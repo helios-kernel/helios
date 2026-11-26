@@ -27,6 +27,7 @@ pub enum CompletionKind {
     InspectKey,
     DiagnosticTarget,
     OciRef,
+    ContainerHandle,
     Path,
     Variable,
 }
@@ -55,6 +56,7 @@ struct CompletionCtx<'a, E: HeliosEnv> {
     stack: &'a Stack,
     env: &'a E,
     span: ReplaceSpan,
+    abs_token_start: usize,
 }
 /// Compute context-sensitive completions for `input` at byte offset `cursor`.
 pub async fn complete_async<E: HeliosEnv>(
@@ -75,6 +77,7 @@ pub async fn complete_async<E: HeliosEnv>(
     let (token_start, token) = current_token(prefix_slice);
     let replace_start = token_start;
     let replace_end = cursor;
+    let abs_token_start = offset + token_start;
     let ctx = CompletionCtx {
         engine_state,
         stack,
@@ -83,6 +86,7 @@ pub async fn complete_async<E: HeliosEnv>(
             start: replace_start,
             end: replace_end,
         },
+        abs_token_start,
     };
 
     // Variable / cell-path completion (`$var.col...`)
@@ -155,8 +159,24 @@ pub async fn complete_async<E: HeliosEnv>(
                 return items;
             }
 
+            // Subcommand completion when user typed a parent command like `sys `,
+            // `linux image `, or `btrfs subvolume ` (before any prior positional args).
+            if prior_positional_count(call, abs_token_start) == 0 {
+                let sub_prefix = format!("{cmd_name} {token}");
+                let subcommands = complete_subcommands(
+                    engine_state,
+                    &cmd_name,
+                    &sub_prefix,
+                    replace_start,
+                    replace_end,
+                );
+                if !subcommands.is_empty() {
+                    return subcommands;
+                }
+            }
+
             // Generic signature-driven path completion.
-            if signature_expects_path(&sig, call) {
+            if signature_expects_path(&sig, call, abs_token_start) {
                 return complete_vfs_paths(
                     engine_state,
                     stack,
@@ -166,19 +186,6 @@ pub async fn complete_async<E: HeliosEnv>(
                     replace_end,
                 )
                 .await;
-            }
-
-            // Subcommand completion when user typed a parent command like `sys ` or `http ` or `random `.
-            let sub_prefix = format!("{cmd_name} {token}");
-            let subcommands = complete_subcommands(
-                engine_state,
-                &cmd_name,
-                &sub_prefix,
-                replace_start,
-                replace_end,
-            );
-            if !subcommands.is_empty() {
-                return subcommands;
             }
 
             // Fallback: if upstream has known columns (e.g. inside `where <col>`), offer them.
@@ -540,7 +547,7 @@ async fn complete_flag_value<E: HeliosEnv>(
                     .collect(),
             )
         }
-        (_, "oci") => {
+        (_, "oci") | ("container create", "image" | "i") => {
             let refs = ctx.env.complete_oci_refs().await.ok()?;
             Some(
                 refs.into_iter()
@@ -555,6 +562,21 @@ async fn complete_flag_value<E: HeliosEnv>(
                     .collect(),
             )
         }
+        ("vm run", "kernel" | "k" | "initramfs" | "disk" | "rootfs-dir")
+        | ("container create", "rootfs" | "r")
+        | ("component add", "dir" | "d")
+        | ("btrfs subvolume send", "parent" | "p")
+        | ("btrfs subvolume receive", "file" | "f") => Some(
+            complete_vfs_paths(
+                ctx.engine_state,
+                ctx.stack,
+                ctx.env,
+                prefix,
+                replace_start,
+                replace_end,
+            )
+            .await,
+        ),
         (
             "http get" | "http post" | "http put" | "http patch" | "http delete" | "http head"
             | "http options",
@@ -613,7 +635,8 @@ async fn complete_domain_positional<E: HeliosEnv>(
                     .collect(),
             )
         }
-        "with-scope" => {
+        "with-scope" | "component status" | "component start" | "component stop"
+        | "component restart" | "component rm" => {
             let monikers = ctx.env.complete_monikers().await.ok()?;
             Some(
                 monikers
@@ -629,7 +652,90 @@ async fn complete_domain_positional<E: HeliosEnv>(
                     .collect(),
             )
         }
-        "cd" | "ls" | "open" | "save" | "mkdir" | "rm" | "cp" | "mv" | "touch" | "watch" => Some(
+        "component add" => {
+            if prior_positional_count(_call, ctx.abs_token_start) == 0 {
+                let monikers = ctx.env.complete_monikers().await.ok()?;
+                Some(
+                    monikers
+                        .into_iter()
+                        .filter(|m| m.starts_with(prefix))
+                        .map(|value| CompletionItem {
+                            value,
+                            description: String::from("component moniker"),
+                            kind: CompletionKind::Moniker,
+                            replace_start,
+                            replace_end,
+                        })
+                        .collect(),
+                )
+            } else {
+                Some(
+                    complete_vfs_paths(
+                        ctx.engine_state,
+                        ctx.stack,
+                        ctx.env,
+                        prefix,
+                        replace_start,
+                        replace_end,
+                    )
+                    .await,
+                )
+            }
+        }
+        "linux image set" | "oci inspect" | "oci rm" | "container create" => {
+            let refs = ctx.env.complete_oci_refs().await.ok()?;
+            Some(
+                refs.into_iter()
+                    .filter(|r| r.starts_with(prefix))
+                    .map(|value| CompletionItem {
+                        value,
+                        description: String::from("OCI image reference"),
+                        kind: CompletionKind::OciRef,
+                        replace_start,
+                        replace_end,
+                    })
+                    .collect(),
+            )
+        }
+        "container exec" | "container spawn" | "container rm" | "with-container" => {
+            if prior_positional_count(_call, ctx.abs_token_start) == 0 {
+                let handles = ctx.env.complete_containers().await.ok()?;
+                Some(
+                    handles
+                        .into_iter()
+                        .filter(|h| h.starts_with(prefix))
+                        .map(|value| CompletionItem {
+                            value,
+                            description: String::from("container handle"),
+                            kind: CompletionKind::ContainerHandle,
+                            replace_start,
+                            replace_end,
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        }
+        "cd"
+        | "ls"
+        | "open"
+        | "save"
+        | "mkdir"
+        | "rm"
+        | "cp"
+        | "mv"
+        | "touch"
+        | "watch"
+        | "umount"
+        | "btrfs subvolume create"
+        | "btrfs subvolume delete"
+        | "btrfs subvolume snapshot"
+        | "btrfs subvolume list"
+        | "btrfs subvolume show"
+        | "btrfs subvolume set-ro"
+        | "btrfs subvolume send"
+        | "btrfs subvolume receive" => Some(
             complete_vfs_paths(
                 ctx.engine_state,
                 ctx.stack,
@@ -640,16 +746,46 @@ async fn complete_domain_positional<E: HeliosEnv>(
             )
             .await,
         ),
+        "mount" => {
+            if prior_positional_count(_call, ctx.abs_token_start) >= 1 {
+                Some(
+                    complete_vfs_paths(
+                        ctx.engine_state,
+                        ctx.stack,
+                        ctx.env,
+                        prefix,
+                        replace_start,
+                        replace_end,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
-fn signature_expects_path(sig: &nu_protocol::Signature, call: &AstCall) -> bool {
-    let pos_count = call
-        .arguments
+fn prior_positional_count(call: &AstCall, abs_token_start: usize) -> usize {
+    call.arguments
         .iter()
-        .filter(|arg| matches!(arg, AstArg::Positional(_) | AstArg::Unknown(_)))
-        .count();
+        .filter(|arg| {
+            matches!(
+                arg,
+                AstArg::Positional(expr) | AstArg::Unknown(expr)
+                    if expr.span.end <= abs_token_start
+            )
+        })
+        .count()
+}
+
+fn signature_expects_path(
+    sig: &nu_protocol::Signature,
+    call: &AstCall,
+    abs_token_start: usize,
+) -> bool {
+    let pos_count = prior_positional_count(call, abs_token_start);
 
     let shape = sig
         .required_positional

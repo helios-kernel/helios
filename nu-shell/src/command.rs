@@ -18,13 +18,15 @@ use crate::error::generic_error;
 use crate::pipeline::AsyncPipelineData;
 
 /// Scoped runtime state carried across async command invocations (explicit
-/// grants, active subtree scope, cancellation/signal context).
+/// grants, active subtree scope, active container handle, cancellation/signal context).
 #[derive(Debug, Default, Clone)]
 pub struct RuntimeScope {
     /// Stack of explicit grant frames pushed by `with-grants`.
     pub grant_frames: Vec<Vec<GrantSpec>>,
     /// Stack of active subtree scopes pushed by `with-scope`.
     pub scope_frames: Vec<String>,
+    /// Stack of active Linux container handles pushed by `with-container`.
+    pub container_frames: Vec<String>,
     /// When `true`, external commands capture stdout even when `stack.stdout()`
     /// is `OutDest::Inherit`/`OutDest::Print` (used by `ShellSession::eval` so
     /// the caller receives the final expression as a [`nu_protocol::Value`]).
@@ -46,6 +48,12 @@ impl RuntimeScope {
     #[must_use]
     pub fn current_scope(&self) -> Option<&str> {
         self.scope_frames.last().map(String::as_str)
+    }
+
+    /// Innermost active Linux container handle, if any (`with-container`).
+    #[must_use]
+    pub fn current_container(&self) -> Option<&str> {
+        self.container_frames.last().map(String::as_str)
     }
 }
 

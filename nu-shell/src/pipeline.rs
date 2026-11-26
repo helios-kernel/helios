@@ -12,6 +12,13 @@ use nu_protocol::{
 
 use crate::env::{AsyncByteReceiver, STREAM_CHANNEL_CAPACITY};
 
+/// Upstream external pipeline stage exit handle propagated through `^a | ^b`.
+#[derive(Debug)]
+pub struct UpstreamExit {
+    pub exit_code: async_channel::Receiver<Result<i32, crate::error::EnvError>>,
+    pub span: Span,
+}
+
 /// Data flowing between pipeline stages in [`crate::eval_ir_async`].
 #[derive(Debug)]
 pub enum AsyncPipelineData {
@@ -30,6 +37,9 @@ pub enum AsyncPipelineData {
         stream: AsyncByteReceiver,
         stderr: Option<AsyncByteReceiver>,
         exit_code: Option<async_channel::Receiver<Result<i32, crate::error::EnvError>>>,
+        upstream_exits: Vec<UpstreamExit>,
+        is_external: bool,
+        merge_stderr: bool,
         span: Span,
         stream_type: ByteStreamType,
         metadata: Option<PipelineMetadata>,
@@ -127,6 +137,9 @@ impl AsyncPipelineData {
             stream,
             stderr: None,
             exit_code: None,
+            upstream_exits: Vec::new(),
+            is_external: false,
+            merge_stderr: false,
             span,
             stream_type,
             metadata: metadata.into(),
@@ -180,6 +193,9 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                is_external,
+                merge_stderr,
                 stream_type,
                 metadata,
                 ..
@@ -187,6 +203,9 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                is_external,
+                merge_stderr,
                 span,
                 stream_type,
                 metadata,
@@ -241,11 +260,21 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                merge_stderr,
                 span,
                 stream_type,
                 ..
             } => {
-                let bytes = collect_byte_stream_checked(stream, stderr, exit_code, span).await?;
+                let bytes = collect_byte_stream_checked(
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    merge_stderr,
+                    span,
+                )
+                .await?;
                 Ok(bytes_to_value(bytes, stream_type, span))
             }
             Self::Sync(data) => data.into_value(fallback_span),
@@ -261,9 +290,21 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                merge_stderr,
                 span,
                 ..
-            } => collect_byte_stream_checked(stream, stderr, exit_code, span).await,
+            } => {
+                collect_byte_stream_checked(
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    merge_stderr,
+                    span,
+                )
+                .await
+            }
             Self::ListStream { stream, .. } => {
                 let mut out = Vec::new();
                 while let Ok(item) = stream.recv().await {
@@ -312,14 +353,54 @@ impl AsyncPipelineData {
         self,
         fallback_span: Span,
     ) -> Result<Option<AsyncByteReceiver>, ShellError> {
+        let (rx, _upstream) = self.into_external_stdin_async(fallback_span).await?;
+        Ok(rx)
+    }
+
+    /// Convert pipeline data into an external process stdin stream while preserving
+    /// upstream external exit handles so `^a | ^b` propagates upstream non-zero exits.
+    pub async fn into_external_stdin_async(
+        self,
+        fallback_span: Span,
+    ) -> Result<(Option<AsyncByteReceiver>, Vec<UpstreamExit>), ShellError> {
         match self {
-            Self::Empty => Ok(None),
-            Self::ByteStream { stream, .. } => Ok(Some(stream)),
+            Self::Empty => Ok((None, Vec::new())),
+            Self::ByteStream {
+                stream,
+                stderr,
+                exit_code,
+                mut upstream_exits,
+                merge_stderr,
+                span,
+                ..
+            } => {
+                if let Some(code_rx) = exit_code {
+                    upstream_exits.push(UpstreamExit {
+                        exit_code: code_rx,
+                        span,
+                    });
+                }
+                if merge_stderr && let Some(err_rx) = stderr {
+                    let (out_res, err_res) = futures_lite::future::zip(
+                        collect_byte_receiver(stream),
+                        collect_byte_receiver(err_rx),
+                    )
+                    .await;
+                    let mut combined = out_res?;
+                    combined.extend_from_slice(&err_res?);
+                    let (tx, rx) = async_channel::bounded(1);
+                    if !combined.is_empty() {
+                        let _ = tx.send(Ok(combined)).await;
+                    }
+                    return Ok((Some(rx), upstream_exits));
+                }
+                Ok((Some(stream), upstream_exits))
+            }
             other => {
                 let bytes = other.into_bytes_async(fallback_span).await?;
                 let (tx, rx) = async_channel::bounded(1);
                 let _ = tx.send(Ok(bytes)).await;
-                Ok(Some(rx))
+                Ok((Some(rx), Vec::new()))
             }
         }
     }
@@ -355,12 +436,22 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                merge_stderr,
                 span,
                 stream_type,
                 metadata,
                 ..
             } => {
-                let bytes = collect_byte_stream_checked(stream, stderr, exit_code, span).await?;
+                let bytes = collect_byte_stream_checked(
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    merge_stderr,
+                    span,
+                )
+                .await?;
                 let byte_stream = match stream_type {
                     ByteStreamType::Binary => ByteStream::read_binary(bytes, span, Signals::EMPTY),
                     ByteStreamType::String => match String::from_utf8(bytes) {
@@ -441,12 +532,22 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                merge_stderr,
                 span,
                 stream_type,
                 metadata,
                 ..
             } => {
-                let bytes = collect_byte_stream_checked(stream, stderr, exit_code, span).await?;
+                let bytes = collect_byte_stream_checked(
+                    stream,
+                    stderr,
+                    exit_code,
+                    upstream_exits,
+                    merge_stderr,
+                    span,
+                )
+                .await?;
                 let val = bytes_to_value(bytes, stream_type, span);
                 let (tx, rx) = async_channel::bounded(1);
                 let _ = tx.try_send(val);
@@ -471,9 +572,10 @@ impl AsyncPipelineData {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
                 span,
                 ..
-            } => drain_byte_stream(stream, stderr, exit_code, span).await,
+            } => drain_byte_stream(stream, stderr, exit_code, upstream_exits, span).await,
             Self::Sync(data) => {
                 data.drain()?;
                 Ok(None)
@@ -488,6 +590,7 @@ fn drain_byte_stream(
     stream: AsyncByteReceiver,
     stderr: Option<AsyncByteReceiver>,
     exit_code: Option<async_channel::Receiver<Result<i32, crate::error::EnvError>>>,
+    upstream_exits: Vec<UpstreamExit>,
     span: Span,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i32>, ShellError>> + Send>> {
     Box::pin(async move {
@@ -508,13 +611,28 @@ fn drain_byte_stream(
         let (out_res, err_res) = futures_lite::future::zip(drain_out, drain_err).await;
         out_res?;
         err_res?;
+        let mut upstream_non_zero = None;
+        for upstream in upstream_exits {
+            if let Ok(code) = upstream.exit_code.recv().await {
+                let code = code.map_err(|err| {
+                    err.into_shell_error("external command failed", upstream.span)
+                })?;
+                if code != 0 && upstream_non_zero.is_none() {
+                    upstream_non_zero = Some(code);
+                }
+            }
+        }
         if let Some(exit_rx) = exit_code
             && let Ok(code) = exit_rx.recv().await
         {
             let code = code.map_err(|err| err.into_shell_error("external command failed", span))?;
-            return Ok(Some(code));
+            return Ok(Some(if code != 0 {
+                code
+            } else {
+                upstream_non_zero.unwrap_or(0)
+            }));
         }
-        Ok(None)
+        Ok(upstream_non_zero)
     })
 }
 
@@ -527,41 +645,104 @@ fn collect_byte_stream_checked(
     stream: AsyncByteReceiver,
     stderr: Option<AsyncByteReceiver>,
     exit_code: Option<async_channel::Receiver<Result<i32, crate::error::EnvError>>>,
+    upstream_exits: Vec<UpstreamExit>,
+    merge_stderr: bool,
     span: Span,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, ShellError>> + Send>> {
     Box::pin(async move {
-        let read_out = collect_byte_receiver(stream);
-        let read_err = async {
-            match stderr {
-                Some(rx) => collect_byte_receiver(rx).await,
-                None => Ok(Vec::new()),
-            }
-        };
-        let (out_res, err_res) = futures_lite::future::zip(read_out, read_err).await;
-        let bytes = out_res?;
-        let stderr_bytes = err_res?;
-        if let Some(exit_rx) = exit_code
-            && let Ok(status) = exit_rx.recv().await
+        let (bytes, stderr_bytes, status) = collect_byte_stream_with_status(
+            stream,
+            stderr,
+            exit_code,
+            upstream_exits,
+            merge_stderr,
+            span,
+        )
+        .await?;
+        if let Some((code, err_span)) = status
+            && let Some(non_zero) = core::num::NonZeroI32::new(code)
         {
-            let code =
-                status.map_err(|err| err.into_shell_error("external command failed", span))?;
-            if let Some(non_zero) = core::num::NonZeroI32::new(code) {
-                let detail = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
-                if detail.is_empty() {
-                    return Err(ShellError::NonZeroExitCode {
-                        exit_code: non_zero,
-                        span,
-                    });
-                }
-                return Err(crate::error::generic_error(
-                    format!("external command exited with status {code}"),
-                    detail,
-                    span,
-                ));
-            }
+            return Err(non_zero_exit_error(
+                non_zero,
+                if merge_stderr { &[] } else { &stderr_bytes },
+                err_span,
+            ));
         }
         Ok(bytes)
     })
+}
+
+/// Collected stdout bytes, stderr bytes, and resolved exit status from a byte stream.
+pub(crate) type CollectedByteStream = (Vec<u8>, Vec<u8>, Option<(i32, Span)>);
+
+/// Collect stdout and stderr bytes from an external `ByteStream` alongside its
+/// resolved exit status (upstream failures first, then stage exit), without
+/// discarding stdout on non-zero exit (used by `o>` redirections so captured
+/// stdout is written before surfacing the non-zero exit error).
+pub(crate) async fn collect_byte_stream_with_status(
+    stream: AsyncByteReceiver,
+    stderr: Option<AsyncByteReceiver>,
+    exit_code: Option<async_channel::Receiver<Result<i32, crate::error::EnvError>>>,
+    upstream_exits: Vec<UpstreamExit>,
+    merge_stderr: bool,
+    span: Span,
+) -> Result<CollectedByteStream, ShellError> {
+    let read_out = collect_byte_receiver(stream);
+    let read_err = async {
+        match stderr {
+            Some(rx) => collect_byte_receiver(rx).await,
+            None => Ok(Vec::new()),
+        }
+    };
+    let (out_res, err_res) = futures_lite::future::zip(read_out, read_err).await;
+    let mut bytes = out_res?;
+    let stderr_bytes = err_res?;
+    if merge_stderr {
+        bytes.extend_from_slice(&stderr_bytes);
+    }
+
+    let mut first_non_zero: Option<(i32, Span)> = None;
+    for upstream in upstream_exits {
+        if let Ok(status) = upstream.exit_code.recv().await {
+            let code = status
+                .map_err(|err| err.into_shell_error("external command failed", upstream.span))?;
+            if code != 0 && first_non_zero.is_none() {
+                first_non_zero = Some((code, upstream.span));
+            }
+        }
+    }
+    let mut final_status = first_non_zero;
+    if let Some(exit_rx) = exit_code
+        && let Ok(status) = exit_rx.recv().await
+    {
+        let code = status.map_err(|err| err.into_shell_error("external command failed", span))?;
+        if code != 0 {
+            if final_status.is_none() {
+                final_status = Some((code, span));
+            }
+        } else if final_status.is_none() {
+            final_status = Some((0, span));
+        }
+    }
+    Ok((bytes, stderr_bytes, final_status))
+}
+
+/// Build the [`ShellError`] surfaced for a non-zero external command exit.
+pub(crate) fn non_zero_exit_error(
+    exit_code: core::num::NonZeroI32,
+    stderr_bytes: &[u8],
+    span: Span,
+) -> ShellError {
+    let detail = String::from_utf8_lossy(stderr_bytes).trim().to_owned();
+    if detail.is_empty() {
+        ShellError::NonZeroExitCode { exit_code, span }
+    } else {
+        crate::error::generic_error(
+            format!("external command exited with status {}", exit_code.get()),
+            detail,
+            span,
+        )
+    }
 }
 
 /// Collect all chunks from an [`AsyncByteReceiver`] into a single `Vec<u8>`.

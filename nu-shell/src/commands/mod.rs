@@ -1,11 +1,17 @@
 //! Helios-native async commands and async-aware Nushell combinators.
 
+pub mod component;
+pub mod container;
 pub mod external;
 pub mod fs;
 pub mod http;
+pub mod linux;
+pub mod oci;
 pub mod process;
 pub mod random;
+pub mod storage;
 pub mod sys;
+pub mod vm;
 
 use core::future::Future;
 use core::pin::Pin;
@@ -72,6 +78,52 @@ pub enum AsyncBuiltin {
     RandomChars,
     RandomBinary,
     RandomUuid,
+    // Linux default image
+    Linux,
+    LinuxImage,
+    LinuxImageGet,
+    LinuxImageSet,
+    LinuxImageClear,
+    // Component topology
+    Component,
+    ComponentLs,
+    ComponentStatus,
+    ComponentStart,
+    ComponentStop,
+    ComponentRestart,
+    ComponentAdd,
+    ComponentRm,
+    // OCI image store
+    Oci,
+    OciPull,
+    OciLs,
+    OciInspect,
+    OciRm,
+    // Linux containers
+    Container,
+    ContainerCreate,
+    ContainerLs,
+    ContainerExec,
+    ContainerSpawn,
+    ContainerRm,
+    WithContainer,
+    // Storage: mount, umount, btrfs
+    Mount,
+    Umount,
+    Btrfs,
+    BtrfsSubvolume,
+    BtrfsSubvolumeCreate,
+    BtrfsSubvolumeDelete,
+    BtrfsSubvolumeSnapshot,
+    BtrfsSubvolumeList,
+    BtrfsSubvolumeShow,
+    BtrfsSubvolumeSetRo,
+    BtrfsSubvolumeSend,
+    BtrfsSubvolumeReceive,
+    // Micro-VMs
+    Vm,
+    VmRun,
+    VmLs,
     // Async-capable combinators so closures can call async commands without block_on
     Do,
     Each,
@@ -129,6 +181,46 @@ impl AsyncBuiltin {
         Self::RandomChars,
         Self::RandomBinary,
         Self::RandomUuid,
+        Self::Linux,
+        Self::LinuxImage,
+        Self::LinuxImageGet,
+        Self::LinuxImageSet,
+        Self::LinuxImageClear,
+        Self::Component,
+        Self::ComponentLs,
+        Self::ComponentStatus,
+        Self::ComponentStart,
+        Self::ComponentStop,
+        Self::ComponentRestart,
+        Self::ComponentAdd,
+        Self::ComponentRm,
+        Self::Oci,
+        Self::OciPull,
+        Self::OciLs,
+        Self::OciInspect,
+        Self::OciRm,
+        Self::Container,
+        Self::ContainerCreate,
+        Self::ContainerLs,
+        Self::ContainerExec,
+        Self::ContainerSpawn,
+        Self::ContainerRm,
+        Self::WithContainer,
+        Self::Mount,
+        Self::Umount,
+        Self::Btrfs,
+        Self::BtrfsSubvolume,
+        Self::BtrfsSubvolumeCreate,
+        Self::BtrfsSubvolumeDelete,
+        Self::BtrfsSubvolumeSnapshot,
+        Self::BtrfsSubvolumeList,
+        Self::BtrfsSubvolumeShow,
+        Self::BtrfsSubvolumeSetRo,
+        Self::BtrfsSubvolumeSend,
+        Self::BtrfsSubvolumeReceive,
+        Self::Vm,
+        Self::VmRun,
+        Self::VmLs,
         Self::Do,
         Self::Each,
         Self::ParEach,
@@ -186,6 +278,46 @@ impl AsyncBuiltin {
             Self::RandomChars => "random chars",
             Self::RandomBinary => "random binary",
             Self::RandomUuid => "random uuid",
+            Self::Linux => "linux",
+            Self::LinuxImage => "linux image",
+            Self::LinuxImageGet => "linux image get",
+            Self::LinuxImageSet => "linux image set",
+            Self::LinuxImageClear => "linux image clear",
+            Self::Component => "component",
+            Self::ComponentLs => "component ls",
+            Self::ComponentStatus => "component status",
+            Self::ComponentStart => "component start",
+            Self::ComponentStop => "component stop",
+            Self::ComponentRestart => "component restart",
+            Self::ComponentAdd => "component add",
+            Self::ComponentRm => "component rm",
+            Self::Oci => "oci",
+            Self::OciPull => "oci pull",
+            Self::OciLs => "oci ls",
+            Self::OciInspect => "oci inspect",
+            Self::OciRm => "oci rm",
+            Self::Container => "container",
+            Self::ContainerCreate => "container create",
+            Self::ContainerLs => "container ls",
+            Self::ContainerExec => "container exec",
+            Self::ContainerSpawn => "container spawn",
+            Self::ContainerRm => "container rm",
+            Self::WithContainer => "with-container",
+            Self::Mount => "mount",
+            Self::Umount => "umount",
+            Self::Btrfs => "btrfs",
+            Self::BtrfsSubvolume => "btrfs subvolume",
+            Self::BtrfsSubvolumeCreate => "btrfs subvolume create",
+            Self::BtrfsSubvolumeDelete => "btrfs subvolume delete",
+            Self::BtrfsSubvolumeSnapshot => "btrfs subvolume snapshot",
+            Self::BtrfsSubvolumeList => "btrfs subvolume list",
+            Self::BtrfsSubvolumeShow => "btrfs subvolume show",
+            Self::BtrfsSubvolumeSetRo => "btrfs subvolume set-ro",
+            Self::BtrfsSubvolumeSend => "btrfs subvolume send",
+            Self::BtrfsSubvolumeReceive => "btrfs subvolume receive",
+            Self::Vm => "vm",
+            Self::VmRun => "vm run",
+            Self::VmLs => "vm ls",
             Self::Do => "do",
             Self::Each => "each",
             Self::ParEach => "par-each",
@@ -277,6 +409,118 @@ impl AsyncBuiltin {
             Self::RandomUuid => {
                 <random::RandomUuid as AsyncCommand<E>>::signature(&random::RandomUuid)
             }
+            Self::Linux => <linux::Linux as AsyncCommand<E>>::signature(&linux::Linux),
+            Self::LinuxImage => {
+                <linux::LinuxImage as AsyncCommand<E>>::signature(&linux::LinuxImage)
+            }
+            Self::LinuxImageGet => {
+                <linux::LinuxImageGet as AsyncCommand<E>>::signature(&linux::LinuxImageGet)
+            }
+            Self::LinuxImageSet => {
+                <linux::LinuxImageSet as AsyncCommand<E>>::signature(&linux::LinuxImageSet)
+            }
+            Self::LinuxImageClear => {
+                <linux::LinuxImageClear as AsyncCommand<E>>::signature(&linux::LinuxImageClear)
+            }
+            Self::Component => {
+                <component::Component as AsyncCommand<E>>::signature(&component::Component)
+            }
+            Self::ComponentLs => {
+                <component::ComponentLs as AsyncCommand<E>>::signature(&component::ComponentLs)
+            }
+            Self::ComponentStatus => <component::ComponentStatus as AsyncCommand<E>>::signature(
+                &component::ComponentStatus,
+            ),
+            Self::ComponentStart => <component::ComponentStart as AsyncCommand<E>>::signature(
+                &component::ComponentStart,
+            ),
+            Self::ComponentStop => {
+                <component::ComponentStop as AsyncCommand<E>>::signature(&component::ComponentStop)
+            }
+            Self::ComponentRestart => <component::ComponentRestart as AsyncCommand<E>>::signature(
+                &component::ComponentRestart,
+            ),
+            Self::ComponentAdd => {
+                <component::ComponentAdd as AsyncCommand<E>>::signature(&component::ComponentAdd)
+            }
+            Self::ComponentRm => {
+                <component::ComponentRm as AsyncCommand<E>>::signature(&component::ComponentRm)
+            }
+            Self::Oci => <oci::Oci as AsyncCommand<E>>::signature(&oci::Oci),
+            Self::OciPull => <oci::OciPull as AsyncCommand<E>>::signature(&oci::OciPull),
+            Self::OciLs => <oci::OciLs as AsyncCommand<E>>::signature(&oci::OciLs),
+            Self::OciInspect => <oci::OciInspect as AsyncCommand<E>>::signature(&oci::OciInspect),
+            Self::OciRm => <oci::OciRm as AsyncCommand<E>>::signature(&oci::OciRm),
+            Self::Container => {
+                <container::Container as AsyncCommand<E>>::signature(&container::Container)
+            }
+            Self::ContainerCreate => <container::ContainerCreate as AsyncCommand<E>>::signature(
+                &container::ContainerCreate,
+            ),
+            Self::ContainerLs => {
+                <container::ContainerLs as AsyncCommand<E>>::signature(&container::ContainerLs)
+            }
+            Self::ContainerExec => {
+                <container::ContainerExec as AsyncCommand<E>>::signature(&container::ContainerExec)
+            }
+            Self::ContainerSpawn => <container::ContainerSpawn as AsyncCommand<E>>::signature(
+                &container::ContainerSpawn,
+            ),
+            Self::ContainerRm => {
+                <container::ContainerRm as AsyncCommand<E>>::signature(&container::ContainerRm)
+            }
+            Self::WithContainer => {
+                <container::WithContainer as AsyncCommand<E>>::signature(&container::WithContainer)
+            }
+            Self::Mount => <storage::Mount as AsyncCommand<E>>::signature(&storage::Mount),
+            Self::Umount => <storage::Umount as AsyncCommand<E>>::signature(&storage::Umount),
+            Self::Btrfs => <storage::Btrfs as AsyncCommand<E>>::signature(&storage::Btrfs),
+            Self::BtrfsSubvolume => {
+                <storage::BtrfsSubvolume as AsyncCommand<E>>::signature(&storage::BtrfsSubvolume)
+            }
+            Self::BtrfsSubvolumeCreate => {
+                <storage::BtrfsSubvolumeCreate as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeCreate,
+                )
+            }
+            Self::BtrfsSubvolumeDelete => {
+                <storage::BtrfsSubvolumeDelete as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeDelete,
+                )
+            }
+            Self::BtrfsSubvolumeSnapshot => {
+                <storage::BtrfsSubvolumeSnapshot as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeSnapshot,
+                )
+            }
+            Self::BtrfsSubvolumeList => {
+                <storage::BtrfsSubvolumeList as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeList,
+                )
+            }
+            Self::BtrfsSubvolumeShow => {
+                <storage::BtrfsSubvolumeShow as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeShow,
+                )
+            }
+            Self::BtrfsSubvolumeSetRo => {
+                <storage::BtrfsSubvolumeSetRo as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeSetRo,
+                )
+            }
+            Self::BtrfsSubvolumeSend => {
+                <storage::BtrfsSubvolumeSend as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeSend,
+                )
+            }
+            Self::BtrfsSubvolumeReceive => {
+                <storage::BtrfsSubvolumeReceive as AsyncCommand<E>>::signature(
+                    &storage::BtrfsSubvolumeReceive,
+                )
+            }
+            Self::Vm => <vm::Vm as AsyncCommand<E>>::signature(&vm::Vm),
+            Self::VmRun => <vm::VmRun as AsyncCommand<E>>::signature(&vm::VmRun),
+            Self::VmLs => <vm::VmLs as AsyncCommand<E>>::signature(&vm::VmLs),
             Self::Do => <AsyncDo as AsyncCommand<E>>::signature(&AsyncDo),
             Self::Each => <AsyncEach as AsyncCommand<E>>::signature(&AsyncEach),
             Self::ParEach => <AsyncParEach as AsyncCommand<E>>::signature(&AsyncParEach),
@@ -368,6 +612,120 @@ impl AsyncBuiltin {
             Self::RandomUuid => {
                 <random::RandomUuid as AsyncCommand<E>>::description(&random::RandomUuid)
             }
+            Self::Linux => <linux::Linux as AsyncCommand<E>>::description(&linux::Linux),
+            Self::LinuxImage => {
+                <linux::LinuxImage as AsyncCommand<E>>::description(&linux::LinuxImage)
+            }
+            Self::LinuxImageGet => {
+                <linux::LinuxImageGet as AsyncCommand<E>>::description(&linux::LinuxImageGet)
+            }
+            Self::LinuxImageSet => {
+                <linux::LinuxImageSet as AsyncCommand<E>>::description(&linux::LinuxImageSet)
+            }
+            Self::LinuxImageClear => {
+                <linux::LinuxImageClear as AsyncCommand<E>>::description(&linux::LinuxImageClear)
+            }
+            Self::Component => {
+                <component::Component as AsyncCommand<E>>::description(&component::Component)
+            }
+            Self::ComponentLs => {
+                <component::ComponentLs as AsyncCommand<E>>::description(&component::ComponentLs)
+            }
+            Self::ComponentStatus => <component::ComponentStatus as AsyncCommand<E>>::description(
+                &component::ComponentStatus,
+            ),
+            Self::ComponentStart => <component::ComponentStart as AsyncCommand<E>>::description(
+                &component::ComponentStart,
+            ),
+            Self::ComponentStop => <component::ComponentStop as AsyncCommand<E>>::description(
+                &component::ComponentStop,
+            ),
+            Self::ComponentRestart => {
+                <component::ComponentRestart as AsyncCommand<E>>::description(
+                    &component::ComponentRestart,
+                )
+            }
+            Self::ComponentAdd => {
+                <component::ComponentAdd as AsyncCommand<E>>::description(&component::ComponentAdd)
+            }
+            Self::ComponentRm => {
+                <component::ComponentRm as AsyncCommand<E>>::description(&component::ComponentRm)
+            }
+            Self::Oci => <oci::Oci as AsyncCommand<E>>::description(&oci::Oci),
+            Self::OciPull => <oci::OciPull as AsyncCommand<E>>::description(&oci::OciPull),
+            Self::OciLs => <oci::OciLs as AsyncCommand<E>>::description(&oci::OciLs),
+            Self::OciInspect => <oci::OciInspect as AsyncCommand<E>>::description(&oci::OciInspect),
+            Self::OciRm => <oci::OciRm as AsyncCommand<E>>::description(&oci::OciRm),
+            Self::Container => {
+                <container::Container as AsyncCommand<E>>::description(&container::Container)
+            }
+            Self::ContainerCreate => <container::ContainerCreate as AsyncCommand<E>>::description(
+                &container::ContainerCreate,
+            ),
+            Self::ContainerLs => {
+                <container::ContainerLs as AsyncCommand<E>>::description(&container::ContainerLs)
+            }
+            Self::ContainerExec => <container::ContainerExec as AsyncCommand<E>>::description(
+                &container::ContainerExec,
+            ),
+            Self::ContainerSpawn => <container::ContainerSpawn as AsyncCommand<E>>::description(
+                &container::ContainerSpawn,
+            ),
+            Self::ContainerRm => {
+                <container::ContainerRm as AsyncCommand<E>>::description(&container::ContainerRm)
+            }
+            Self::WithContainer => <container::WithContainer as AsyncCommand<E>>::description(
+                &container::WithContainer,
+            ),
+            Self::Mount => <storage::Mount as AsyncCommand<E>>::description(&storage::Mount),
+            Self::Umount => <storage::Umount as AsyncCommand<E>>::description(&storage::Umount),
+            Self::Btrfs => <storage::Btrfs as AsyncCommand<E>>::description(&storage::Btrfs),
+            Self::BtrfsSubvolume => {
+                <storage::BtrfsSubvolume as AsyncCommand<E>>::description(&storage::BtrfsSubvolume)
+            }
+            Self::BtrfsSubvolumeCreate => {
+                <storage::BtrfsSubvolumeCreate as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeCreate,
+                )
+            }
+            Self::BtrfsSubvolumeDelete => {
+                <storage::BtrfsSubvolumeDelete as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeDelete,
+                )
+            }
+            Self::BtrfsSubvolumeSnapshot => {
+                <storage::BtrfsSubvolumeSnapshot as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeSnapshot,
+                )
+            }
+            Self::BtrfsSubvolumeList => {
+                <storage::BtrfsSubvolumeList as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeList,
+                )
+            }
+            Self::BtrfsSubvolumeShow => {
+                <storage::BtrfsSubvolumeShow as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeShow,
+                )
+            }
+            Self::BtrfsSubvolumeSetRo => {
+                <storage::BtrfsSubvolumeSetRo as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeSetRo,
+                )
+            }
+            Self::BtrfsSubvolumeSend => {
+                <storage::BtrfsSubvolumeSend as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeSend,
+                )
+            }
+            Self::BtrfsSubvolumeReceive => {
+                <storage::BtrfsSubvolumeReceive as AsyncCommand<E>>::description(
+                    &storage::BtrfsSubvolumeReceive,
+                )
+            }
+            Self::Vm => <vm::Vm as AsyncCommand<E>>::description(&vm::Vm),
+            Self::VmRun => <vm::VmRun as AsyncCommand<E>>::description(&vm::VmRun),
+            Self::VmLs => <vm::VmLs as AsyncCommand<E>>::description(&vm::VmLs),
             Self::Do => <AsyncDo as AsyncCommand<E>>::description(&AsyncDo),
             Self::Each => <AsyncEach as AsyncCommand<E>>::description(&AsyncEach),
             Self::ParEach => <AsyncParEach as AsyncCommand<E>>::description(&AsyncParEach),
@@ -470,6 +828,56 @@ impl AsyncBuiltin {
             Self::RandomChars => Box::pin(random::RandomChars.run_async(ctx, input)),
             Self::RandomBinary => Box::pin(random::RandomBinary.run_async(ctx, input)),
             Self::RandomUuid => Box::pin(random::RandomUuid.run_async(ctx, input)),
+            Self::Linux => Box::pin(linux::Linux.run_async(ctx, input)),
+            Self::LinuxImage => Box::pin(linux::LinuxImage.run_async(ctx, input)),
+            Self::LinuxImageGet => Box::pin(linux::LinuxImageGet.run_async(ctx, input)),
+            Self::LinuxImageSet => Box::pin(linux::LinuxImageSet.run_async(ctx, input)),
+            Self::LinuxImageClear => Box::pin(linux::LinuxImageClear.run_async(ctx, input)),
+            Self::Component => Box::pin(component::Component.run_async(ctx, input)),
+            Self::ComponentLs => Box::pin(component::ComponentLs.run_async(ctx, input)),
+            Self::ComponentStatus => Box::pin(component::ComponentStatus.run_async(ctx, input)),
+            Self::ComponentStart => Box::pin(component::ComponentStart.run_async(ctx, input)),
+            Self::ComponentStop => Box::pin(component::ComponentStop.run_async(ctx, input)),
+            Self::ComponentRestart => Box::pin(component::ComponentRestart.run_async(ctx, input)),
+            Self::ComponentAdd => Box::pin(component::ComponentAdd.run_async(ctx, input)),
+            Self::ComponentRm => Box::pin(component::ComponentRm.run_async(ctx, input)),
+            Self::Oci => Box::pin(oci::Oci.run_async(ctx, input)),
+            Self::OciPull => Box::pin(oci::OciPull.run_async(ctx, input)),
+            Self::OciLs => Box::pin(oci::OciLs.run_async(ctx, input)),
+            Self::OciInspect => Box::pin(oci::OciInspect.run_async(ctx, input)),
+            Self::OciRm => Box::pin(oci::OciRm.run_async(ctx, input)),
+            Self::Container => Box::pin(container::Container.run_async(ctx, input)),
+            Self::ContainerCreate => Box::pin(container::ContainerCreate.run_async(ctx, input)),
+            Self::ContainerLs => Box::pin(container::ContainerLs.run_async(ctx, input)),
+            Self::ContainerExec => Box::pin(container::ContainerExec.run_async(ctx, input)),
+            Self::ContainerSpawn => Box::pin(container::ContainerSpawn.run_async(ctx, input)),
+            Self::ContainerRm => Box::pin(container::ContainerRm.run_async(ctx, input)),
+            Self::WithContainer => Box::pin(container::WithContainer.run_async(ctx, input)),
+            Self::Mount => Box::pin(storage::Mount.run_async(ctx, input)),
+            Self::Umount => Box::pin(storage::Umount.run_async(ctx, input)),
+            Self::Btrfs => Box::pin(storage::Btrfs.run_async(ctx, input)),
+            Self::BtrfsSubvolume => Box::pin(storage::BtrfsSubvolume.run_async(ctx, input)),
+            Self::BtrfsSubvolumeCreate => {
+                Box::pin(storage::BtrfsSubvolumeCreate.run_async(ctx, input))
+            }
+            Self::BtrfsSubvolumeDelete => {
+                Box::pin(storage::BtrfsSubvolumeDelete.run_async(ctx, input))
+            }
+            Self::BtrfsSubvolumeSnapshot => {
+                Box::pin(storage::BtrfsSubvolumeSnapshot.run_async(ctx, input))
+            }
+            Self::BtrfsSubvolumeList => Box::pin(storage::BtrfsSubvolumeList.run_async(ctx, input)),
+            Self::BtrfsSubvolumeShow => Box::pin(storage::BtrfsSubvolumeShow.run_async(ctx, input)),
+            Self::BtrfsSubvolumeSetRo => {
+                Box::pin(storage::BtrfsSubvolumeSetRo.run_async(ctx, input))
+            }
+            Self::BtrfsSubvolumeSend => Box::pin(storage::BtrfsSubvolumeSend.run_async(ctx, input)),
+            Self::BtrfsSubvolumeReceive => {
+                Box::pin(storage::BtrfsSubvolumeReceive.run_async(ctx, input))
+            }
+            Self::Vm => Box::pin(vm::Vm.run_async(ctx, input)),
+            Self::VmRun => Box::pin(vm::VmRun.run_async(ctx, input)),
+            Self::VmLs => Box::pin(vm::VmLs.run_async(ctx, input)),
             Self::Do => Box::pin(AsyncDo.run_async(ctx, input)),
             Self::Each => Box::pin(AsyncEach.run_async(ctx, input)),
             Self::ParEach => Box::pin(AsyncParEach.run_async(ctx, input)),
@@ -988,6 +1396,8 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncComplete {
                 stream,
                 stderr,
                 exit_code,
+                upstream_exits,
+                merge_stderr,
                 ..
             } => {
                 let (out_res, err_res) =
@@ -998,9 +1408,29 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncComplete {
                         }
                     })
                     .await;
-                let out_bytes = out_res?;
-                let err_bytes = err_res?;
-                let code = match exit_code {
+                let mut out_bytes = out_res?;
+                let mut err_bytes = err_res?;
+                if merge_stderr {
+                    out_bytes.extend_from_slice(&err_bytes);
+                    err_bytes.clear();
+                }
+                let mut upstream_non_zero = None;
+                for upstream in upstream_exits {
+                    if let Ok(status) = upstream.exit_code.recv().await {
+                        match status {
+                            Ok(code) if code != 0 && upstream_non_zero.is_none() => {
+                                upstream_non_zero = Some(code);
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                return Err(
+                                    err.into_shell_error("external command failed", upstream.span)
+                                );
+                            }
+                        }
+                    }
+                }
+                let own_code = match exit_code {
                     Some(rx) => match rx.recv().await {
                         Ok(Ok(code)) => code,
                         Ok(Err(err)) => {
@@ -1009,6 +1439,11 @@ impl<E: HeliosEnv> AsyncCommand<E> for AsyncComplete {
                         Err(_) => 0,
                     },
                     None => 0,
+                };
+                let code = if own_code != 0 {
+                    own_code
+                } else {
+                    upstream_non_zero.unwrap_or(0)
                 };
                 (
                     String::from_utf8_lossy(&out_bytes).into_owned(),
@@ -1255,6 +1690,168 @@ impl HeliosEnv for SignatureOnlyEnv {
         &self,
         _: &str,
     ) -> Result<async_channel::Receiver<crate::env::WatchEvent>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn linux_image_get(&self) -> Result<crate::env::LinuxImageInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn linux_image_set(
+        &self,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<crate::env::LinuxImageInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn linux_image_clear(
+        &self,
+    ) -> Result<crate::env::LinuxImageClearResult, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_list(
+        &self,
+    ) -> Result<Vec<crate::env::ComponentInfo>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_status(
+        &self,
+        _: &str,
+    ) -> Result<crate::env::ComponentInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_start(
+        &self,
+        _: &str,
+    ) -> Result<crate::env::ComponentInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_stop(&self, _: &str) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_restart(
+        &self,
+        _: &str,
+    ) -> Result<crate::env::ComponentInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_add(
+        &self,
+        _: crate::env::ComponentAddRequest,
+    ) -> Result<String, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn component_remove(&self, _: &str) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn oci_pull(
+        &self,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<crate::env::OciImageSummary, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn oci_list(&self) -> Result<Vec<crate::env::OciImageSummary>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn oci_inspect(
+        &self,
+        _: &str,
+    ) -> Result<crate::env::OciImageInspect, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn oci_remove(&self, _: &str) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn container_create(
+        &self,
+        _: crate::env::ContainerCreateRequest,
+    ) -> Result<crate::env::ContainerInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn container_list(
+        &self,
+    ) -> Result<Vec<crate::env::ContainerInfo>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn container_exec(
+        &self,
+        _: &str,
+        _: crate::env::ContainerExecRequest,
+    ) -> Result<crate::env::ContainerExecOutput, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn container_spawn(
+        &self,
+        _: &str,
+        _: crate::env::ContainerSpawnRequest,
+    ) -> Result<crate::env::ExternalProcess, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn container_remove(&self, _: &str) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn list_mounts(&self) -> Result<Vec<crate::env::MountEntryInfo>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn mount(&self, _: crate::env::MountRequestSpec) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn umount(&self, _: &str) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_create(
+        &self,
+        _: &str,
+    ) -> Result<crate::env::BtrfsSubvolumeInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_delete(&self, _: &str) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_snapshot(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+    ) -> Result<crate::env::BtrfsSubvolumeInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_list(
+        &self,
+        _: &str,
+    ) -> Result<Vec<crate::env::BtrfsSubvolumeInfo>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_info(
+        &self,
+        _: &str,
+    ) -> Result<crate::env::BtrfsSubvolumeInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_set_ro(&self, _: &str, _: bool) -> Result<(), crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_send(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: &[String],
+    ) -> Result<Vec<u8>, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn btrfs_subvolume_receive(
+        &self,
+        _: &str,
+        _: Vec<u8>,
+    ) -> Result<crate::env::BtrfsSubvolumeInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn vm_run(
+        &self,
+        _: crate::env::VmRunRequest,
+    ) -> Result<crate::env::VmInfo, crate::error::EnvError> {
+        unreachable!("SignatureOnlyEnv is never executed")
+    }
+    async fn vm_list(&self) -> Result<Vec<crate::env::VmInfo>, crate::error::EnvError> {
         unreachable!("SignatureOnlyEnv is never executed")
     }
 }

@@ -22,15 +22,19 @@ pub use command::{
 pub use commands::AsyncBuiltin;
 pub use completion::{CompletionItem, CompletionKind, complete_async};
 pub use env::{
-    AsyncByteReceiver, AsyncByteSender, ExecutableMatch, ExternalProcess, ExternalSpawnRequest,
-    FileMetadata, FileType, GrantSpec, HeliosEnv, HttpRedirectMode, HttpRequest, HttpResponse,
-    InspectEntry, InspectValue, InstructionProfileSummary, ProcessInfo, STREAM_CHANNEL_CAPACITY,
-    SnapshotInfo, SysCpuInfo, SysDiskInfo, SysHostInfo, SysMemInfo, SysNetInfo, WatchEvent,
-    normalize_vfs_path,
+    AsyncByteReceiver, AsyncByteSender, BtrfsSubvolumeInfo, ComponentAddRequest, ComponentInfo,
+    ComponentSubtreeSource, ContainerCreateRequest, ContainerExecOutput, ContainerExecRequest,
+    ContainerInfo, ContainerMountSharingSpec, ContainerMountSpec, ContainerSpawnRequest,
+    DEFAULT_LINUX_IMAGE_REF, ExecutableMatch, ExternalProcess, ExternalSpawnRequest, FileMetadata,
+    FileType, GrantSpec, HeliosEnv, HttpRedirectMode, HttpRequest, HttpResponse, InspectEntry,
+    InspectValue, InstructionProfileSummary, LinuxImageClearResult, LinuxImageInfo, MountEntryInfo,
+    MountRequestSpec, MountSharingSpec, MountSourceSpec, OciImageInspect, OciImageSummary,
+    ProcessInfo, STREAM_CHANNEL_CAPACITY, SnapshotInfo, SysCpuInfo, SysDiskInfo, SysHostInfo,
+    SysMemInfo, SysNetInfo, VmInfo, VmRunRequest, VmShareSpec, WatchEvent, normalize_vfs_path,
 };
 pub use error::{EnvError, NuError};
 pub use eval::{eval_block_async, eval_call_by_name_async, eval_closure_async, eval_ir_async};
-pub use pipeline::{AsyncExecutionData, AsyncPipelineData};
+pub use pipeline::{AsyncExecutionData, AsyncPipelineData, UpstreamExit};
 
 use nu_protocol::Value;
 use nu_protocol::engine::{EngineState, Stack, StateWorkingSet};
