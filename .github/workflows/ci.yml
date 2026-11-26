@@ -3061,7 +3061,7 @@ jobs:
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --boot-program procbench --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c '/bin/procbench swap-cycle --mib 64 /bin/procbench' \
             2>&1 > swap-cycle.out | tee "$runtime/inspector.log"
           cat swap-cycle.out
