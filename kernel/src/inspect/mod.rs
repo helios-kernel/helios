@@ -255,7 +255,10 @@ impl InspectRegistry {
 
     /// Snapshots all component publications admitted by `scope` and `prefixes`,
     /// combining them with `kernel_telemetry` when `scope == AuthorityScope::Machine`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "snapshot binds caller scope, timestamp, registries, residency, kernel telemetry, prefix filter, and entry cap explicitly"
+    )]
     pub fn snapshot(
         &self,
         timestamp: u64,
@@ -282,40 +285,50 @@ impl InspectRegistry {
             (limit as usize).min(MAX_INSPECT_LIMIT)
         };
 
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(effective_limit.min(64));
         let mut publications = Vec::new();
+        let mut truncated = false;
 
-        if scope == AuthorityScope::Machine
-            && let Some(telemetry) = kernel_telemetry
-        {
-            emit_kernel_entries(telemetry, prefixes, &mut entries);
-        }
-
+        // Component paths (`/components/*`, `/instances/*`) sort strictly
+        // before `/kernel/*`. Reading component publications in exact sorted
+        // root-prefix order lets each publication bound its decoded entries to
+        // `effective_limit - entries.len()` without losing lexicographical
+        // order or allocating unbounded kernel heap on a small `limit`.
         if prefixes.may_match_subtree("/instances") || prefixes.may_match_subtree("/components") {
-            let candidates: Vec<Arc<PublishedSpan>> = {
+            let mut candidates: Vec<(String, Arc<PublishedSpan>)> = {
                 let table = self.inner.publications.lock();
                 table
                     .iter()
                     .filter(|pub_entry| {
                         scope.admits_instance(caller_id, pub_entry.instance_id, instance_registry)
                     })
-                    .cloned()
+                    .filter_map(|pub_entry| {
+                        let root_prefix = match pub_entry.namespace {
+                            InspectNamespace::Instances => format!(
+                                "/instances/{}/{}",
+                                pub_entry.instance_id.raw(),
+                                pub_entry.name
+                            ),
+                            InspectNamespace::Components => String::from("/components"),
+                        };
+                        prefixes
+                            .may_match_subtree(&root_prefix)
+                            .then(|| (root_prefix, pub_entry.clone()))
+                    })
                     .collect()
             };
+            // Compare with a trailing `/` so sibling names sharing a prefix
+            // (`a` vs `a-b`) order identically to `"{root_prefix}/{rel_path}"`.
+            candidates.sort_unstable_by(|(a, _), (b, _)| {
+                a.as_bytes()
+                    .iter()
+                    .chain(core::iter::once(&b'/'))
+                    .cmp(b.as_bytes().iter().chain(core::iter::once(&b'/')))
+            });
 
-            for pub_entry in candidates {
-                let root_prefix = match pub_entry.namespace {
-                    InspectNamespace::Instances => format!(
-                        "/instances/{}/{}",
-                        pub_entry.instance_id.raw(),
-                        pub_entry.name
-                    ),
-                    InspectNamespace::Components => String::from("/components"),
-                };
-                if !prefixes.may_match_subtree(&root_prefix) {
-                    continue;
-                }
-
+            let mut scratch = Vec::new();
+            let mut path_buf = String::new();
+            for (root_prefix, pub_entry) in candidates {
                 let Some(mapping_guard) = pub_entry.mapping.try_read() else {
                     continue;
                 };
@@ -349,27 +362,31 @@ impl InspectRegistry {
                     continue;
                 }
 
+                let remaining = effective_limit.saturating_sub(entries.len());
                 // SAFETY: `mapping_guard` prevents the owning store from
                 // revoking or recycling the linear memory, `_pin` prevents
                 // swap eviction via `while_off_processor`, and residency was
                 // verified above. Every access uses aligned atomic loads.
-                let outcome = unsafe { buffer::read_span_snapshot(mapped.base, mapped.length) };
+                let outcome = unsafe {
+                    buffer::read_span_snapshot(
+                        mapped.base,
+                        mapped.length,
+                        &mut scratch,
+                        &mut path_buf,
+                        &root_prefix,
+                        prefixes,
+                        remaining,
+                        &mut entries,
+                    )
+                };
                 drop(mapping_guard);
 
                 match outcome {
                     buffer::SpanReadOutcome::Ok {
                         generation,
-                        entries: decoded,
+                        truncated: pub_truncated,
                     } => {
-                        for (rel_path, value) in decoded {
-                            let full_path = format!("{root_prefix}/{rel_path}");
-                            if prefixes.admits(&full_path) {
-                                entries.push(InspectEntry {
-                                    path: full_path,
-                                    value,
-                                });
-                            }
-                        }
+                        truncated |= pub_truncated;
                         publications.push(ComponentPublication {
                             instance_id: pub_entry.instance_id,
                             instance_name: pub_entry.instance_name.clone(),
@@ -400,17 +417,29 @@ impl InspectRegistry {
             }
         }
 
+        if scope == AuthorityScope::Machine
+            && let Some(telemetry) = kernel_telemetry
+            && (!truncated || entries.len() < effective_limit)
+        {
+            let mut kernel_entries = Vec::new();
+            emit_kernel_entries(telemetry, prefixes, &mut kernel_entries);
+            if !kernel_entries.is_empty() {
+                kernel_entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+                let remaining = effective_limit.saturating_sub(entries.len());
+                if kernel_entries.len() > remaining {
+                    truncated = true;
+                    kernel_entries.truncate(remaining);
+                }
+                entries.extend(kernel_entries);
+            }
+        }
+
         entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         publications.sort_unstable_by(|a, b| {
             a.instance_id
                 .cmp(&b.instance_id)
                 .then_with(|| a.name.cmp(&b.name))
         });
-
-        let truncated = entries.len() > effective_limit;
-        if truncated {
-            entries.truncate(effective_limit);
-        }
 
         InspectSnapshot {
             timestamp,
@@ -492,4 +521,112 @@ fn validate_span(memory: GuestMemory, span: Span) -> Result<MappedSpan, InspectP
         return Err(InspectPublishError::BadSpan);
     }
     Ok(MappedSpan { base, length })
+}
+
+#[cfg(test)]
+mod bounded_snapshot_tests {
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::sync::atomic::AtomicU64;
+
+    use helios_hal::vmm::VirtAddr;
+
+    use super::buffer::encode_buffer;
+    use super::{InspectRegistry, InspectValue, PublicationStatus};
+    use crate::buffer::{GuestMemory, Span, WASM_PAGE_BYTES};
+    use crate::{AuthorityScope, InstanceRegistry, PrefixSet};
+
+    #[test]
+    fn snapshot_limit_bounds_decoded_entries_across_publications_in_lexicographical_order() {
+        let instances = InstanceRegistry::new();
+        let inst_a = instances.register("alpha", 1);
+        let inst_b = instances.register("beta", 2);
+        let registry = InspectRegistry::new();
+
+        let total_bytes = 2 * (WASM_PAGE_BYTES as usize);
+        let mut words: Box<[AtomicU64]> = (0..total_bytes / 8)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let gm = GuestMemory::new(
+            VirtAddr::new(words.as_ptr() as usize),
+            (words.len() * 8) as u64,
+        );
+
+        let words_per_page = WASM_PAGE_BYTES as usize / 8;
+        let (page0_words, page1_words) = words.split_at_mut(words_per_page);
+        let page0_ptr = page0_words.as_mut_ptr().cast::<u8>();
+        // SAFETY: `AtomicU64` has the same size and alignment as `u64` with no
+        // padding, and `page0_words` is uniquely borrowed from `words`.
+        let page0 = unsafe { core::slice::from_raw_parts_mut(page0_ptr, WASM_PAGE_BYTES as usize) };
+        encode_buffer(
+            2,
+            &[
+                ("z-last", InspectValue::Blob(vec![0xaa; 256])),
+                ("a-first", InspectValue::Unsigned64(11)),
+                ("m-mid", InspectValue::Text(String::from("mid"))),
+            ],
+            page0,
+        )
+        .expect("encode page 0");
+
+        let page1_ptr = page1_words.as_mut_ptr().cast::<u8>();
+        // SAFETY: `AtomicU64` has the same size and alignment as `u64` with no
+        // padding, and `page1_words` is uniquely borrowed from `words`.
+        let page1 = unsafe { core::slice::from_raw_parts_mut(page1_ptr, WASM_PAGE_BYTES as usize) };
+        encode_buffer(
+            4,
+            &[
+                ("b-second", InspectValue::Blob(vec![0xbb; 512])),
+                ("a-second", InspectValue::Unsigned64(22)),
+            ],
+            page1,
+        )
+        .expect("encode page 1");
+
+        let _p_b = registry
+            .publish(
+                inst_b.id(),
+                "beta",
+                "pub",
+                gm,
+                Span::new(WASM_PAGE_BYTES, WASM_PAGE_BYTES),
+            )
+            .unwrap();
+        let _p_a = registry
+            .publish(
+                inst_a.id(),
+                "alpha",
+                "pub",
+                gm,
+                Span::new(0, WASM_PAGE_BYTES),
+            )
+            .unwrap();
+
+        let snap = registry.snapshot(
+            42,
+            inst_a.id(),
+            Some(AuthorityScope::Machine),
+            &instances,
+            None,
+            None,
+            &PrefixSet::default(),
+            1,
+        );
+        assert!(snap.truncated);
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(
+            snap.entries[0].path,
+            alloc::format!("/instances/{}/pub/a-first", inst_a.id().raw())
+        );
+        assert_eq!(snap.entries[0].value, InspectValue::Unsigned64(11));
+        assert_eq!(snap.publications.len(), 2);
+        assert!(
+            snap.publications
+                .iter()
+                .all(|p| p.status == PublicationStatus::Ok)
+        );
+    }
 }
