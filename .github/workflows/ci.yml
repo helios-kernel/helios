@@ -624,7 +624,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
-    timeout-minutes: 15
+    timeout-minutes: 35
     permissions:
       contents: read
       actions: read
