@@ -128,7 +128,7 @@ use core::ptr::NonNull;
 use thiserror::Error;
 
 use crate::hv::RegisterId;
-use crate::vmm::{PageFlags, VirtAddr, VirtRange};
+use crate::vmm::{PageFlags, SwapToken, VirtAddr, VirtRange};
 
 /// The instruction set a native program is compiled for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +185,8 @@ pub enum NativeError {
     NotMapped,
     #[error("the mapped page has no resident frame and requires backing resolution")]
     BackingFault,
+    #[error("the mapped page is swapped out and must be faulted back in")]
+    Swapped,
     #[error("the register does not exist on this instruction set")]
     Register,
 }
@@ -525,6 +527,76 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     fn read_unrestricted(&self, address: VirtAddr, output: &mut [u8]) -> Result<(), NativeError> {
         self.read(address, output)
     }
+
+    /// Returns the [`SwapToken`] for page `base` if it is currently swapped out.
+    fn swapped_token(&self, _base: VirtAddr) -> Option<SwapToken> {
+        None
+    }
+
+    /// Returns the page-aligned address of the first swapped-out page overlapping
+    /// `range`, if any.
+    fn first_swapped_in(&self, _range: VirtRange) -> Option<VirtAddr> {
+        None
+    }
+
+    /// Returns the page-aligned address of the first swapped-out page anywhere in
+    /// this address space, if any.
+    fn first_swapped_page(&self) -> Option<VirtAddr> {
+        None
+    }
+
+    /// Total bytes of private pages currently swapped out for this address space.
+    fn swapped_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Total bytes of resident backing frames currently mapped in this address space.
+    fn resident_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Scans private resident pages for swap eviction, clearing hardware accessed
+    /// flags when `cold_only` is set, and appends up to `max_pages` candidate page
+    /// addresses to `out`. Returns the number of pages visited.
+    fn scan_private_pages_for_swap(
+        &self,
+        _max_visits: usize,
+        _cold_only: bool,
+        _max_pages: usize,
+        _out: &mut Vec<VirtAddr>,
+    ) -> usize {
+        0
+    }
+
+    /// Detaches a private resident page at `base`, unmapping its translation and
+    /// completing any TLB shootdown before copying its bytes into `out` and
+    /// returning its backing frame to the user memory pool.
+    fn swap_out_private_page(
+        &self,
+        _base: VirtAddr,
+        _token: SwapToken,
+        _out: &mut [u8],
+    ) -> Result<(), NativeError> {
+        Err(NativeError::NotMapped)
+    }
+
+    /// Reinstates a swapped-out private page at `base` from `bytes`, returning the
+    /// [`SwapToken`] the page carried.
+    fn swap_in_private_page(
+        &self,
+        _base: VirtAddr,
+        _bytes: &[u8],
+    ) -> Result<SwapToken, NativeError> {
+        Err(NativeError::NotMapped)
+    }
+
+    /// Drains swap tokens orphaned by `unmap`, `discard`, or overwrites into `out`.
+    fn drain_orphan_swap_tokens(&self, _out: &mut Vec<SwapToken>) {}
+
+    /// Marks this space as torn down and drains all swap tokens (both previously
+    /// orphaned tokens and currently swapped pages) into `out` so the swap service
+    /// can release every backend extent.
+    fn drain_all_swap_tokens_for_teardown(&self, _out: &mut Vec<SwapToken>) {}
 }
 
 /// A run of pages mapped with one access, as [`UserSpace::mapping`]
@@ -697,6 +769,57 @@ unsafe impl UserSpace for Infallible {
     }
 
     fn read_unrestricted(&self, _: VirtAddr, _: &mut [u8]) -> Result<(), NativeError> {
+        match *self {}
+    }
+
+    fn swapped_token(&self, _: VirtAddr) -> Option<SwapToken> {
+        match *self {}
+    }
+
+    fn first_swapped_in(&self, _: VirtRange) -> Option<VirtAddr> {
+        match *self {}
+    }
+
+    fn first_swapped_page(&self) -> Option<VirtAddr> {
+        match *self {}
+    }
+
+    fn swapped_bytes(&self) -> u64 {
+        match *self {}
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        match *self {}
+    }
+
+    fn scan_private_pages_for_swap(
+        &self,
+        _: usize,
+        _: bool,
+        _: usize,
+        _: &mut Vec<VirtAddr>,
+    ) -> usize {
+        match *self {}
+    }
+
+    fn swap_out_private_page(
+        &self,
+        _: VirtAddr,
+        _: SwapToken,
+        _: &mut [u8],
+    ) -> Result<(), NativeError> {
+        match *self {}
+    }
+
+    fn swap_in_private_page(&self, _: VirtAddr, _: &[u8]) -> Result<SwapToken, NativeError> {
+        match *self {}
+    }
+
+    fn drain_orphan_swap_tokens(&self, _: &mut Vec<SwapToken>) {
+        match *self {}
+    }
+
+    fn drain_all_swap_tokens_for_teardown(&self, _: &mut Vec<SwapToken>) {
         match *self {}
     }
 }

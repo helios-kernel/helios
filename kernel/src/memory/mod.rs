@@ -84,9 +84,10 @@ pub use reservations::{
 };
 pub use residency::{ResidencyVmHooks, UserResidency, install_residency_hooks, residency_vm_hooks};
 pub use swap::{
-    AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES,
-    SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace,
-    SwapStats, SwapVmHooks, disable_swap, install_swap, install_swap_hooks, installed_swap_handle,
+    AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, NativeSpaceRegistry,
+    RegisteredNativeSpace, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn,
+    SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, disable_swap, install_swap,
+    install_swap_hooks, install_swap_with_native_spaces, installed_swap_handle,
     installed_swap_hooks, swap_vm_hooks, swapped_token,
 };
 #[cfg(test)]

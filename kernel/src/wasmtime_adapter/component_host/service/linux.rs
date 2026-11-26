@@ -771,7 +771,10 @@ fn map_error(error: NativeError) -> MapError {
         NativeError::OutOfMemory => MapError::OutOfMemory,
         NativeError::Address => MapError::Address,
         NativeError::Overlap => MapError::Occupied,
-        error @ (NativeError::NotMapped | NativeError::BackingFault | NativeError::Register) => {
+        error @ (NativeError::NotMapped
+        | NativeError::BackingFault
+        | NativeError::Swapped
+        | NativeError::Register) => {
             panic!("a validated Linux memory-map call was refused: {error}")
         }
     }
@@ -843,9 +846,12 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
         match self.space.populate(VirtAddr::new(address as usize), bytes) {
             Ok(()) => Ok(()),
             Err(NativeError::OutOfMemory) => Err(MapError::OutOfMemory),
-            Err(NativeError::Address | NativeError::NotMapped | NativeError::BackingFault) => {
-                Err(MapError::Address)
-            }
+            Err(
+                NativeError::Address
+                | NativeError::NotMapped
+                | NativeError::BackingFault
+                | NativeError::Swapped,
+            ) => Err(MapError::Address),
             Err(error @ (NativeError::Overlap | NativeError::Register)) => {
                 panic!("populating a validated Linux mapping was refused: {error}")
             }
