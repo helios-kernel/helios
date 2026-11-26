@@ -25,7 +25,19 @@ pub enum BootMemoryKind {
     /// Memory used by the bootloader (page tables, boot structures) that
     /// remains live until the kernel replaces every reference to it.
     BootloaderReclaimable,
+    /// Physical RAM holding the loaded kernel ELF image and boot modules.
+    KernelAndModules,
+    /// Physical RAM holding firmware ACPI tables that may be reclaimed after
+    /// parsing.
+    AcpiReclaimable,
+    /// Physical RAM reserved for ACPI non-volatile storage (e.g. FACS, vmgenid).
+    AcpiNvs,
+    /// Firmware-reserved memory (`RESERVED`, e.g. UEFI Runtime Services or
+    /// OpenSBI firmware memory) that may reside within physical DRAM banks.
     Reserved,
+    /// Non-DRAM or defective regions (`BAD_MEMORY`, `FRAMEBUFFER`) that are
+    /// never part of physical DRAM banks.
+    Unusable,
 }
 
 impl BootMemoryKind {
@@ -35,7 +47,24 @@ impl BootMemoryKind {
             Self::Usable => 0,
             Self::BootloaderReclaimable => 1,
             Self::Reserved => 2,
+            Self::KernelAndModules => 3,
+            Self::AcpiReclaimable => 4,
+            Self::AcpiNvs => 5,
+            Self::Unusable => 6,
         }
+    }
+
+    /// Whether this region is backed by physical DRAM rather than firmware
+    /// MMIO, ROM, framebuffer, or permanently reserved hardware space.
+    pub const fn is_dram(self) -> bool {
+        matches!(
+            self,
+            Self::Usable
+                | Self::BootloaderReclaimable
+                | Self::KernelAndModules
+                | Self::AcpiReclaimable
+                | Self::AcpiNvs
+        )
     }
 }
 
@@ -109,6 +138,13 @@ impl KernelSectionRange {
 /// writable kernel state that a full-memory snapshot must preserve.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KernelImageSections {
+    /// Full contiguous loaded kernel image span (`virtual_base..bss_end` at
+    /// `physical_base`), covering ELF headers, `.rodata`, `.eh_frame`, `.text`,
+    /// `.data.rel.ro`, `.dynamic`, `.got`, `.data`, and `.bss` when the loader
+    /// places the kernel at a single physical base (e.g. Limine on x86-64 and
+    /// AArch64). Used during hibernate resume to relocate every read-only/RELRO
+    /// image page cleanly when firmware shifts the physical load address.
+    pub image: Option<KernelSectionRange>,
     pub text: KernelSectionRange,
     pub rodata: KernelSectionRange,
     pub data: KernelSectionRange,

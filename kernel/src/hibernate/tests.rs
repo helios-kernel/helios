@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 
-use helios_hal::boot::{BootMemoryKind, BootMemoryRegion};
+use helios_hal::boot::{BootMemoryKind, BootMemoryRegion, KernelSectionRange};
 use helios_hal::cpu::{
     Aarch64SnapshotContext, BspSnapshotContext, ProcessorId, ResumeHandoff, Riscv64SnapshotContext,
     X86_64SnapshotContext,
@@ -17,7 +17,8 @@ use helios_hal::{DeviceInventory, DmaModel};
 use super::HibernateError;
 use super::format::{
     DeviceFeatureRecord, FORMAT_VERSION, HEADER_BYTES, HEADER_MAC_OFFSET, HEADER_MAGIC,
-    HibernateHeader, HibernateIdentity, hash_device_inventory, hash_firmware_memory_map,
+    HibernateHeader, HibernateIdentity, canonical_dram_regions,
+    canonical_firmware_memory_map_count, hash_device_inventory, hash_firmware_memory_map,
     hash_negotiated_features,
 };
 use super::snapshot::{
@@ -80,7 +81,7 @@ fn sample_identity() -> HibernateIdentity {
         boot_payload_len: 0x0020_0000,
         boot_payload_sha256: [0x33; 32],
 
-        firmware_memory_map_count: fw_map.len() as u32,
+        firmware_memory_map_count: canonical_firmware_memory_map_count(&fw_map),
         firmware_memory_map_sha256: hash_firmware_memory_map(&fw_map),
 
         processor_count: 4,
@@ -433,10 +434,10 @@ fn every_identity_mismatch_returns_its_own_typed_error() {
         HibernateError::BootPayloadDigestMismatch
     );
 
-    let mut wrong_payload_addr = base;
-    wrong_payload_addr.boot_payload_phys_addr += 0x1000;
+    let mut wrong_payload_len = base;
+    wrong_payload_len.boot_payload_len += 0x1000;
     assert_eq!(
-        decode_image_into(&image, &key, &wrong_payload_addr, 64, |_, _| Ok(())).unwrap_err(),
+        decode_image_into(&image, &key, &wrong_payload_len, 64, |_, _| Ok(())).unwrap_err(),
         HibernateError::BootPayloadAddressMismatch
     );
 
@@ -1152,8 +1153,8 @@ fn plan_frame_placement_keeps_displaced_trampoline_and_table_disjoint_from_targe
         },
     ];
 
-    let plan = plan_frame_placement(&chunks, &usable, &protected, 5)
-        .expect("64 usable frames easily satisfy 10 displaced + 5 table + 1 tramp + 1 copy table");
+    let plan = plan_frame_placement(&chunks, &[], &usable, &usable, &protected, 5)
+        .expect("64 usable frames easily satisfy 10 displaced + 5 table + 2 tramp + 1 copy table");
 
     // 2..8 (6 frames) + 20..24 (4 frames) = 10 displaced frames;
     // 8..10 (2) + 18..20 (2) + 30..34 (4) = 8 direct frames.
@@ -1185,6 +1186,8 @@ fn plan_frame_placement_keeps_displaced_trampoline_and_table_disjoint_from_targe
     let mut safe_used = BTreeSet::new();
     assert!(!forbidden.contains(&plan.trampoline_phys));
     assert!(safe_used.insert(plan.trampoline_phys));
+    assert!(!forbidden.contains(&plan.trampoline_enter_copy_phys));
+    assert!(safe_used.insert(plan.trampoline_enter_copy_phys));
 
     for &tbl in &plan.trampoline_table_frames {
         assert!(!forbidden.contains(&tbl), "table frame {tbl:#x} collides");
@@ -1252,8 +1255,15 @@ fn plan_frame_placement_reports_insufficient_restore_memory_when_pool_exhausted(
         sha256: [0; 32],
     }];
 
-    let err = plan_frame_placement(&chunks, &usable, core::slice::from_ref(&protected_range), 5)
-        .expect_err("6 free frames cannot satisfy 5 table + 1 tramp + 1 copy table + 4 displaced");
+    let err = plan_frame_placement(
+        &chunks,
+        &[],
+        &usable,
+        &usable,
+        core::slice::from_ref(&protected_range),
+        5,
+    )
+    .expect_err("6 free frames cannot satisfy 5 table + 2 tramp + 1 copy table + 4 displaced");
     assert!(matches!(
         err,
         HibernateError::InsufficientRestoreMemory { .. }
@@ -1375,8 +1385,11 @@ fn probe_and_load_returns_no_image_on_blank_disk_and_invalidates_on_refusal() {
         &identity,
         128,
         &usable,
+        &usable,
+        None,
         &[],
         2,
+        |_, _| {},
         |_, _| {},
         || {},
     );
@@ -1394,8 +1407,11 @@ fn probe_and_load_returns_no_image_on_blank_disk_and_invalidates_on_refusal() {
         &identity,
         128,
         &usable,
+        &usable,
+        None,
         &[],
         2,
+        |_, _| {},
         |_, _| {},
         || {},
     );
@@ -1413,10 +1429,417 @@ fn probe_and_load_returns_no_image_on_blank_disk_and_invalidates_on_refusal() {
         &identity,
         128,
         &usable,
+        &usable,
+        None,
         &[],
         2,
+        |_, _| {},
         |_, _| {},
         || {},
     );
     assert!(matches!(second_probe, ResumeProbe::NoImage));
+}
+
+#[test]
+fn canonical_dram_identity_tolerates_uefi_subsplits_and_refuses_ram_size_change() {
+    use super::verify::verify_identity;
+
+    // Boot 1 (OVMF 2 GiB): DRAM bank [0x10_0000..0x8000_0000] subdivided across
+    // Usable, KernelAndModules, BootloaderReclaimable, AcpiReclaimable, AcpiNvs,
+    // and top-of-RAM UEFI Runtime Services (`Reserved`), plus an Unusable PCI
+    // framebuffer at 0x8000_0000 and standalone Reserved firmware flash.
+    let boot1_map = [
+        BootMemoryRegion {
+            start: 0x0000_0000,
+            end: 0x000a_0000,
+            kind: BootMemoryKind::Usable,
+        },
+        BootMemoryRegion {
+            start: 0x0010_0000,
+            end: 0x784e_b000,
+            kind: BootMemoryKind::Usable,
+        },
+        BootMemoryRegion {
+            start: 0x784e_b000,
+            end: 0x7ab0_0000,
+            kind: BootMemoryKind::KernelAndModules,
+        },
+        BootMemoryRegion {
+            start: 0x7ab0_0000,
+            end: 0x7f80_0000,
+            kind: BootMemoryKind::BootloaderReclaimable,
+        },
+        BootMemoryRegion {
+            start: 0x7f80_0000,
+            end: 0x7fa0_0000,
+            kind: BootMemoryKind::AcpiReclaimable,
+        },
+        BootMemoryRegion {
+            start: 0x7fa0_0000,
+            end: 0x7fc0_0000,
+            kind: BootMemoryKind::AcpiNvs,
+        },
+        BootMemoryRegion {
+            start: 0x7fc0_0000,
+            end: 0x8000_0000,
+            kind: BootMemoryKind::Reserved,
+        },
+        BootMemoryRegion {
+            start: 0x8000_0000,
+            end: 0x8040_0000,
+            kind: BootMemoryKind::Unusable,
+        },
+        BootMemoryRegion {
+            start: 0xffc0_0000,
+            end: 0x1_0000_0000,
+            kind: BootMemoryKind::Reserved,
+        },
+    ];
+
+    // Boot 2 (OVMF 2 GiB after NVRAM update): kernel shifted +1 MiB, ACPI NVS
+    // & UEFI Runtime Services boundary shifted -128 KiB inside the same 2 GiB DRAM.
+    let boot2_map = [
+        BootMemoryRegion {
+            start: 0x0000_0000,
+            end: 0x000a_0000,
+            kind: BootMemoryKind::Usable,
+        },
+        BootMemoryRegion {
+            start: 0x0010_0000,
+            end: 0x785e_b000,
+            kind: BootMemoryKind::Usable,
+        },
+        BootMemoryRegion {
+            start: 0x785e_b000,
+            end: 0x7ac0_0000,
+            kind: BootMemoryKind::KernelAndModules,
+        },
+        BootMemoryRegion {
+            start: 0x7ac0_0000,
+            end: 0x7f7e_0000,
+            kind: BootMemoryKind::BootloaderReclaimable,
+        },
+        BootMemoryRegion {
+            start: 0x7f7e_0000,
+            end: 0x7f9e_0000,
+            kind: BootMemoryKind::AcpiReclaimable,
+        },
+        BootMemoryRegion {
+            start: 0x7f9e_0000,
+            end: 0x7fbe_0000,
+            kind: BootMemoryKind::AcpiNvs,
+        },
+        BootMemoryRegion {
+            start: 0x7fbe_0000,
+            end: 0x8000_0000,
+            kind: BootMemoryKind::Reserved,
+        },
+        BootMemoryRegion {
+            start: 0x8000_0000,
+            end: 0x8040_0000,
+            kind: BootMemoryKind::Unusable,
+        },
+        BootMemoryRegion {
+            start: 0xffc0_0000,
+            end: 0x1_0000_0000,
+            kind: BootMemoryKind::Reserved,
+        },
+    ];
+
+    assert_eq!(
+        canonical_dram_regions(&boot1_map),
+        vec![0x0000_0000..0x000a_0000, 0x0010_0000..0x8000_0000]
+    );
+    assert_eq!(
+        canonical_dram_regions(&boot1_map),
+        canonical_dram_regions(&boot2_map)
+    );
+    assert_eq!(
+        canonical_firmware_memory_map_count(&boot1_map),
+        canonical_firmware_memory_map_count(&boot2_map)
+    );
+    assert_eq!(
+        hash_firmware_memory_map(&boot1_map),
+        hash_firmware_memory_map(&boot2_map)
+    );
+
+    // Adding a second 2 GiB bank (-m 4G) or shrinking RAM (-m 1G) MUST fail.
+    let mut ram_4g = boot2_map.to_vec();
+    ram_4g.push(BootMemoryRegion {
+        start: 0x1_0000_0000,
+        end: 0x1_8000_0000,
+        kind: BootMemoryKind::Usable,
+    });
+    assert_ne!(
+        hash_firmware_memory_map(&boot1_map),
+        hash_firmware_memory_map(&ram_4g)
+    );
+
+    let mut id_boot1 = sample_identity();
+    id_boot1.firmware_memory_map_count = canonical_firmware_memory_map_count(&boot1_map);
+    id_boot1.firmware_memory_map_sha256 = hash_firmware_memory_map(&boot1_map);
+    let digest = id_boot1.digest();
+
+    let mut id_boot2 = id_boot1;
+    id_boot2.kernel_text_phys_start += 0x0010_0000;
+    id_boot2.kernel_rodata_phys_start += 0x0010_0000;
+    id_boot2.boot_payload_phys_addr += 0x0008_0000;
+    id_boot2.firmware_memory_map_count = canonical_firmware_memory_map_count(&boot2_map);
+    id_boot2.firmware_memory_map_sha256 = hash_firmware_memory_map(&boot2_map);
+    verify_identity(&id_boot1, &digest, &id_boot2)
+        .expect("shifted UEFI subsplits and physical load addresses must pass verify_identity");
+
+    let mut id_4g = id_boot2;
+    id_4g.firmware_memory_map_count = canonical_firmware_memory_map_count(&ram_4g);
+    id_4g.firmware_memory_map_sha256 = hash_firmware_memory_map(&ram_4g);
+    assert_eq!(
+        verify_identity(&id_boot1, &digest, &id_4g),
+        Err(HibernateError::FirmwareMemoryMapMismatch)
+    );
+}
+
+#[test]
+fn relocated_kernel_and_payload_pass_identity_and_restore_byte_for_byte_with_overlap() {
+    use super::resume::{ResumeProbe, probe_and_load_hibernate_image};
+    use super::storage::{HIBERNATE_SECTOR_BYTES, HibernateStorage, HibernateStorageError};
+    use alloc::collections::BTreeSet;
+
+    struct MemDisk(Vec<u8>);
+    impl HibernateStorage for MemDisk {
+        fn capacity_bytes(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn sector_size(&self) -> usize {
+            HIBERNATE_SECTOR_BYTES
+        }
+        fn reinitialize_for_write(&mut self) -> Result<(), HibernateStorageError> {
+            Ok(())
+        }
+        fn write_sectors(
+            &mut self,
+            start_sector: u64,
+            data: &[u8],
+        ) -> Result<(), HibernateStorageError> {
+            let off = (start_sector as usize) * HIBERNATE_SECTOR_BYTES;
+            self.0[off..off + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), HibernateStorageError> {
+            Ok(())
+        }
+        fn read_sectors(
+            &mut self,
+            start_sector: u64,
+            dst: &mut [u8],
+        ) -> Result<(), HibernateStorageError> {
+            let off = (start_sector as usize) * HIBERNATE_SECTOR_BYTES;
+            dst.copy_from_slice(&self.0[off..off + dst.len()]);
+            Ok(())
+        }
+    }
+
+    let p = PhysFrame::SIZE as u64;
+    let key = auth_key(0xe2);
+
+    // Boot 1 layout (inside 128 frames of DRAM):
+    // - Full kernel ELF image: frames 16..26
+    //   - .rodata: frames 16..18 (unaligned sub-page start +0x400 to mirror real ELF!)
+    //   - .text:   frames 18..22
+    //   - .data.rel.ro / .got: frames 22..24
+    //   - writable .data/.bss: frames 24..26 (saved in chunks!)
+    // - boot_payload: frames 30..34 (3 full pages + 512 bytes tail)
+    // - user memory:  frames 4..8 (saved in chunks!)
+    let mut boot1_id = sample_identity();
+    boot1_id.kernel_rodata_phys_start = 16 * p + 0x400;
+    boot1_id.kernel_rodata_virt_start = 0xffff_ffff_8000_0400;
+    boot1_id.kernel_rodata_len = 2 * p - 0x400;
+    boot1_id.kernel_text_phys_start = 18 * p;
+    boot1_id.kernel_text_virt_start = 0xffff_ffff_8000_2000;
+    boot1_id.kernel_text_len = 4 * p;
+    boot1_id.boot_payload_phys_addr = 30 * p;
+    boot1_id.boot_payload_len = 3 * p + 512;
+
+    let chunk_runs = [FrameRun::new(4, 4), FrameRun::new(24, 2)];
+    let (mut image_bytes, _header, expected_chunk_frames) =
+        build_synthetic_image(&key, boot1_id, &chunk_runs, 128, 4);
+    image_bytes.resize(512 * 1024, 0);
+    let mut disk = MemDisk(image_bytes);
+
+    // Boot 2 shifts the kernel image +4 frames (frames 20..30, overlapping Boot
+    // 1's 16..26!) and shifts boot_payload +2 frames (frames 32..36, overlapping
+    // Boot 1's 30..34!).
+    let mut boot2_id = boot1_id;
+    boot2_id.kernel_rodata_phys_start = 20 * p + 0x400;
+    boot2_id.kernel_text_phys_start = 22 * p;
+    boot2_id.boot_payload_phys_addr = 32 * p;
+    let boot2_kernel_image = KernelSectionRange::new(20 * p, 0xffff_ffff_8000_0000, 10 * p);
+
+    // Populate Boot 2's simulated physical RAM with distinct immutable bytes in
+    // its kernel image (frames 20..30) and boot payload (frames 32..36).
+    let mut ram: BTreeMap<u64, [u8; PhysFrame::SIZE]> = BTreeMap::new();
+    let mut expected_relocated_kernel: BTreeMap<u64, [u8; PhysFrame::SIZE]> = BTreeMap::new();
+    for offset in 0..10_u64 {
+        let mut frame = [0_u8; PhysFrame::SIZE];
+        for (i, b) in frame.iter_mut().enumerate() {
+            *b = ((offset as usize * 37 + i * 13) ^ 0x5a) as u8;
+        }
+        ram.insert((20 + offset) * p, frame);
+        if offset < 8 {
+            // Frames 16..24 (read-only + RELRO/GOT) must match Boot 2's image
+            // bytes; frames 24..26 (.data/.bss) MUST come from Boot 1's chunks!
+            expected_relocated_kernel.insert((16 + offset) * p, frame);
+        }
+    }
+    let mut expected_relocated_payload: BTreeMap<u64, [u8; PhysFrame::SIZE]> = BTreeMap::new();
+    for offset in 0..4_u64 {
+        let mut frame = [0_u8; PhysFrame::SIZE];
+        for (i, b) in frame.iter_mut().enumerate() {
+            *b = ((offset as usize * 71 + i * 3) ^ 0xa5) as u8;
+        }
+        ram.insert((32 + offset) * p, frame);
+        let mut expected = frame;
+        if offset == 3 {
+            expected[512..].fill(0);
+        }
+        expected_relocated_payload.insert((30 + offset) * p, expected);
+    }
+
+    let dram = [FrameRun::new(0, 128)];
+    // Boot 2's Usable RAM excludes its own kernel (20..30) and payload (32..36).
+    let usable = [
+        FrameRun::new(0, 20),
+        FrameRun::new(30, 2),
+        FrameRun::new(36, 92),
+    ];
+    let protected = [(20 * p)..(30 * p), (32 * p)..(36 * p)];
+
+    let ram = core::cell::RefCell::new(ram);
+    let loaded = match probe_and_load_hibernate_image(
+        &mut disk,
+        Some(&key),
+        &boot2_id,
+        128,
+        &usable,
+        &dram,
+        Some(boot2_kernel_image),
+        &protected,
+        6,
+        |src_phys, dst| {
+            *dst = *ram
+                .borrow()
+                .get(&src_phys)
+                .unwrap_or_else(|| panic!("missing relocated source frame {src_phys:#x}"));
+        },
+        |dst_phys, src| {
+            ram.borrow_mut().insert(dst_phys, *src);
+        },
+        || {},
+    ) {
+        ResumeProbe::Ready(loaded) => loaded,
+        other => panic!("expected ResumeProbe::Ready for relocated boot, got {other:?}"),
+    };
+    let mut ram = ram.into_inner();
+
+    // 8 relocated kernel frames (16..24, skipping 24..26 owned by chunks) +
+    // 4 relocated payload frames (30..34) = 12 relocated frames.
+    assert_eq!(loaded.plan.relocated_placements.len(), 12);
+
+    // Every safe allocation (trampoline, enter_copy, tables, copy_table,
+    // displaced srcs) must be unique and disjoint from Boot 2 protected ranges
+    // AND all Boot 1 targets (chunks + relocated).
+    let mut forbidden = BTreeSet::new();
+    for f in (4..8)
+        .chain(16..26)
+        .chain(20..30)
+        .chain(30..34)
+        .chain(32..36)
+    {
+        forbidden.insert(f * p);
+    }
+    let mut safe_used = BTreeSet::new();
+    assert!(!forbidden.contains(&loaded.plan.trampoline_phys));
+    assert!(safe_used.insert(loaded.plan.trampoline_phys));
+    assert!(!forbidden.contains(&loaded.plan.trampoline_enter_copy_phys));
+    assert!(safe_used.insert(loaded.plan.trampoline_enter_copy_phys));
+    for &tbl in &loaded.plan.trampoline_table_frames {
+        assert!(!forbidden.contains(&tbl));
+        assert!(safe_used.insert(tbl));
+    }
+    for i in 0..loaded.plan.copy_table_pages {
+        let addr = loaded.plan.copy_table_phys + i * p;
+        assert!(!forbidden.contains(&addr));
+        assert!(safe_used.insert(addr));
+    }
+    for copy in &loaded.plan.displaced_copies {
+        assert!(!forbidden.contains(&copy.src_phys));
+        assert!(safe_used.insert(copy.src_phys));
+    }
+
+    // Execute the restore trampoline's linear copy loop on simulated RAM.
+    for copy in &loaded.plan.displaced_copies {
+        let bytes = *ram
+            .get(&copy.src_phys)
+            .expect("displaced source frame staged");
+        ram.insert(copy.dst_phys, bytes);
+    }
+
+    // Verify all chunks (user 4..8 AND mutated .data 24..26) restored intact.
+    for (frame, expected) in &expected_chunk_frames {
+        assert_eq!(
+            ram.get(&(frame * p)).expect("chunk frame present"),
+            expected,
+            "chunk frame {frame} mismatch after relocation restore"
+        );
+    }
+    // Verify all read-only/RELRO kernel pages (16..24) restored intact.
+    for (phys, expected) in &expected_relocated_kernel {
+        assert_eq!(
+            ram.get(phys).expect("relocated kernel frame present"),
+            expected,
+            "relocated kernel frame {phys:#x} mismatch"
+        );
+    }
+    // Verify all boot payload pages (30..34, including zero-padded tail) intact.
+    for (phys, expected) in &expected_relocated_payload {
+        assert_eq!(
+            ram.get(phys).expect("relocated payload frame present"),
+            expected,
+            "relocated payload frame {phys:#x} mismatch"
+        );
+    }
+}
+
+#[test]
+fn plan_frame_placement_refuses_target_outside_dram_regions() {
+    use super::format::ChunkDescriptor;
+    use super::resume::{RelocatedRegion, plan_frame_placement};
+
+    let p = PhysFrame::SIZE as u64;
+    // DRAM is only frames 0..64; frames 64..80 are outside DRAM (MMIO/Unusable).
+    let dram = [FrameRun::new(0, 64)];
+    let usable = [FrameRun::new(0, 64)];
+
+    let bad_chunk = [ChunkDescriptor {
+        start_phys_frame: 62,
+        frame_count: 4, // 64..66 lie outside DRAM
+        uncompressed_len: 4 * PhysFrame::SIZE as u32,
+        compressed_len: 100,
+        flags: 0,
+        data_offset: HEADER_BYTES as u64,
+        sha256: [0; 32],
+    }];
+    assert_eq!(
+        plan_frame_placement(&bad_chunk, &[], &usable, &dram, &[], 4),
+        Err(HibernateError::FirmwareMemoryMapMismatch)
+    );
+
+    let bad_reloc = [RelocatedRegion {
+        boot_src_phys: 10 * p,
+        image_dst_phys: 64 * p,
+        byte_len: 2 * p,
+    }];
+    assert_eq!(
+        plan_frame_placement(&[], &bad_reloc, &usable, &dram, &[], 4),
+        Err(HibernateError::FirmwareMemoryMapMismatch)
+    );
 }

@@ -38,8 +38,11 @@ pub fn verify_identity(
     if !constant_time_eq_32(&image_identity.digest(), header_identity_digest) {
         return Err(HibernateError::IdentityDigestMismatch);
     }
-    if image_identity.kernel_text_phys_start != expected.kernel_text_phys_start
-        || image_identity.kernel_text_virt_start != expected.kernel_text_virt_start
+    // Physical load addresses of `.text`, `.rodata`, and `boot_payload` are
+    // allowed to shift between UEFI boots; virtual addresses, lengths, and
+    // SHA-256 digests must match identically, and the resume loader relocates
+    // the immutable bytes into the image's expected physical addresses.
+    if image_identity.kernel_text_virt_start != expected.kernel_text_virt_start
         || image_identity.kernel_text_len != expected.kernel_text_len
         || !constant_time_eq_32(
             &image_identity.kernel_text_sha256,
@@ -48,8 +51,7 @@ pub fn verify_identity(
     {
         return Err(HibernateError::KernelTextMismatch);
     }
-    if image_identity.kernel_rodata_phys_start != expected.kernel_rodata_phys_start
-        || image_identity.kernel_rodata_virt_start != expected.kernel_rodata_virt_start
+    if image_identity.kernel_rodata_virt_start != expected.kernel_rodata_virt_start
         || image_identity.kernel_rodata_len != expected.kernel_rodata_len
         || !constant_time_eq_32(
             &image_identity.kernel_rodata_sha256,
@@ -64,9 +66,7 @@ pub fn verify_identity(
     ) {
         return Err(HibernateError::BootPayloadDigestMismatch);
     }
-    if image_identity.boot_payload_phys_addr != expected.boot_payload_phys_addr
-        || image_identity.boot_payload_len != expected.boot_payload_len
-    {
+    if image_identity.boot_payload_len != expected.boot_payload_len {
         return Err(HibernateError::BootPayloadAddressMismatch);
     }
     if image_identity.firmware_memory_map_count != expected.firmware_memory_map_count

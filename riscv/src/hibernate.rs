@@ -34,7 +34,7 @@ use helios_kernel::hibernate::{
     DeviceFeatureRecord, HIBERNATE_FREEZE_DEADLINE, HibernateDeviceController,
     HibernateDeviceError, HibernateOutcome, HibernateRequest, HibernateRequestError,
     LoadedHibernateImage, ResumeProbe, VirtioBlockHibernateStorage, build_machine_identity,
-    collect_boot_protected_ranges, compute_hibernate_reservation_bytes,
+    collect_boot_protected_ranges, compute_hibernate_reservation_bytes, dram_physical_frame_runs,
     hibernate_machine_with_handle, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 use helios_kernel::{
@@ -472,6 +472,7 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
     let max_phys = boot_memory.max_physical_address();
     let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
     let usable_frames = usable_physical_frame_runs(boot_memory);
+    let dram_frames = dram_physical_frame_runs(boot_memory);
     let protected_ranges = collect_boot_protected_ranges(boot_memory, pool, extra_protected);
     // 1 frame: Sv48 root table whose entry 0 is a 512 GiB RWX identity leaf.
     let table_pages = 1_usize;
@@ -491,8 +492,21 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         &expected_identity,
         machine_max_frames,
         &usable_frames,
+        &dram_frames,
+        boot_memory.kernel_sections.image,
         &protected_ranges,
         table_pages,
+        |src_phys, frame_bytes| {
+            // SAFETY: RISC-V identity-maps all physical RAM; `src_phys` lies
+            // in Boot 2's immutable kernel image or boot payload region.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::with_exposed_provenance::<u8>(src_phys as usize),
+                    frame_bytes.as_mut_ptr(),
+                    PhysFrame::SIZE,
+                );
+            }
+        },
         |dst_phys, frame_bytes| {
             // SAFETY: RISC-V identity-maps all physical RAM; `dst_phys` is
             // either a non-colliding final target frame or a safe displaced
@@ -512,6 +526,12 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         ResumeProbe::NoImage | ResumeProbe::Refused(_) => return,
         ResumeProbe::Ready(loaded) => loaded,
     };
+
+    assert_eq!(
+        loaded.header.identity.kernel_text_phys_start,
+        boot_memory.kernel_sections.text.physical_start,
+        "identity-mapped RISC-V kernel .text physical start must match across resume"
+    );
 
     // Collect fresh per-boot handoff state BEFORE quiescing devices.
     let mut fresh_entropy = [0_u8; 32];
@@ -541,6 +561,7 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         image_id = format_args!("{:032x}", u128::from_be_bytes(handoff.image_id)),
         direct_frames = loaded.plan.direct_frames,
         displaced_frames = loaded.plan.displaced_copies.len(),
+        relocated_frames = loaded.plan.relocated_placements.len(),
         "entering RISC-V hibernate restore trampoline"
     );
 

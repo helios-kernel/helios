@@ -1421,6 +1421,7 @@ fn collect_boot_memory_metadata(
     let stack = riscv_section_range(&raw const __estack, &raw const __sstack);
     let mut metadata = BootMemoryMetadata {
         kernel_sections: KernelImageSections {
+            image: None,
             text: riscv_section_range(&raw const __stext, &raw const __etext),
             rodata: riscv_section_range(&raw const __srodata, &raw const __erodata),
             data: riscv_section_range(&raw const __sdata, &raw const __edata),

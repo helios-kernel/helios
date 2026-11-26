@@ -27,8 +27,8 @@
 .option arch, +f, +d
 
 .section .text.helios_riscv_restore, "ax"
+.balign 4096
 .global __helios_riscv_restore_trampoline
-.balign 4
 __helios_riscv_restore_trampoline:
     // Ensure supervisor interrupts are masked and `sie` is cleared while
     // physical memory is rewritten.
@@ -69,7 +69,13 @@ __helios_riscv_restore_trampoline:
     // Order all memory writes and flush the instruction stream.
     fence rw, rw
     fence.i
+    j __helios_riscv_restore_finish
+.global __helios_riscv_restore_trampoline_enter_end
+__helios_riscv_restore_trampoline_enter_end:
 
+.balign 4096
+.global __helios_riscv_restore_finish
+__helios_riscv_restore_finish:
     // Load pointer to saved `Riscv64SnapshotContext` and `handoff_phys`.
     ld t0, 0x28(t6)         // ctx_phys
     ld a1, 0x20(t6)         // handoff_phys

@@ -75,6 +75,7 @@ use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::numa::NumaTopology;
+use helios_hal::pmm::PhysFrame;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{
@@ -1036,28 +1037,49 @@ fn collect_boot_memory_metadata(
     physical_memory_offset: usize,
     payload_sha256: &[u8; 32],
 ) -> BootMemoryMetadata {
+    let text = x86_section_range(
+        &raw const __helios_text_start,
+        &raw const __helios_text_end,
+        handoff,
+    );
+    let rodata = x86_section_range(
+        &raw const __helios_rodata_start,
+        &raw const __helios_rodata_end,
+        handoff,
+    );
+    let data = x86_section_range(
+        &raw const __helios_data_start,
+        &raw const __helios_data_end,
+        handoff,
+    );
+    let bss = x86_section_range(
+        &raw const __helios_bss_start,
+        &raw const __helios_bss_end,
+        handoff,
+    );
+    let image_end_virt = [
+        text.virtual_end(),
+        rodata.virtual_end(),
+        data.virtual_end(),
+        bss.virtual_end(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(handoff.kernel.virtual_base);
+    let image_len = image_end_virt
+        .saturating_sub(handoff.kernel.virtual_base)
+        .next_multiple_of(PhysFrame::SIZE as u64);
     let mut metadata = BootMemoryMetadata {
         kernel_sections: KernelImageSections {
-            text: x86_section_range(
-                &raw const __helios_text_start,
-                &raw const __helios_text_end,
-                handoff,
-            ),
-            rodata: x86_section_range(
-                &raw const __helios_rodata_start,
-                &raw const __helios_rodata_end,
-                handoff,
-            ),
-            data: x86_section_range(
-                &raw const __helios_data_start,
-                &raw const __helios_data_end,
-                handoff,
-            ),
-            bss: x86_section_range(
-                &raw const __helios_bss_start,
-                &raw const __helios_bss_end,
-                handoff,
-            ),
+            image: Some(KernelSectionRange::new(
+                handoff.kernel.physical_base,
+                handoff.kernel.virtual_base,
+                image_len,
+            )),
+            text,
+            rodata,
+            data,
+            bss,
             uninit: None,
             stack: None,
         },

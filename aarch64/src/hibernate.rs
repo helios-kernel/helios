@@ -35,7 +35,7 @@ use helios_kernel::hibernate::{
     DeviceFeatureRecord, HIBERNATE_FREEZE_DEADLINE, HibernateDeviceController,
     HibernateDeviceError, HibernateOutcome, HibernateRequest, HibernateRequestError,
     LoadedHibernateImage, ResumeProbe, VirtioBlockHibernateStorage, build_machine_identity,
-    collect_boot_protected_ranges, compute_hibernate_reservation_bytes,
+    collect_boot_protected_ranges, compute_hibernate_reservation_bytes, dram_physical_frame_runs,
     hibernate_machine_with_handle, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 use helios_kernel::{
@@ -64,7 +64,9 @@ global_asm!(include_str!("restore.S"));
 
 unsafe extern "C" {
     fn __helios_aarch64_restore_trampoline(params: *const Aarch64RestoreParams) -> !;
-    static __helios_aarch64_restore_trampoline_end: u8;
+    static __helios_aarch64_restore_trampoline_enter_end: u8;
+    fn __helios_aarch64_restore_finish() -> !;
+    static __helios_aarch64_restore_finish_end: u8;
 }
 
 /// Polled I/O deadline for early-boot hibernate disk discovery, verification,
@@ -489,10 +491,11 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
     let max_phys = boot_memory.max_physical_address();
     let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
     let usable_frames = usable_physical_frame_runs(boot_memory);
+    let dram_frames = dram_physical_frame_runs(boot_memory);
     let protected_ranges = collect_boot_protected_ranges(boot_memory, pool, extra_protected);
-    // 5 frames: L0 + HHDM L1 (1 GiB blocks up to 512 GiB) + L1/L2/L3 for
-    // the trampoline `.text` page(s).
-    let table_pages = 5_usize;
+    // 8 frames: L0 + HHDM L1 (1 GiB blocks up to 512 GiB) + up to 3 tables for
+    // `V_enter` + up to 3 tables for `V_finish`.
+    let table_pages = 8_usize;
 
     let cpu_for_storage = *cpu;
     let deadline = cpu
@@ -509,8 +512,24 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         &expected_identity,
         machine_max_frames,
         &usable_frames,
+        &dram_frames,
+        boot_memory.kernel_sections.image,
         &protected_ranges,
         table_pages,
+        |src_phys, frame_bytes| {
+            let src_virt = (src_phys as usize)
+                .checked_add(physical_memory_offset)
+                .expect("hibernate relocation source overflows HHDM");
+            // SAFETY: `src_phys` lies in Boot 2's immutable kernel image or
+            // boot payload region, mapped readable in the HHDM.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::with_exposed_provenance::<u8>(src_virt),
+                    frame_bytes.as_mut_ptr(),
+                    PhysFrame::SIZE,
+                );
+            }
+        },
         |dst_phys, frame_bytes| {
             let dst_virt = (dst_phys as usize)
                 .checked_add(physical_memory_offset)
@@ -576,6 +595,7 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         image_id = format_args!("{:032x}", u128::from_be_bytes(handoff.image_id)),
         direct_frames = loaded.plan.direct_frames,
         displaced_frames = loaded.plan.displaced_copies.len(),
+        relocated_frames = loaded.plan.relocated_placements.len(),
         "entering AArch64 hibernate restore trampoline"
     );
 
@@ -722,6 +742,26 @@ unsafe extern "C" fn limine_secondary_power_off_main(mp_info: &MpInfo) -> ! {
     crate::lifecycle::Psci::cpu_off_current(conduit)
 }
 
+/// Cleans the data cache to Point of Unification across one 4 KiB page at
+/// `virt` so instruction fetches after `ic iallu` observe freshly copied code.
+fn clean_dcache_pou_page(virt: usize) {
+    let ctr: u64;
+    // SAFETY: reading `CTR_EL0` at EL1 has no side effects.
+    unsafe {
+        asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+    let dminline = 4_usize << ((ctr >> 16) & 0xf);
+    let mut addr = virt;
+    let end = virt + PhysFrame::SIZE;
+    while addr < end {
+        // SAFETY: `addr` lies within a mapped Normal WB 4 KiB frame in HHDM.
+        unsafe {
+            asm!("dc cvau, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += dminline;
+    }
+}
+
 fn enter_restore_trampoline(
     loaded: &LoadedHibernateImage,
     handoff: ResumeHandoff,
@@ -755,13 +795,78 @@ fn enter_restore_trampoline(
         virt as u64
     };
 
-    // 2. Build a self-contained TTBR1 page table inside
-    //    `plan.trampoline_table_frames`.
+    // 2. Stage a safe copy of `V_enter` into `plan.trampoline_enter_copy_phys`,
+    //    clean D-cache to PoU on `trampoline_enter_copy_phys` and every
+    //    direct-placed relocated frame, and build the self-contained TTBR1
+    //    table mapping `V_enter -> enter_copy_phys` and
+    //    `V_finish -> image_finish_phys`.
+    let enter_virt = __helios_aarch64_restore_trampoline as *const () as usize;
+    let enter_end = &raw const __helios_aarch64_restore_trampoline_enter_end as usize;
+    let finish_virt = __helios_aarch64_restore_finish as *const () as usize;
+    let finish_end = &raw const __helios_aarch64_restore_finish_end as usize;
+    assert!(
+        enter_virt.is_multiple_of(PhysFrame::SIZE),
+        "AArch64 restore trampoline entry is not page-aligned"
+    );
+    assert!(
+        finish_virt.is_multiple_of(PhysFrame::SIZE),
+        "AArch64 restore trampoline finish is not page-aligned"
+    );
+    assert!(
+        enter_end > enter_virt && enter_end - enter_virt <= PhysFrame::SIZE,
+        "AArch64 restore trampoline entry exceeds one 4 KiB page"
+    );
+    assert!(
+        finish_end > finish_virt && finish_end - finish_virt <= PhysFrame::SIZE,
+        "AArch64 restore trampoline finish exceeds one 4 KiB page"
+    );
+    assert_ne!(
+        enter_virt, finish_virt,
+        "AArch64 restore trampoline entry and finish must occupy distinct pages"
+    );
+
+    let enter_copy_virt = (plan.trampoline_enter_copy_phys as usize)
+        .checked_add(physical_memory_offset)
+        .expect("trampoline entry copy address overflows HHDM");
+    // SAFETY: `enter_virt` is a mapped readable 4 KiB `.text` page of the
+    // running kernel and `enter_copy_virt` is an exclusively owned safe 4 KiB
+    // frame mapped writable in HHDM.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::with_exposed_provenance::<u8>(enter_virt),
+            core::ptr::with_exposed_provenance_mut::<u8>(enter_copy_virt),
+            PhysFrame::SIZE,
+        );
+    }
+    clean_dcache_pou_page(enter_copy_virt);
+
+    for reloc in &plan.relocated_placements {
+        if reloc.staging_phys == reloc.dst_phys {
+            let dst_virt = (reloc.dst_phys as usize)
+                .checked_add(physical_memory_offset)
+                .expect("direct relocated frame overflows HHDM");
+            clean_dcache_pou_page(dst_virt);
+        }
+    }
+
+    let offset_in_text = (finish_virt as u64)
+        .checked_sub(loaded.header.identity.kernel_text_virt_start)
+        .expect("AArch64 restore finish lies outside kernel .text");
+    let image_finish_phys = loaded.header.identity.kernel_text_phys_start + offset_in_text;
+    assert!(
+        image_finish_phys.is_multiple_of(PhysFrame::SIZE as u64),
+        "image restore finish physical address is not page-aligned"
+    );
+
     let trampoline_ttbr1 = build_trampoline_page_tables(
         &plan.trampoline_table_frames,
         boot_memory,
         physical_memory_offset,
         bti_enabled,
+        enter_virt,
+        plan.trampoline_enter_copy_phys,
+        finish_virt,
+        image_finish_phys,
     );
 
     // 3. Populate the safe trampoline page with `Aarch64RestoreParams`,
@@ -817,11 +922,19 @@ fn enter_restore_trampoline(
         );
     }
 
-    // Ensure all direct-placed image frames and trampoline structures are
-    // coherent with instruction fetch before entering the trampoline.
-    // SAFETY: `dsb ish` orders all preceding writes across the inner shareable domain.
+    // Ensure all direct-placed image frames, `trampoline_enter_copy_phys`, and
+    // trampoline structures are coherent with instruction fetch before
+    // entering the trampoline.
+    // SAFETY: `dsb ish; ic iallu; dsb ish; isb` orders all preceding writes
+    // and invalidates any stale I-cache lines for `trampoline_enter_copy_phys`.
     unsafe {
-        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!(
+            "dsb ish",
+            "ic iallu",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        );
     }
 
     // SAFETY: all displaced frames are staged in disjoint safe frames, the
@@ -836,15 +949,24 @@ fn enter_restore_trampoline(
 }
 
 /// Builds a self-contained AArch64 4-level TTBR1 page table in `table_frames`
-/// (5 frames) mapping:
+/// (up to 8 frames) mapping:
 /// - `0..max_phys` at `physical_memory_offset + phys` using 1 GiB blocks (RW, PXN, UXN),
-/// - the kernel `.text` page(s) containing [`__helios_aarch64_restore_trampoline`]
-///   at their exact linked virtual address (RX, with `GP` set if BTI is enabled).
+/// - `enter_virt` (`V_enter`) -> `enter_copy_phys` (RX, `GP` if BTI), and
+/// - `finish_virt` (`V_finish`) -> `image_finish_phys` (RX, `GP` if BTI,
+///   matching Boot 1's saved `ctx.ttbr1_el1`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "page-table builder takes explicit physical/virtual trampoline mappings"
+)]
 fn build_trampoline_page_tables(
     table_frames: &[u64],
     boot_memory: &BootMemoryMetadata,
     physical_memory_offset: usize,
     bti_enabled: bool,
+    enter_virt: usize,
+    enter_copy_phys: u64,
+    finish_virt: usize,
+    image_finish_phys: u64,
 ) -> u64 {
     const TABLE_DESC: u64 = 0b11;
     const BLOCK_DESC: u64 = 0b01;
@@ -911,21 +1033,13 @@ fn build_trampoline_page_tables(
         hhdm_l1[l1_idx] = phys | BLOCK_DESC | attr_field | SH_INNER | AF | PXN | UXN;
     }
 
-    // 2. Map every 4 KiB page of `__helios_aarch64_restore_trampoline` at its
-    //    exact kernel `.text` virtual address (Normal WB, RO, executable, GP if BTI).
-    let text = boot_memory.kernel_sections.text;
-    let stub_start =
-        (__helios_aarch64_restore_trampoline as *const () as usize) & !(PhysFrame::SIZE - 1);
-    let stub_end =
-        ((&raw const __helios_aarch64_restore_trampoline_end as usize) + PhysFrame::SIZE - 1)
-            & !(PhysFrame::SIZE - 1);
+    // 2. Map `V_enter` -> `enter_copy_phys` and `V_finish` ->
+    //    `image_finish_phys` (Normal WB, RO, executable, GP if BTI).
     let gp_bit = if bti_enabled { GP } else { 0 };
-    let mut virt = stub_start;
-    while virt < stub_end {
-        let offset_in_text = (virt as u64)
-            .checked_sub(text.virtual_start)
-            .expect("restore trampoline lies outside kernel .text");
-        let phys = text.physical_start + offset_in_text;
+    for (virt, phys) in [
+        (enter_virt, enter_copy_phys),
+        (finish_virt, image_finish_phys),
+    ] {
         let i0 = (virt >> 39) & 0x1ff;
         let i1 = (virt >> 30) & 0x1ff;
         let i2 = (virt >> 21) & 0x1ff;
@@ -957,7 +1071,6 @@ fn build_trampoline_page_tables(
         };
         table_at(l3_phys)[i3] =
             phys | PAGE_DESC | attr_field | SH_INNER | AF | AP_KERNEL_RO | gp_bit | UXN;
-        virt += PhysFrame::SIZE;
     }
 
     // SAFETY: `dsb ishst` ensures all new page-table entries are visible before

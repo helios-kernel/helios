@@ -35,13 +35,15 @@ pub use format::{
     CHUNK_DESCRIPTOR_BYTES, ChunkDescriptor, DEFAULT_CHUNK_FRAMES,
     DEFAULT_HIBERNATE_COMPRESSION_LEVEL, DeviceFeatureRecord, FORMAT_VERSION, HEADER_BYTES,
     HEADER_MAC_BYTES, HEADER_MAC_OFFSET, HEADER_MAGIC, HibernateHeader, HibernateIdentity,
-    MAX_CHUNKS, hash_device_inventory, hash_firmware_memory_map, hash_negotiated_features,
+    MAX_CHUNKS, canonical_dram_regions, canonical_firmware_memory_map_count, hash_device_inventory,
+    hash_firmware_memory_map, hash_negotiated_features,
 };
 pub use helios_hal::cpu::{DisplacedFrameCopy, ResumeHandoff, ResumeHandoffWire};
 pub use resume::{
-    ChunkPlacement, FramePlacementPlan, LoadedHibernateImage, ResumeProbe, build_machine_identity,
-    build_machine_identity_with_hashes, collect_boot_protected_ranges, plan_frame_placement,
-    probe_and_load_hibernate_image, usable_physical_frame_runs,
+    ChunkPlacement, FramePlacementPlan, LoadedHibernateImage, RelocatedFramePlacement,
+    RelocatedRegion, ResumeProbe, build_machine_identity, build_machine_identity_with_hashes,
+    build_relocated_regions, collect_boot_protected_ranges, dram_physical_frame_runs,
+    plan_frame_placement, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 pub use snapshot::{
     AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, ReservationWriter,

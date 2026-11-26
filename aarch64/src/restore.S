@@ -36,6 +36,7 @@
 //   0x120:      rgsr_el1
 .section .text.helios_aarch64_restore, "ax"
 .arch armv8.5-a+memtag
+.balign 4096
 
 .global __helios_aarch64_restore_trampoline
 .type __helios_aarch64_restore_trampoline, %function
@@ -49,9 +50,9 @@ __helios_aarch64_restore_trampoline:
     ldr x1, [x19, #0x20]
     mov sp, x1
 
-    // Switch TTBR1_EL1 to the self-contained safe trampoline page tables so
-    // displaced copies overwriting bootloader-reclaimable memory cannot touch
-    // active translation tables.
+    // Switch TTBR1_EL1 to the self-contained safe trampoline page tables.
+    // `V_enter` maps to `trampoline_enter_copy_phys` (exact copy of this page),
+    // so the copy loop can overwrite Boot 2's `.text` without faulting.
     ldr x1, [x19, #0x00]
     msr ttbr1_el1, x1
     dsb ish
@@ -107,8 +108,23 @@ __helios_aarch64_restore_trampoline:
     sub x9, x9, #1
     b .Lhelios_aarch64_copy_loop
 .Lhelios_aarch64_copy_done:
+    // Invalidate the entire instruction cache across all restored & relocated
+    // `.text` pages before branching to `V_finish`.
+    dsb ish
+    ic iallu
     dsb ish
     isb
+    b __helios_aarch64_restore_finish
+.size __helios_aarch64_restore_trampoline, . - __helios_aarch64_restore_trampoline
+.global __helios_aarch64_restore_trampoline_enter_end
+__helios_aarch64_restore_trampoline_enter_end:
+
+.balign 4096
+.global __helios_aarch64_restore_finish
+.type __helios_aarch64_restore_finish, %function
+__helios_aarch64_restore_finish:
+    // BTI jc landing pad for guarded kernel text.
+    hint #38
 
     // Point x20 at saved Aarch64SnapshotContext on the safe trampoline page.
     ldr x20, [x19, #0x30]
@@ -130,7 +146,8 @@ __helios_aarch64_restore_trampoline:
 .Lhelios_aarch64_skip_mte:
     isb
 
-    // Switch back to the image kernel's translation regime.
+    // Switch back to the image kernel's translation regime. `V_finish` maps to
+    // Boot 1's `image_finish_phys` in both `trampoline_ttbr1` and `ctx.ttbr1_el1`.
     ldr x1, [x20, #0xd0]        // mair_el1
     msr mair_el1, x1
     ldr x1, [x20, #0xd8]        // tcr_el1
@@ -184,6 +201,6 @@ __helios_aarch64_restore_trampoline:
     // `Aarch64Cpu::capture_bsp_state`.
     mov x0, #1
     ret
-.size __helios_aarch64_restore_trampoline, . - __helios_aarch64_restore_trampoline
-.global __helios_aarch64_restore_trampoline_end
-__helios_aarch64_restore_trampoline_end:
+.size __helios_aarch64_restore_finish, . - __helios_aarch64_restore_finish
+.global __helios_aarch64_restore_finish_end
+__helios_aarch64_restore_finish_end:

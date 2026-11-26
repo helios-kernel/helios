@@ -159,8 +159,16 @@ fn convert_memory_kind(entry_type: EntryType) -> BootMemoryKind {
         BootMemoryKind::Usable
     } else if entry_type == EntryType::BOOTLOADER_RECLAIMABLE {
         BootMemoryKind::BootloaderReclaimable
-    } else {
+    } else if entry_type == EntryType::EXECUTABLE_AND_MODULES {
+        BootMemoryKind::KernelAndModules
+    } else if entry_type == EntryType::ACPI_RECLAIMABLE {
+        BootMemoryKind::AcpiReclaimable
+    } else if entry_type == EntryType::ACPI_NVS {
+        BootMemoryKind::AcpiNvs
+    } else if entry_type == EntryType::RESERVED {
         BootMemoryKind::Reserved
+    } else {
+        BootMemoryKind::Unusable
     }
 }
 
@@ -202,8 +210,28 @@ mod tests {
             BootMemoryKind::BootloaderReclaimable
         );
         assert_eq!(
+            convert_memory_kind(EntryType::EXECUTABLE_AND_MODULES),
+            BootMemoryKind::KernelAndModules
+        );
+        assert_eq!(
+            convert_memory_kind(EntryType::ACPI_RECLAIMABLE),
+            BootMemoryKind::AcpiReclaimable
+        );
+        assert_eq!(
+            convert_memory_kind(EntryType::ACPI_NVS),
+            BootMemoryKind::AcpiNvs
+        );
+        assert_eq!(
             convert_memory_kind(EntryType::RESERVED),
             BootMemoryKind::Reserved
+        );
+        assert_eq!(
+            convert_memory_kind(EntryType::FRAMEBUFFER),
+            BootMemoryKind::Unusable
+        );
+        assert_eq!(
+            convert_memory_kind(EntryType::BAD_MEMORY),
+            BootMemoryKind::Unusable
         );
     }
 
