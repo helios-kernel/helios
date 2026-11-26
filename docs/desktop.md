@@ -3,7 +3,7 @@
 A guest that draws needs a display adapter, a keyboard and two pointers,
 one that makes a sound needs a sound device, and a host that wants to
 prove what came out of either needs to read it back.
-`helios-inspector vm` attaches the devices, reads the scanout through
+`helios vm` attaches the devices, reads the scanout through
 QEMU's machine protocol and records the playback to a file, so the
 evidence is a PNG and a WAV a lane can keep rather than a window somebody
 watched and a speaker somebody heard.

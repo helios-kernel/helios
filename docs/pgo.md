@@ -55,7 +55,7 @@ workload that ran nothing.
 
 ```bash
 just build-instrumented x86-64      # aarch64, riscv64, x86-64
-helios-inspector vm --arch x86-64 --profile-generate --accel kvm shell
+helios vm --arch x86-64 --profile-generate --accel kvm shell
 ```
 
 `just build-instrumented` is the inspector's own `vm --profile-generate
@@ -151,11 +151,11 @@ On the host:
 
 ```bash
 # collect and stop
-helios-inspector vm --arch x86-64 --profile-generate --accel kvm \
+helios vm --arch x86-64 --profile-generate --accel kvm \
     profile target/pgo/boot.profraw
 
 # collect after a workload
-helios-inspector vm --arch x86-64 --profile-generate --accel kvm \
+helios vm --arch x86-64 --profile-generate --accel kvm \
     aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
     --llvm-raw-profile-output target/pgo/aot-bench.profraw
 ```
@@ -235,7 +235,7 @@ would cost every lane and every developer loop.
 
 ```bash
 just kernel-pgo-use x86-64 target/pgo/helios-kernel.profdata
-helios-inspector vm --arch x86-64 \
+helios vm --arch x86-64 \
     --profile-use target/pgo/helios-kernel.profdata --accel kvm shell
 ```
 
@@ -473,7 +473,7 @@ is the answer the job exists to produce.
 
 What profile-guided optimisation is worth on the kernel that ships is a
 different question, and it has a control: the same commit built without
-any profile. `helios-inspector vm --release --without-kernel-profile`
+any profile. `helios vm --release --without-kernel-profile`
 builds it, on the one target whose release builds otherwise read the
 fetched profile, and puts it in the `kernel-release` directory where
 every other target's release kernel lands; asking for it elsewhere is refused,
@@ -529,7 +529,7 @@ helios-cli profile-fetch                 # the newest collection on the default 
 helios-cli profile-fetch --branch perf/x  # the newest collection on a branch
 helios-cli profile-fetch --run 34424416974     # the artifact one run uploaded
 helios-cli profile-fetch --tag helios-v0.1.0   # the asset a release carries
-helios-inspector vm --arch x86-64 --release --accel kvm shell
+helios vm --arch x86-64 --release --accel kvm shell
 ```
 
 The fetch is the one entry point that puts a profile in the store.
@@ -657,7 +657,7 @@ Three decisions the rewrite makes, and why:
 `!helios-branch-profile-1` and `!helios-branch-profile-end` markers so the
 surrounding console traffic is not mistaken for counts and a guest that
 died mid-dump is rejected rather than half-read. That channel already
-exists: `helios-inspector vm … shell -c` runs a command in the guest and
+exists: `helios vm … shell -c` runs a command in the guest and
 brings its output back. The LLVM raw-profile export of (a) was the
 alternative and does not fit: it carries the *kernel's*
 `-C profile-generate` counters out of a kernel built for it, and has no way

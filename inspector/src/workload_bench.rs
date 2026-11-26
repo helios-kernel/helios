@@ -998,16 +998,12 @@ async fn run_shell_workload(
         command,
     )?;
     let started = Instant::now();
-    let output = crate::programs::exec(
-        client,
-        crate::programs::REMOTE_SHELL_PATH,
-        &["-c".to_owned(), script],
-    )
-    .await
-    .map_err(|source| WorkloadBenchError::RunWorkload {
-        workload: workload.name.clone(),
-        source,
-    })?;
+    let output = crate::programs::exec(client, "/bin/dash", &["-c".to_owned(), script])
+        .await
+        .map_err(|source| WorkloadBenchError::RunWorkload {
+            workload: workload.name.clone(),
+            source,
+        })?;
     let elapsed_ms = elapsed_millis(started);
     launched_output(workload, elapsed_ms, output)
 }

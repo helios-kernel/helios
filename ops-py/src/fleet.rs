@@ -52,7 +52,6 @@ impl PyFleet {
     /// Construct a [`Fleet`] from explicit targets (`Target` or target name/URI strings).
     #[staticmethod]
     #[pyo3(signature = (targets, *, concurrency=DEFAULT_FLEET_CONCURRENCY, timeout_secs=None, scope=None, only=None, identity=None, targets_path=None))]
-    #[allow(clippy::too_many_arguments)]
     fn from_targets(
         targets: Vec<Bound<'_, PyAny>>,
         concurrency: usize,
@@ -66,7 +65,14 @@ impl PyFleet {
         for item in &targets {
             resolved.push(extract_target_arg(item, targets_path.as_deref())?);
         }
-        let options = build_session_options(timeout_secs, scope, only, identity)?;
+        let allow_ambient_auth = resolved.iter().all(|target| {
+            !matches!(
+                target.parsed_uri(),
+                Ok(helios_ops::TargetUri::Helios { tls: false, .. })
+            )
+        });
+        let options =
+            build_session_options(timeout_secs, scope, only, identity, allow_ambient_auth)?;
         Ok(Self {
             inner: Fleet::new(resolved, concurrency, options),
         })
@@ -75,7 +81,6 @@ impl PyFleet {
     /// Construct a [`Fleet`] by selecting targets matching `key=value` labels in `targets.toml`.
     #[staticmethod]
     #[pyo3(signature = (labels, *, concurrency=DEFAULT_FLEET_CONCURRENCY, timeout_secs=None, scope=None, only=None, identity=None, targets_path=None))]
-    #[allow(clippy::too_many_arguments)]
     fn from_labels(
         labels: Vec<String>,
         concurrency: usize,
@@ -90,7 +95,14 @@ impl PyFleet {
             None => TargetStore::load_default().map_err(target_err_to_py)?,
         };
         let targets = store.select_by_labels(&labels).map_err(target_err_to_py)?;
-        let options = build_session_options(timeout_secs, scope, only, identity)?;
+        let allow_ambient_auth = targets.iter().all(|target| {
+            !matches!(
+                target.parsed_uri(),
+                Ok(helios_ops::TargetUri::Helios { tls: false, .. })
+            )
+        });
+        let options =
+            build_session_options(timeout_secs, scope, only, identity, allow_ambient_auth)?;
         Ok(Self {
             inner: Fleet::new(targets, concurrency, options),
         })
