@@ -1565,6 +1565,7 @@ where
             .map_or_else(p1_errno_from_udp_error, |()| p1::errno::SUCCESS),
         Some(
             UnixSocketHandle::<Net>::PacketSocket(_)
+            | UnixSocketHandle::<Net>::IcmpSocket(_)
             | UnixSocketHandle::<Net>::VsockListener(_)
             | UnixSocketHandle::<Net>::VsockStream(_),
         )

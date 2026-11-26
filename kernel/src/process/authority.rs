@@ -1862,6 +1862,7 @@ impl ProcessAuthority {
             && scope_contains_without_registry(self.instance_control, child.instance_control)
             && self.settings.contains(child.settings)
             && self.machine.contains(child.machine)
+            && (!child.root_supervisor || self.root_supervisor)
             && child
                 .devices
                 .iter()
@@ -1923,6 +1924,7 @@ impl ProcessAuthority {
             )
             && self.settings.contains(child.settings)
             && self.machine.contains(child.machine)
+            && (!child.root_supervisor || self.root_supervisor)
             && child
                 .devices
                 .iter()
@@ -3220,5 +3222,38 @@ mod tests {
         );
         assert!(!empty.can_load_program("/bin/inspector-worker"));
         assert!(!empty.can_write_path("/etc/inspector/policy.postcard"));
+    }
+
+    #[test]
+    fn contains_authority_and_contains_child_authority_reject_root_supervisor_escalation() {
+        let registry = crate::InstanceRegistry::new();
+        let parent_inst = registry.register("parent", 1);
+        let child_inst = registry.register_child(Some(parent_inst.id()), "child", 2);
+
+        let non_supervisor = ProcessAuthority::root();
+        let mut supervisor = ProcessAuthority::root();
+        supervisor.grant_root_supervisor();
+
+        assert!(
+            !non_supervisor.contains_authority(&supervisor),
+            "non-supervisor authority must not contain root_supervisor"
+        );
+        assert!(
+            !non_supervisor.contains_child_authority(
+                parent_inst.id(),
+                child_inst.id(),
+                &supervisor,
+                &registry,
+            ),
+            "non-supervisor parent must not contain child with root_supervisor"
+        );
+        assert!(supervisor.contains_authority(&supervisor));
+        assert!(supervisor.contains_authority(&non_supervisor));
+        assert!(supervisor.contains_child_authority(
+            parent_inst.id(),
+            child_inst.id(),
+            &supervisor,
+            &registry,
+        ));
     }
 }

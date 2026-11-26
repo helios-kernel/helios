@@ -492,6 +492,28 @@ where
         self.inner.tracing.next_after(scope, cursor, filter)
     }
 
+    /// Arms a reusable wait for newly recorded trace events; see
+    /// [`TraceLog::waiter`].
+    pub fn trace_waiter(&self) -> NotifyWaiter {
+        self.inner.tracing.waiter()
+    }
+
+    /// Polls for the next event after `*cursor` that `scope` admits and
+    /// `filter` matches, registering `cx.waker()` on `waiter` before parking;
+    /// see [`TraceLog::poll_next_after`].
+    pub fn poll_next_after(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        waiter: &mut NotifyWaiter,
+        scope: &impl crate::ObservationScope,
+        cursor: &mut u64,
+        filter: &TraceFilter,
+    ) -> core::task::Poll<Arc<TraceEvent>> {
+        self.inner
+            .tracing
+            .poll_next_after(cx, waiter, scope, cursor, filter)
+    }
+
     pub fn set_profiling_enabled(&self, enabled: bool) {
         crate::set_kernel_heap_size_class_metrics_enabled(enabled);
         if enabled {
