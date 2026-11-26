@@ -306,7 +306,7 @@ iterations 2..N; iteration 1 pays the cold cache build and is excluded.
 the baseline.
 
 ```bash
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     aot-bench artifacts/wasi-tools/curl.wasm --iterations 5 \
     | tee target/perf-baselines/x86-64-kvm-curl-<short-sha>.log
 ```
@@ -322,9 +322,9 @@ the boot that ran the workload being measured. `docs/networking.md` covers
 the backends and the privileged setup.
 
 ```bash
-helios-inspector vm net-setup \
+helios vm net-setup \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0 --net-dhcp
-./target/release/helios-inspector vm --arch x86-64 --release --accel kvm \
+./target/release/helios vm --arch x86-64 --release --accel kvm \
     --net-backend tap --net-ifname helios0 --net-bridge helios-br0 \
     --net-queues "$(nproc)" \
     workload-bench --workload tcp-throughput --iterations 5 \
