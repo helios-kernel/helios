@@ -244,11 +244,93 @@ fn publish() {
     unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
 }
 
+/// Synchronizes data and instruction caches to the Point of Unification for
+/// the 4 KiB user frame mapped in the kernel direct map at `direct_va`
+/// (Arm ARM B2.4.4 / Linux `arch/arm64/mm/flush.c` `__sync_icache_dcache`).
+///
+/// Reads `CTR_EL0` to honor `IDC` (bit 28: no D-cache clean to PoU required),
+/// `DIC` (bit 29: no I-cache invalidation required), `DminLine` (bits [19:16]),
+/// `IminLine` (bits [3:0]), and `L1Ip` (bits [15:14]: `0b11` is PIPT, allowing
+/// per-line `ic ivau` via the direct map; VIPT falls back to inner-shareable
+/// `ic ialluis` so user-VA alias sets are invalidated safely).
+fn sync_icache_page(direct_va: usize) {
+    const CTR_IDC: u64 = 1 << 28;
+    const CTR_DIC: u64 = 1 << 29;
+    const CTR_L1IP_SHIFT: u64 = 14;
+    const CTR_L1IP_PIPT: u64 = 0b11;
+
+    let ctr: u64;
+    // SAFETY: `ctr_el0` is an architectural read-only cache-type register.
+    unsafe {
+        asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+
+    let idc = ctr & CTR_IDC != 0;
+    let dic = ctr & CTR_DIC != 0;
+    if idc && dic {
+        return;
+    }
+
+    let end = direct_va + PAGE as usize;
+    if !idc {
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let mut addr = direct_va & !(dline - 1);
+        while addr < end {
+            // SAFETY: `addr` lies in the valid kernel direct-map range for the
+            // 4 KiB user frame; `dc cvau` cleans the line to PoU.
+            unsafe {
+                asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags));
+            }
+            addr += dline;
+        }
+        // SAFETY: `dsb ish` ensures cleaned data lines reach PoU across all
+        // inner-shareable processors before I-cache invalidation or execution.
+        unsafe {
+            asm!("dsb ish", options(nostack, preserves_flags));
+        }
+    }
+
+    if !dic {
+        let l1ip = (ctr >> CTR_L1IP_SHIFT) & 0b11;
+        if l1ip == CTR_L1IP_PIPT {
+            let iline = 4usize << (ctr & 0xf);
+            let mut addr = direct_va & !(iline - 1);
+            while addr < end {
+                // SAFETY: `addr` lies in the valid kernel direct-map range for
+                // this frame, and PIPT I-caches index by physical address;
+                // `ic ivau` broadcasts invalidation to the inner-shareable PoU.
+                unsafe {
+                    asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags));
+                }
+                addr += iline;
+            }
+        } else {
+            // SAFETY: `ic ialluis` invalidates all inner-shareable instruction
+            // caches, avoiding VIPT alias mismatch between direct-map and EL0 VAs.
+            unsafe {
+                asm!("ic ialluis", options(nostack, preserves_flags));
+            }
+        }
+        // SAFETY: `dsb ish` waits for inner-shareable I-cache invalidation to
+        // complete on all processors.
+        unsafe {
+            asm!("dsb ish", options(nostack, preserves_flags));
+        }
+    }
+    // SAFETY: `isb` synchronizes the instruction fetch stream on this core.
+    unsafe {
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
 // SAFETY: a user page maps exactly the given frame, with EL0 access no
 // wider than `flags`, never executable at EL1, and only below 2^48 in
 // TTBR0, which holds no kernel mapping.
 unsafe impl UserTranslation for Aarch64Tables {
     fn install(&mut self, base: u64, physical: u64, flags: PageFlags) -> Result<(), NativeError> {
+        if flags.contains(PageFlags::EXECUTE) {
+            sync_icache_page(physical as usize + self.offset);
+        }
         let leaf = self.leaf(base)?;
         // SAFETY: the leaf entry of a page that is not mapped.
         unsafe { leaf.write_volatile(page_descriptor(physical, flags)) };
@@ -268,7 +350,11 @@ unsafe impl UserTranslation for Aarch64Tables {
         let leaf = self.leaf(base).expect("an installed page has its tables");
         // SAFETY: `leaf` is an aligned, mapped entry of this space under its
         // lock.
-        let physical = unsafe { leaf.read_volatile() } & ADDRESS;
+        let old = unsafe { leaf.read_volatile() };
+        let physical = old & ADDRESS;
+        if flags.contains(PageFlags::EXECUTE) && (old & UXN != 0) {
+            sync_icache_page(physical as usize + self.offset);
+        }
         // SAFETY: as in `install`. Only the access bits change, which the
         // Arm ARM's break-before-make rules do not require a break for; the
         // caller invalidates a narrowing.
@@ -276,6 +362,10 @@ unsafe impl UserTranslation for Aarch64Tables {
             leaf.write_volatile(page_descriptor(physical, flags));
         }
         publish();
+    }
+
+    fn sync_executable_frame(&self, frame: NonNull<u8>) {
+        sync_icache_page(frame.as_ptr() as usize);
     }
 
     fn invalidate(&self, first: u64, last: u64) {
