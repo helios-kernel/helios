@@ -39,7 +39,7 @@ use crate::cpu::HostedCpu;
 use crate::runtime::HostedMachine;
 
 const PROCESSORS: usize = 4;
-const TEST_HEAP_BYTES: usize = 32 * 1024 * 1024;
+const TEST_HEAP_BYTES: usize = 64 * 1024 * 1024;
 const RESERVATION_BYTES: usize = 4 * 1024 * 1024;
 const PATIENCE: Duration = Duration::from_secs(20);
 const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
