@@ -148,6 +148,13 @@ impl RpcClient {
         })
     }
 
+    /// Attaches the guest's `MachineIdentity` Ed25519 public key observed
+    /// during `client_handshake`.
+    pub(crate) const fn with_server_public_key(mut self, key: Option<[u8; 32]>) -> Self {
+        self.server_machine_public_key = key;
+        self
+    }
+
     /// Runs the unified Ed25519 + `postcard` authentication handshake over
     /// `(read, write)` and starts the WIT-RPC frame driver once accepted.
     pub(crate) async fn connect_authenticated(
@@ -167,9 +174,7 @@ impl RpcClient {
             None,
         )
         .await?;
-        let mut client = Self::new(read, write)?;
-        client.server_machine_public_key = Some(hello.machine_public_key);
-        Ok(client)
+        Ok(Self::new(read, write)?.with_server_public_key(Some(hello.machine_public_key)))
     }
 
     /// Returns the authenticated guest's `MachineIdentity` Ed25519 public key
@@ -409,6 +414,11 @@ fn is_unix_socket(device: &str) -> Result<bool, SerialError> {
 }
 
 impl SerialIo {
+    #[cfg(test)]
+    pub(crate) fn from_parts(read: RpcReader, write: RpcWriter) -> Self {
+        Self { read, write }
+    }
+
     pub(crate) fn into_split(self) -> (RpcReader, RpcWriter) {
         (self.read, self.write)
     }

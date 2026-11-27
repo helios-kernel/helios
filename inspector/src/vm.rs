@@ -4460,7 +4460,7 @@ fn run_gui_session(client: RpcClient, runtime: &mut VmRuntime) -> Result<(), VmS
     eprintln!("  {}          VT1 system log", theme.bold("Alt+F1"));
     eprintln!("  {} / close window to stop", theme.bold("Ctrl+C"));
     crate::run_interruptible(async move {
-        let mut last_handled_request_id = 0_u64;
+        let mut broker = console_auth::ConsoleAuthBroker::new();
         loop {
             if runtime
                 .child
@@ -4470,7 +4470,7 @@ fn run_gui_session(client: RpcClient, runtime: &mut VmRuntime) -> Result<(), VmS
             {
                 return Ok(());
             }
-            console_auth::poll_and_broker_once(&client, &mut last_handled_request_id).await;
+            broker.poll_and_broker_once(&client).await;
             async_io::Timer::after(console_auth::GUI_BROKER_POLL_INTERVAL).await;
         }
     })

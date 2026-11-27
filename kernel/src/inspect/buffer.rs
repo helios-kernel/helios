@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
+use helios_hal::vmm::{VirtAddr, VirtRange};
 use thiserror::Error;
 
 use super::{InspectEntry, InspectValue};
@@ -87,6 +88,7 @@ pub(crate) enum SpanReadOutcome {
     Ok { generation: u64, truncated: bool },
     Busy { generation: u64 },
     Corrupt { generation: u64 },
+    SwappedOut,
 }
 
 /// Validates a component publication name (one path segment under
@@ -171,18 +173,26 @@ fn parse_header_words(w0: u64, w1: u64, w2: u64, w3: u64, span_len: usize) -> Op
 /// `scratch` across seqlock retries and materialising at most `max_entries`
 /// lexicographically smallest entries admitted by `prefixes` into `out`.
 ///
+/// `is_resident` is checked on the 32-byte header before reading header words
+/// and on `0..INSPECT_HEADER_BYTES + header.payload_len` before reading payload
+/// words, so unused swapped-out tail pages beyond `payload_len` never cause
+/// false-positive [`SpanReadOutcome::SwappedOut`] classifications while no
+/// swapped-out guest page is ever dereferenced.
+///
 /// # Safety
 ///
-/// `base..base + span_len` must remain mapped and resident for the entire
-/// duration of this call (enforced by holding the publication's read lock and
-/// the owning instance's swap read-pin after verifying residency).
+/// `base..base + span_len` must remain mapped and pinned against swap eviction
+/// for the entire duration of this call (enforced by holding the publication's
+/// read lock and the owning instance's [`crate::InspectReadPin`]), and every
+/// sub-range for which `is_resident` returns `true` must be resident in memory.
 #[expect(
     clippy::too_many_arguments,
-    reason = "bounded lock-free span reader takes reusable scratch buffers alongside prefix filter and entry cap"
+    reason = "bounded lock-free span reader takes monomorphised residency check and reusable scratch buffers alongside prefix filter and entry cap"
 )]
 pub(crate) unsafe fn read_span_snapshot(
     base: usize,
     span_len: usize,
+    is_resident: impl Fn(VirtRange) -> bool,
     scratch: &mut Vec<u8>,
     path_buf: &mut String,
     root_prefix: &str,
@@ -197,6 +207,9 @@ pub(crate) unsafe fn read_span_snapshot(
         || base.checked_add(span_len).is_none()
     {
         return SpanReadOutcome::Corrupt { generation: 0 };
+    }
+    if !is_resident(VirtRange::new(VirtAddr::new(base), INSPECT_HEADER_BYTES)) {
+        return SpanReadOutcome::SwappedOut;
     }
     let mut last_generation = 0u64;
 
@@ -223,6 +236,19 @@ pub(crate) unsafe fn read_span_snapshot(
                 generation: gen_before,
             };
         };
+
+        let active_bytes = INSPECT_HEADER_BYTES + header.payload_len;
+        if active_bytes > INSPECT_HEADER_BYTES
+            && !is_resident(VirtRange::new(VirtAddr::new(base), active_bytes))
+        {
+            fence(Ordering::Acquire);
+            let gen_after = load_aligned_word(base, 1);
+            last_generation = gen_after;
+            if gen_after != gen_before {
+                continue;
+            }
+            return SpanReadOutcome::SwappedOut;
+        }
 
         // Reuse one scratch allocation across all seqlock retries and
         // publications instead of allocating a fresh buffer per retry.

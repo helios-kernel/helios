@@ -29,6 +29,10 @@ use crate::serial::RpcClient;
 /// Poll interval for both QEMU window exit and guest VT2 login challenges.
 pub(super) const GUI_BROKER_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Per-RPC deadline for guest inspect polling and auth-reply file writes so a
+/// stalled serial or vsock transport never wedges `run_gui_session`.
+const CONSOLE_AUTH_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Maximum inspect entries scanned when looking for pending console login challenges.
 const CONSOLE_AUTH_INSPECT_LIMIT: u32 = 256;
 
@@ -149,94 +153,172 @@ pub(super) fn process_console_login_challenge_with(
     )
 }
 
-/// Performs one non-fatal poll cycle against the guest's inspect tree,
-/// brokering any new VT2 login challenge on a worker thread and writing the
-/// signed reply back to [`CONSOLE_AUTH_REPLY_PATH`].
-pub(super) async fn poll_and_broker_once(client: &RpcClient, last_handled_request_id: &mut u64) {
-    let inspect_client = proto_inspect::RpcClient::new(client.peer());
-    let query = proto_inspect::Query {
-        prefixes: vec!["/instances/".to_owned()],
-    };
-    let snapshot = match inspect_client
-        .snapshot(query, CONSOLE_AUTH_INSPECT_LIMIT)
+/// Stateful host-side VT2 Touch ID / FIDO2 login broker for `helios vm --gui`.
+pub(super) struct ConsoleAuthBroker {
+    last_handled_request_id: u64,
+    transport_degraded_logged: bool,
+}
+
+impl ConsoleAuthBroker {
+    pub(super) const fn new() -> Self {
+        Self {
+            last_handled_request_id: 0,
+            transport_degraded_logged: false,
+        }
+    }
+
+    /// Performs one non-fatal poll cycle against the guest's inspect tree,
+    /// brokering any new VT2 login challenge on a worker thread and writing the
+    /// signed reply back to [`CONSOLE_AUTH_REPLY_PATH`].
+    pub(super) async fn poll_and_broker_once(&mut self, client: &RpcClient) {
+        self.poll_once_with_timeout(
+            &client.peer(),
+            client.server_public_key(),
+            CONSOLE_AUTH_RPC_TIMEOUT,
+        )
+        .await;
+    }
+
+    async fn poll_once_with_timeout(
+        &mut self,
+        peer: &helios_wit_rpc::PeerHandle,
+        expected_machine_key: Option<[u8; 32]>,
+        rpc_timeout: Duration,
+    ) {
+        let inspect_client = proto_inspect::RpcClient::new(peer.clone());
+        let query = proto_inspect::Query {
+            prefixes: vec!["/instances/".to_owned()],
+        };
+        let theme = CliTheme::stderr();
+        let snapshot = match crate::runtime::timeout(
+            rpc_timeout,
+            inspect_client.snapshot(query, CONSOLE_AUTH_INSPECT_LIMIT),
+        )
         .await
-    {
-        Ok(Ok(snap)) => snap,
-        _ => return,
-    };
+        {
+            Some(Ok(Ok(snap))) => {
+                self.transport_degraded_logged = false;
+                snap
+            }
+            Some(Ok(Err(filter_err))) => {
+                if !self.transport_degraded_logged {
+                    self.transport_degraded_logged = true;
+                    eprintln!(
+                        "{} guest console-auth inspect filter rejected: {filter_err:?}",
+                        theme.yellow("warn"),
+                    );
+                }
+                return;
+            }
+            Some(Err(rpc_err)) => {
+                if !self.transport_degraded_logged {
+                    self.transport_degraded_logged = true;
+                    eprintln!(
+                        "{} guest console-auth inspect poll failed: {rpc_err}",
+                        theme.yellow("warn"),
+                    );
+                }
+                return;
+            }
+            None => {
+                if !self.transport_degraded_logged {
+                    self.transport_degraded_logged = true;
+                    eprintln!(
+                        "{} guest console-auth inspect poll timed out after {:.1}s",
+                        theme.yellow("warn"),
+                        rpc_timeout.as_secs_f64(),
+                    );
+                }
+                return;
+            }
+        };
 
-    let Some(challenge) = extract_pending_console_challenge(&snapshot, *last_handled_request_id)
-    else {
-        return;
-    };
-    *last_handled_request_id = challenge.request_id;
-    let expected_machine_key = client.server_public_key();
-    let theme = CliTheme::stderr();
-    eprintln!(
-        "{} VT2 login challenge for {} {} — confirm Touch ID or FIDO2 key if prompted...",
-        theme.bold_cyan("auth"),
-        theme.bold(&challenge.username),
-        theme.dim(format!("(request #{})", challenge.request_id)),
-    );
-
-    let (reply_tx, reply_rx) = async_channel::bounded(1);
-    let challenge_for_thread = challenge.clone();
-    std::thread::spawn(move || {
-        let store = AccountStore::default_store();
-        let reply = process_console_login_challenge_default(
-            &challenge_for_thread,
-            expected_machine_key,
-            &store,
-        );
-        let _ = reply_tx.send_blocking(reply);
-    });
-
-    let Ok(reply) = reply_rx.recv().await else {
-        return;
-    };
-    let encoded = match reply.encode_postcard() {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!(
-                "{} failed to encode console auth reply: {err}",
-                theme.bold_red("auth")
-            );
+        let Some(challenge) =
+            extract_pending_console_challenge(&snapshot, self.last_handled_request_id)
+        else {
             return;
-        }
-    };
-
-    let peer = client.peer();
-    if let Some(parent) = Path::new(CONSOLE_AUTH_REPLY_PATH).parent()
-        && let Some(parent_str) = parent.to_str()
-    {
-        let _ = inspector_fs::mkdir(&peer, parent_str).await;
-    }
-    if let Err(err) =
-        inspector_fs::write_file(&peer, CONSOLE_AUTH_REPLY_PATH, &encoded, false).await
-    {
+        };
+        self.last_handled_request_id = challenge.request_id;
         eprintln!(
-            "{} failed to deliver console auth reply to `{CONSOLE_AUTH_REPLY_PATH}`: {err}",
-            theme.bold_red("auth")
+            "{} VT2 login challenge for {} {} — confirm Touch ID or FIDO2 key if prompted...",
+            theme.bold_cyan("auth"),
+            theme.bold(&challenge.username),
+            theme.dim(format!("(request #{})", challenge.request_id)),
         );
-        return;
-    }
 
-    match &reply {
-        ConsoleLoginAuthReply::Approved(_) => {
-            eprintln!(
-                "{} authenticated VT2 login for {} {}",
-                theme.check(),
-                theme.bold(&challenge.username),
-                theme.dim(format!("(request #{})", challenge.request_id)),
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        let challenge_for_thread = challenge.clone();
+        std::thread::spawn(move || {
+            let store = AccountStore::default_store();
+            let reply = process_console_login_challenge_default(
+                &challenge_for_thread,
+                expected_machine_key,
+                &store,
             );
+            let _ = reply_tx.send_blocking(reply);
+        });
+
+        let Ok(reply) = reply_rx.recv().await else {
+            return;
+        };
+        let encoded = match reply.encode_postcard() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!(
+                    "{} failed to encode console auth reply: {err}",
+                    theme.bold_red("auth")
+                );
+                return;
+            }
+        };
+
+        if let Some(parent) = Path::new(CONSOLE_AUTH_REPLY_PATH).parent()
+            && let Some(parent_str) = parent.to_str()
+        {
+            let _ =
+                crate::runtime::timeout(rpc_timeout, inspector_fs::mkdir(peer, parent_str)).await;
         }
-        ConsoleLoginAuthReply::Rejected { reason, .. } => {
-            eprintln!(
-                "{} VT2 login rejected for {} {}: {reason}",
-                theme.bold_red("auth"),
-                theme.bold(&challenge.username),
-                theme.dim(format!("(request #{})", challenge.request_id)),
-            );
+        match crate::runtime::timeout(
+            rpc_timeout,
+            inspector_fs::write_file(peer, CONSOLE_AUTH_REPLY_PATH, &encoded, false),
+        )
+        .await
+        {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                eprintln!(
+                    "{} failed to deliver console auth reply to `{CONSOLE_AUTH_REPLY_PATH}`: {err}",
+                    theme.bold_red("auth")
+                );
+                return;
+            }
+            None => {
+                eprintln!(
+                    "{} timed out delivering console auth reply to `{CONSOLE_AUTH_REPLY_PATH}` after {:.1}s",
+                    theme.bold_red("auth"),
+                    rpc_timeout.as_secs_f64(),
+                );
+                return;
+            }
+        }
+
+        match &reply {
+            ConsoleLoginAuthReply::Approved(_) => {
+                eprintln!(
+                    "{} authenticated VT2 login for {} {}",
+                    theme.check(),
+                    theme.bold(&challenge.username),
+                    theme.dim(format!("(request #{})", challenge.request_id)),
+                );
+            }
+            ConsoleLoginAuthReply::Rejected { reason, .. } => {
+                eprintln!(
+                    "{} VT2 login rejected for {} {}: {reason}",
+                    theme.bold_red("auth"),
+                    theme.bold(&challenge.username),
+                    theme.dim(format!("(request #{})", challenge.request_id)),
+                );
+            }
         }
     }
 }
@@ -468,5 +550,49 @@ mod tests {
             Some(challenge)
         );
         assert_eq!(extract_pending_console_challenge(&snapshot, 4), None);
+    }
+
+    #[test]
+    fn stalled_inspect_rpc_times_out_without_wedging_gui_broker() {
+        use async_io::Async;
+        use helios_inspector_protocol::wire::{Frame, read_frame, write_frame};
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        let (host_sock, guest_sock) = UnixStream::pair().expect("socket pair");
+        let (peer, _driver) = crate::frame_reader::FrameReader::start(
+            Async::new(host_sock.try_clone().expect("clone host read")).expect("async read"),
+            Async::new(host_sock).expect("async write"),
+        )
+        .expect("start frame reader");
+
+        // Simulate the exact #1314 wedge: guest accepts `Frame::Open` and then
+        // stalls without ever sending `Frame::Data` or `Frame::Close`.
+        let server = std::thread::spawn(move || {
+            crate::runtime::block_on(async move {
+                let mut r = Async::new(guest_sock.try_clone().expect("clone guest read"))
+                    .expect("guest async read");
+                let mut w = Async::new(guest_sock).expect("guest async write");
+                if let Ok(Some(Frame::Open { invocation, .. })) = read_frame(&mut r).await {
+                    let _ = write_frame(&mut w, &Frame::Accept { invocation }).await;
+                }
+                async_io::Timer::after(Duration::from_millis(250)).await;
+            });
+        });
+
+        let started = Instant::now();
+        let mut broker = ConsoleAuthBroker::new();
+        crate::runtime::block_on(broker.poll_once_with_timeout(
+            &peer,
+            None,
+            Duration::from_millis(50),
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "broker poll must return promptly once per-RPC timeout fires"
+        );
+        assert!(broker.transport_degraded_logged);
+        drop(peer);
+        let _ = server.join();
     }
 }
