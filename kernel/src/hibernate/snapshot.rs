@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use core::time::Duration;
 
-use helios_hal::boot::{BootMemoryKind, BootMemoryMetadata};
+use helios_hal::boot::BootMemoryMetadata;
 use helios_hal::cpu::{BspSnapshotContext, Cpu, ResumeHandoff, SnapshotPoint};
 use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
@@ -592,15 +592,6 @@ pub fn collect_snapshot_physical_runs(
     for range in &boot_memory.bootloader_reclaimable {
         if !range.is_empty() {
             included_phys.push(range.start..range.end);
-        }
-    }
-
-    // 4b. ACPI reclaimable tables so parsed ACPI tables (MADT, DSDT, hotplug
-    //     AML, etc.) remain intact at Boot 1's physical addresses even if Boot
-    //     2 places ACPI tables at a different offset.
-    for region in &boot_memory.firmware_memory_map {
-        if region.kind == BootMemoryKind::AcpiReclaimable && region.end > region.start {
-            included_phys.push(region.start..region.end);
         }
     }
 
