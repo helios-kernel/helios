@@ -1024,10 +1024,7 @@ where
     if !p1_file_fdflags_supported(fdflags) {
         return Ok(p1::errno::INVAL);
     }
-    let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
-    if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= FsDescriptorFlags::WRITE;
-    }
+    let descriptor_flags = p1_open_descriptor_flags(&base, open_flags, rights, fdflags);
     p1_path_open_resolved(
         caller,
         &memory,
@@ -3233,13 +3230,14 @@ where
     // Refuse a target past the descriptor limit before the file is opened.
     snapshot.descriptors.target_index(fd)?;
     let (base, relative_path) = wasix_spawn_resolve_open_base(snapshot, source_fd, path)?;
+    let open_flags = p1_open_flags(oflags);
     let descriptor = p1_open_descriptor_resolved(
         caller,
         &base,
         p1_path_flags(dirflags),
         &relative_path,
-        p1_open_flags(oflags),
-        p1_descriptor_flags(rights, fdflags),
+        open_flags,
+        p1_open_descriptor_flags(&base, open_flags, rights, fdflags),
     )
     .await?;
     let entry = Preview1DescriptorEntry::new(

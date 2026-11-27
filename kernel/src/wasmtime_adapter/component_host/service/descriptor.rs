@@ -1986,7 +1986,7 @@ pub(super) fn p1_descriptor_rights<Net: ComponentHostNetwork>(
 }
 
 /// The preview1 rights a filesystem node handle's flags grant.
-fn p1_node_rights(descriptor: &FsDescriptor) -> u64 {
+pub(super) fn p1_node_rights(descriptor: &FsDescriptor) -> u64 {
     let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
     if descriptor.flags.contains(FsDescriptorFlags::READ) {
         rights |= P1_RIGHT_FD_READ
