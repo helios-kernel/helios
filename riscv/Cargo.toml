@@ -10,14 +10,16 @@ default = []
 arrayvec = { version = "0.7.6", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 fdt = { version = "0.1.5", default-features = false }
+limine = "0.6.5"
 ns16550a = "0.5.0"
 pci_types = "0.10.1"
 plic = "0.0.3"
+r-efi = { version = "7.1.0", default-features = false }
 riscv = "0.16.0"
-riscv-rt = { version = "0.17.1", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy"]}
 sbi-spec = { version = "0.0.7", default-features = false }
 spin = { version = "0.12.3", default-features = false, features = ["mutex", "once", "spin_mutex"] }
+thiserror = { version = "2.0.20", default-features = false }
 helios-firmware = { workspace = true, features = ["devicetree"] }
 helios-hal.workspace = true
 i6300esb.workspace = true

@@ -1,12 +1,12 @@
 //! Sv48 paging for the RISC-V backend.
 //!
-//! The kernel boots in machine→supervisor mode via OpenSBI with
-//! paging disabled (`satp = 0`); every address is a physical address.
-//! This module brings up Sv48 with an identity map covering all
-//! physical memory the kernel will ever touch, so paging activation is
-//! a no-op for kernel addresses, then carves a high user-VA window
-//! 0x0000_2000_0000_0000..0x0000_4000_0000_0000 (32 TiB) for
-//! [`RiscvUserAddressSpace`] dynamic mappings.
+//! Limine enters the kernel in supervisor mode with Sv48 paging already
+//! enabled, the kernel mapped in the higher half (`0xffffffff80000000..`),
+//! and physical memory mapped through the higher-half direct map (HHDM).
+//! This module adopts Limine's live Sv48 root table, maps any MMIO windows
+//! not already covered by the HHDM on demand, and carves a lower-half
+//! user-VA window `0x0000_2000_0000_0000..0x0000_4000_0000_0000` (32 TiB)
+//! for [`RiscvUserAddressSpace`] dynamic mappings.
 //!
 //! # Why Sv48 and not Sv39
 //!
@@ -17,27 +17,6 @@
 //! address space cannot hold one engine's worth. Sv48 gives 256 TiB,
 //! and the window carved here matches the x86 backend's so a VA in a
 //! fault trace reads the same on both.
-//!
-//! # Why upfront identity-map then enable
-//!
-//! After `csrw satp` the next instruction fetch goes through the
-//! MMU. If the page tables do not cover the kernel's instruction
-//! pointer, stack, or heap, the hart traps immediately into a
-//! recursive page fault and dies silently before any diagnostic can
-//! reach the serial port. Identity-mapping every region the kernel
-//! has actually touched (or will reach in normal operation) makes
-//! activation visible only to subsequent user-VA mapping work, never
-//! to existing kernel code paths.
-//!
-//! # Allocation model
-//!
-//! The identity map is one root-level leaf: Sv48's largest page is
-//! 512 GiB, so a single PTE covers every physical address the platform
-//! exposes and the map needs no page-table allocation at all. That
-//! matters because paging comes up before the kernel heap does. The
-//! user-VA window allocates fresh L2/L1/L0 tables on demand for
-//! fine-grained mappings, by which time the heap exists; each table is
-//! one 4 KiB physical frame from the kernel global allocator.
 //!
 //! # Why user pages are not marked `U`
 //!
@@ -52,12 +31,14 @@
 //!
 //! # SMP
 //!
-//! `enable_paging` runs on every hart that comes online. The bootstrap
-//! hart sets up the root table, secondary harts share it via `satp`.
-//! Every address-space mutation invalidates this hart's TLB entries
-//! and dispatches one `sbi_rt::remote_sfence_vma` range fence to every
-//! other running hart (a stopped hart flushes on restart), after the last page-table write and before any frame
-//! goes back to the user-memory pool.
+//! Limine starts every secondary hart on the same Sv48 root table as the
+//! bootstrap hart; [`activate_paging`] still refreshes `satp` and flushes
+//! the local TLB on secondary entry and hotplug restart. Every
+//! address-space mutation invalidates this hart's TLB entries and
+//! dispatches one `sbi_rt::remote_sfence_vma` range fence to every other
+//! running hart (a stopped hart flushes on restart), after the last
+//! page-table write and before any frame goes back to the user-memory
+//! pool.
 
 extern crate alloc;
 
@@ -111,23 +92,17 @@ const PTE_FLAGS_MASK: u64 = (1 << PTE_PPN_SHIFT) - 1;
 const PTE_LEAF_MASK: u64 = PTE_READ | PTE_WRITE | PTE_EXECUTE;
 
 const SATP_MODE_SHIFT: u32 = 60;
+const SATP_MODE_MASK: u64 = 0xf << SATP_MODE_SHIFT;
 const SATP_MODE_SV48: u64 = 9 << SATP_MODE_SHIFT;
+const SATP_PPN_MASK: u64 = (1 << 44) - 1;
 
 const GIB: usize = 1 << 30;
-/// Bytes one root-level leaf maps in Sv48: 512 GiB, the mode's largest
-/// page size. Every physical address a RISC-V platform helios targets
-/// exposes — MMIO below 1 GiB, RAM from 0x8000_0000 up — is inside the
-/// first one, so the kernel identity map is a single PTE.
+/// Bytes one root-level leaf maps in Sv48: 512 GiB.
 const KERNEL_IDENTITY_BYTES: usize = 1 << (PAGE_SHIFT + LEVEL_BITS * (LEVELS as u32 - 1));
 
-/// Highest physical address the kernel identity map reaches. Physical
-/// memory the firmware reports past this point is unreachable and the
-/// backend refuses to boot rather than faulting on it later.
-pub const KERNEL_IDENTITY_LIMIT: usize = KERNEL_IDENTITY_BYTES;
-
-/// User-VA window. Starts well clear of the identity map so address
-/// values are unambiguous when debugging fault traces, and matches the
-/// x86 backend's window so the two read alike.
+/// User-VA window. Lives in the lower canonical half (root entries 64..128),
+/// clear of Limine's higher-half direct map and kernel image, and matches the
+/// x86 backend's window so fault traces read alike.
 const USER_VA_BASE: usize = 0x0000_2000_0000_0000;
 const USER_VA_END: usize = 0x0000_4000_0000_0000;
 
@@ -144,6 +119,10 @@ fn level_index(virt: usize, level: usize) -> usize {
     (virt >> (PAGE_SHIFT + LEVEL_BITS * level as u32)) & (PTE_COUNT - 1)
 }
 
+fn level_span(level: usize) -> usize {
+    1 << (PAGE_SHIFT + LEVEL_BITS * level as u32)
+}
+
 fn entry_phys(entry: u64) -> usize {
     ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize
 }
@@ -151,10 +130,8 @@ fn entry_phys(entry: u64) -> usize {
 #[repr(align(4096))]
 struct PageTable(UnsafeCell<[u64; PTE_COUNT]>);
 
-// SAFETY: `ROOT_TABLE` is only mutably accessed in `install_kernel_paging`
-// before paging is enabled; afterwards every hart shares it via `satp` and
-// mutations to user-VA entries are serialised by `RiscvUserAddressSpace::state`
-// with atomic operations on intermediate entries.
+// SAFETY: `RESTART_ROOT_TABLE` is only mutated under `RESTART_TABLE_LOCK`
+// before `sbi_rt::hart_start` publishes it to a restarting hart.
 unsafe impl Sync for PageTable {}
 
 impl PageTable {
@@ -162,76 +139,127 @@ impl PageTable {
         Self(UnsafeCell::new([0; PTE_COUNT]))
     }
 
-    /// The table's entries as a raw array pointer.
-    ///
-    /// The root table is a `static` shared by every hart, so there is
-    /// never a `&mut PageTable` to hand out; who may write it is decided
-    /// by the paging bring-up order rather than by the borrow checker,
-    /// and each caller states which side of that order it is on.
     fn entries_ptr(&self) -> *mut [u64; PTE_COUNT] {
         self.0.get()
     }
-
-    fn phys_addr(&self) -> usize {
-        self.entries_ptr().cast::<u64>() as usize
-    }
 }
 
-/// Boot-time root page table. `static` so it is in BSS at a stable
-/// physical address before paging is enabled. Only the bootstrap hart
-/// initialises it; secondaries share it via the same `satp` value.
-static ROOT_TABLE: PageTable = PageTable::new();
+/// Scratch root page table used exclusively during SBI HSM hotplug restart so
+/// `_hart_restart` can turn Sv48 paging on at its physical address before
+/// jumping into the higher-half kernel and switching to the live root table.
+static RESTART_ROOT_TABLE: PageTable = PageTable::new();
+static RESTART_TABLE_LOCK: Mutex<()> = Mutex::new(());
+static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 
+static PHYSICAL_MEMORY_OFFSET: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_VIRTUAL_BASE: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_PHYSICAL_BASE: AtomicUsize = AtomicUsize::new(0);
 static PAGING_ROOT_PHYS: AtomicUsize = AtomicUsize::new(0);
 static USER_AS: Once<RiscvUserAddressSpace> = Once::new();
 
-/// Initialise the root table with the kernel identity map. The
-/// caller is responsible for invoking `activate_paging` on each hart
-/// that should run paged.
-///
-/// # Safety
-/// Must be called exactly once, before any hart writes `satp`. The
-/// returned `&'static RiscvUserAddressSpace` is the user-VA address
-/// space owned by this kernel; it survives for the lifetime of the
-/// process.
-pub unsafe fn install_kernel_paging() -> &'static RiscvUserAddressSpace {
-    // SAFETY: the caller guarantees this runs once, before any hart
-    // writes `satp`, so the bootstrap hart is the only writer.
-    let entries = unsafe { &mut *ROOT_TABLE.entries_ptr() };
-    for entry in entries.iter_mut() {
-        *entry = 0;
-    }
-    // A single 512 GiB leaf at root index 0: PPN 0, so virtual equals
-    // physical across the whole identity window. Nothing is allocated,
-    // which is what lets paging come up before the kernel heap does.
-    entries[0] = PTE_VALID | PTE_READ | PTE_WRITE | PTE_EXECUTE | PTE_ACCESSED | PTE_DIRTY;
-    let root_phys = ROOT_TABLE.phys_addr();
+pub(crate) fn physical_memory_offset() -> usize {
+    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::Acquire);
     assert!(
-        root_phys.is_multiple_of(PAGE_SIZE),
-        "Sv48 root table is not page-aligned"
+        offset != 0,
+        "physical memory offset read before adopt_limine_paging"
     );
-    PAGING_ROOT_PHYS.store(root_phys, Ordering::Release);
-    USER_AS.call_once(|| RiscvUserAddressSpace::new(root_phys))
+    offset
 }
 
-/// Switch the calling hart into Sv48 paging using the root table
-/// installed by [`install_kernel_paging`].
-///
-/// # Safety
-/// `install_kernel_paging` must have completed on the bootstrap hart
-/// before any hart calls this function. The caller must ensure no
-/// instruction or data in flight relies on a physical address outside
-/// the identity-mapped window.
-pub unsafe fn activate_paging() {
+pub(crate) fn phys_to_virt(phys: usize) -> usize {
+    phys.checked_add(physical_memory_offset())
+        .unwrap_or_else(|| panic!("physical address {phys:#x} overflows HHDM"))
+}
+
+pub(crate) fn hhdm_virt_to_phys(virt: usize) -> usize {
+    let offset = physical_memory_offset();
+    virt.checked_sub(offset)
+        .unwrap_or_else(|| panic!("HHDM address {virt:#x} is below offset {offset:#x}"))
+}
+
+pub(crate) fn kernel_virt_to_phys(virt: usize) -> usize {
+    let vbase = KERNEL_VIRTUAL_BASE.load(Ordering::Acquire);
+    let pbase = KERNEL_PHYSICAL_BASE.load(Ordering::Acquire);
+    assert!(
+        vbase != 0,
+        "kernel virtual base read before adopt_limine_paging"
+    );
+    let offset = virt.checked_sub(vbase).unwrap_or_else(|| {
+        panic!("kernel virtual address {virt:#x} precedes kernel base {vbase:#x}")
+    });
+    pbase
+        .checked_add(offset)
+        .unwrap_or_else(|| panic!("kernel physical address overflow for virtual address {virt:#x}"))
+}
+
+pub(crate) fn kernel_satp() -> u64 {
     let root_phys = PAGING_ROOT_PHYS.load(Ordering::Acquire);
     assert!(
         root_phys != 0,
-        "Sv48 root table not installed before activate_paging"
+        "Sv48 root table not installed before kernel_satp"
     );
-    let satp = SATP_MODE_SV48 | (root_phys as u64 >> PAGE_SHIFT);
-    // SAFETY: `install_kernel_paging` completed before this call, `satp`
-    // encodes Sv48 mode and the page-aligned physical address of `ROOT_TABLE`,
-    // and `sfence.vma zero, zero` flushes any stale translations on this hart.
+    SATP_MODE_SV48 | (root_phys as u64 >> PAGE_SHIFT)
+}
+
+/// Adopts the live Sv48 page-table root installed by Limine and initializes
+/// [`RiscvUserAddressSpace`].
+///
+/// # Safety
+/// Must be called exactly once on the bootstrap hart before any secondary hart
+/// starts or any dynamic mapping is created.
+pub unsafe fn adopt_limine_paging(
+    hhdm_offset: usize,
+    kernel_virtual_base: usize,
+    kernel_physical_base: usize,
+) -> &'static RiscvUserAddressSpace {
+    let satp = riscv::register::satp::read().bits() as u64;
+    assert_eq!(
+        satp & SATP_MODE_MASK,
+        SATP_MODE_SV48,
+        "Limine did not enter the RISC-V kernel in Sv48 mode (satp={satp:#x})"
+    );
+    let root_phys = ((satp & SATP_PPN_MASK) << PAGE_SHIFT) as usize;
+    assert!(
+        root_phys != 0 && root_phys.is_multiple_of(PAGE_SIZE),
+        "Limine Sv48 root table address {root_phys:#x} is invalid"
+    );
+    PHYSICAL_MEMORY_OFFSET.store(hhdm_offset, Ordering::Release);
+    KERNEL_VIRTUAL_BASE.store(kernel_virtual_base, Ordering::Release);
+    KERNEL_PHYSICAL_BASE.store(kernel_physical_base, Ordering::Release);
+    PAGING_ROOT_PHYS.store(root_phys, Ordering::Release);
+
+    let root_table = phys_to_virt(root_phys) as *const [u64; PTE_COUNT];
+    // SAFETY: `root_phys` is the active Sv48 root table mapped through Limine's
+    // HHDM, and no other hart is mutating it yet.
+    let entries = unsafe { &*root_table };
+    let first_user = level_index(USER_VA_BASE, LEVELS - 1);
+    let last_user = level_index(USER_VA_END - 1, LEVELS - 1);
+    for (index, &entry) in entries
+        .iter()
+        .enumerate()
+        .take(last_user + 1)
+        .skip(first_user)
+    {
+        assert_eq!(
+            entry & PTE_VALID,
+            0,
+            "Limine pre-populated Sv48 root entry {index} inside the user-VA window"
+        );
+    }
+
+    USER_AS.call_once(|| RiscvUserAddressSpace::new(root_phys))
+}
+
+/// Switch the calling hart onto the adopted Sv48 root table and flush its TLB.
+///
+/// # Safety
+/// `adopt_limine_paging` must have completed on the bootstrap hart before any
+/// hart calls this function.
+pub unsafe fn activate_paging() {
+    let satp = kernel_satp();
+    // SAFETY: `adopt_limine_paging` completed before this call, `satp`
+    // encodes Sv48 mode and the page-aligned physical address of the shared
+    // root table, and `sfence.vma zero, zero` flushes any stale translations.
     unsafe {
         core::arch::asm!(
             "csrw satp, {satp}",
@@ -240,12 +268,6 @@ pub unsafe fn activate_paging() {
             options(nostack, preserves_flags),
         );
     }
-    // `satp.MODE` is WARL: a hart that does not implement Sv48 discards
-    // the whole write and stays in bare mode, where the identity map
-    // happens to make execution look fine right up until the first user
-    // mapping is dereferenced. Reading the register back is the only way
-    // to tell the two apart, and there is no 39-bit configuration to
-    // fall back to, so a hart that refuses Sv48 stops here.
     let installed = riscv::register::satp::read().bits() as u64;
     assert!(
         installed == satp,
@@ -253,8 +275,153 @@ pub unsafe fn activate_paging() {
     );
 }
 
+/// Builds a temporary Sv48 root table for SBI HSM hotplug restart containing
+/// the live kernel's upper half (`256..512`) plus a 512 GiB RWX identity leaf
+/// covering `restart_phys`.
+pub(crate) fn build_restart_satp(restart_phys: usize) -> u64 {
+    let _guard = RESTART_TABLE_LOCK.lock();
+    let root_phys = PAGING_ROOT_PHYS.load(Ordering::Acquire);
+    assert!(
+        root_phys != 0,
+        "Sv48 root table not installed before build_restart_satp"
+    );
+    let live_entries = phys_to_virt(root_phys) as *const [u64; PTE_COUNT];
+    // SAFETY: `RESTART_TABLE_LOCK` serializes writes to `RESTART_ROOT_TABLE`,
+    // and `live_entries` points to the live Sv48 root table mapped in HHDM.
+    let restart_entries = unsafe { &mut *RESTART_ROOT_TABLE.entries_ptr() };
+    for entry in restart_entries.iter_mut() {
+        *entry = 0;
+    }
+    // SAFETY: upper-half root entries (`256..512`) hold Limine's higher-half
+    // kernel and HHDM mappings.
+    let live = unsafe { &*live_entries };
+    restart_entries[256..PTE_COUNT].copy_from_slice(&live[256..PTE_COUNT]);
+
+    let id_idx =
+        (restart_phys >> (PAGE_SHIFT + LEVEL_BITS * (LEVELS as u32 - 1))) & (PTE_COUNT - 1);
+    assert!(
+        id_idx < 256,
+        "restart entry physical address {restart_phys:#x} lies outside the lower 256 TiB"
+    );
+    let ppn = ((id_idx as u64) << (LEVEL_BITS * (LEVELS as u32 - 1))) << PTE_PPN_SHIFT;
+    restart_entries[id_idx] =
+        ppn | PTE_VALID | PTE_READ | PTE_WRITE | PTE_EXECUTE | PTE_ACCESSED | PTE_DIRTY;
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    let table_phys = kernel_virt_to_phys(RESTART_ROOT_TABLE.entries_ptr() as usize);
+    SATP_MODE_SV48 | (table_phys as u64 >> PAGE_SHIFT)
+}
+
+/// Ensures physical MMIO range `phys..phys + bytes` is mapped read-write in
+/// the higher-half direct map and returns its virtual base address.
+///
+/// Any page or superpage already mapped at `phys + hhdm_offset -> phys` with
+/// read+write permission (for example Limine's lower-4 GiB HHDM superpages) is
+/// reused untouched; unmapped pages (such as 64-bit PCI BARs above 4 GiB) are
+/// mapped with 4 KiB supervisor RW leaves on demand.
+pub(crate) fn map_mmio_range(phys: usize, bytes: usize) -> usize {
+    assert!(
+        bytes != 0,
+        "cannot map a zero-length MMIO range at {phys:#x}"
+    );
+    let hhdm = physical_memory_offset();
+    let end = phys
+        .checked_add(bytes)
+        .unwrap_or_else(|| panic!("MMIO range {phys:#x}+{bytes:#x} overflows usize"));
+    let page_start = phys & !(PAGE_SIZE - 1);
+    let page_end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let root_phys = PAGING_ROOT_PHYS.load(Ordering::Acquire);
+    assert!(
+        root_phys != 0,
+        "map_mmio_range called before adopt_limine_paging"
+    );
+
+    let _guard = MMIO_MAP_LOCK.lock();
+    let root_table = phys_to_virt(root_phys) as *mut [u64; PTE_COUNT];
+    let mut cursor = page_start;
+    let mut mapped_any = false;
+    while cursor < page_end {
+        let virt = cursor
+            .checked_add(hhdm)
+            .unwrap_or_else(|| panic!("MMIO address {cursor:#x} overflows HHDM"));
+        let mut table = root_table;
+        let mut covered_span = None;
+        for level in (1..LEVELS).rev() {
+            let index = level_index(virt, level);
+            // SAFETY: `table` points to a live Sv48 page table mapped in HHDM
+            // and `MMIO_MAP_LOCK` serializes MMIO page-table mutations.
+            let entry_ptr = unsafe { table.cast::<u64>().add(index) };
+            // SAFETY: `entry_ptr` is aligned to `u64` inside a live page table.
+            let entry_atomic = unsafe { AtomicU64::from_ptr(entry_ptr) };
+            let entry = entry_atomic.load(Ordering::Acquire);
+            if entry & PTE_VALID != 0 {
+                if entry & PTE_LEAF_MASK != 0 {
+                    let span = level_span(level);
+                    let leaf_phys = entry_phys(entry);
+                    let expected_leaf_phys = cursor & !(span - 1);
+                    assert!(
+                        leaf_phys == expected_leaf_phys
+                            && (entry & (PTE_READ | PTE_WRITE)) == (PTE_READ | PTE_WRITE),
+                        "Sv48 HHDM leaf at {virt:#x} (level {level}) maps {leaf_phys:#x} \
+                         with flags {entry:#x}, expected RW mapping of {expected_leaf_phys:#x}"
+                    );
+                    covered_span = Some(span - (cursor & (span - 1)));
+                    break;
+                }
+                table = phys_to_virt(entry_phys(entry)) as *mut [u64; PTE_COUNT];
+            } else {
+                let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
+                    .expect("Sv48 page-table layout is well-formed");
+                // SAFETY: `layout` has non-zero `PAGE_SIZE` size and alignment.
+                let raw = unsafe { alloc_zeroed(layout) };
+                let raw = NonNull::new(raw).expect("Sv48 MMIO page-table allocation failed");
+                let child_phys = hhdm_virt_to_phys(raw.as_ptr() as usize);
+                let new_entry = ((child_phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID;
+                entry_atomic.store(new_entry, Ordering::Release);
+                table = raw.as_ptr().cast::<[u64; PTE_COUNT]>();
+            }
+        }
+        if let Some(advance) = covered_span {
+            cursor = cursor.saturating_add(advance);
+            continue;
+        }
+        let leaf_index = level_index(virt, 0);
+        // SAFETY: `table` is a live level-0 page table and `leaf_index < 512`.
+        let leaf_ptr = unsafe { table.cast::<u64>().add(leaf_index) };
+        // SAFETY: `MMIO_MAP_LOCK` is held and `leaf_ptr` points to a valid leaf PTE.
+        let existing = unsafe { leaf_ptr.read_volatile() };
+        if existing & PTE_VALID != 0 {
+            assert!(
+                entry_phys(existing) == cursor
+                    && (existing & (PTE_READ | PTE_WRITE)) == (PTE_READ | PTE_WRITE),
+                "Sv48 HHDM 4K leaf at {virt:#x} conflicts with MMIO physical address {cursor:#x}"
+            );
+        } else {
+            let ppn = (cursor as u64) >> PAGE_SHIFT;
+            // SAFETY: `leaf_ptr` points to an empty leaf PTE under `MMIO_MAP_LOCK`.
+            unsafe {
+                leaf_ptr.write_volatile(
+                    (ppn << PTE_PPN_SHIFT)
+                        | PTE_VALID
+                        | PTE_READ
+                        | PTE_WRITE
+                        | PTE_ACCESSED
+                        | PTE_DIRTY,
+                );
+            }
+            mapped_any = true;
+        }
+        cursor += PAGE_SIZE;
+    }
+    if mapped_any {
+        let virt_start = page_start + hhdm;
+        flush_tlb_pages(virt_start, (page_end - page_start) / PAGE_SIZE);
+    }
+    phys + hhdm
+}
+
 /// Get the user address space registered at boot. Returns `None`
-/// before [`install_kernel_paging`] has run.
+/// before [`adopt_limine_paging`] has run.
 pub fn user_address_space() -> Option<&'static RiscvUserAddressSpace> {
     USER_AS.get()
 }
@@ -314,7 +481,7 @@ impl RiscvUserAddressSpace {
     fn free_pinned_run(&self, phys: usize, bytes: usize, align: usize) {
         let layout = Layout::from_size_align(bytes, align)
             .unwrap_or_else(|_| panic!("RISC-V pinned run has an invalid layout"));
-        let ptr = NonNull::new(phys as *mut u8)
+        let ptr = NonNull::new(phys_to_virt(phys) as *mut u8)
             .unwrap_or_else(|| panic!("RISC-V pinned run has a null pointer"));
         deallocate_user_run_on(crate::current_hart_id(), ptr, layout);
     }
@@ -326,13 +493,9 @@ impl RiscvUserAddressSpace {
             .or_else(|| self.va_cursor.carve(byte_len))
     }
 
-    /// The root table this address space maps through.
-    ///
-    /// The table lives at a fixed physical address rather than inside
-    /// the address space value, so it is reached by pointer; callers
-    /// hold the reservation lock that serialises table edits.
+    /// The root table this address space maps through, reached through HHDM.
     fn root_table(&self) -> *mut [u64; PTE_COUNT] {
-        self.root_phys as *mut [u64; PTE_COUNT]
+        phys_to_virt(self.root_phys) as *mut [u64; PTE_COUNT]
     }
 
     fn ensure_intermediate(table: *mut [u64; PTE_COUNT], index: usize) -> *mut [u64; PTE_COUNT] {
@@ -349,17 +512,17 @@ impl RiscvUserAddressSpace {
                 entry & PTE_LEAF_MASK == 0,
                 "Sv48 user-VA index {index:#x} collides with a leaf mapping"
             );
-            return entry_phys(entry) as *mut [u64; PTE_COUNT];
+            return phys_to_virt(entry_phys(entry)) as *mut [u64; PTE_COUNT];
         }
         let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
             .expect("Sv48 page-table layout is well-formed");
         // SAFETY: `layout` has non-zero `PAGE_SIZE` size and alignment.
         let raw = unsafe { alloc_zeroed(layout) };
         let raw = NonNull::new(raw).expect("Sv48 page-table allocation failed");
-        let phys = raw.as_ptr() as usize;
+        let phys = hhdm_virt_to_phys(raw.as_ptr() as usize);
         let new_entry = ((phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT | PTE_VALID;
         entry_atomic.store(new_entry, Ordering::Release);
-        phys as *mut [u64; PTE_COUNT]
+        raw.as_ptr().cast::<[u64; PTE_COUNT]>()
     }
 
     /// Pointer to the leaf entry for `virt`, allocating the
@@ -400,7 +563,7 @@ impl RiscvUserAddressSpace {
                 entry & PTE_LEAF_MASK == 0,
                 "Sv48 user VA {virt:#x} resolves through a leaf mapping at level {level}"
             );
-            table = entry_phys(entry) as *mut [u64; PTE_COUNT];
+            table = phys_to_virt(entry_phys(entry)) as *mut [u64; PTE_COUNT];
         }
         // SAFETY: `table` is a live leaf page table and `level_index(virt, 0) < PTE_COUNT`.
         Some(unsafe { table.cast::<u64>().add(level_index(virt, 0)) })
@@ -545,7 +708,7 @@ impl RiscvUserAddressSpace {
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
         let raw = allocate_user_frame_zeroed_on(crate::current_hart_id())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        Ok(raw.as_ptr() as usize)
+        Ok(hhdm_virt_to_phys(raw.as_ptr() as usize))
     }
 
     /// A replacement for the frame at `old_phys`, from the node that
@@ -553,15 +716,15 @@ impl RiscvUserAddressSpace {
     /// would undo its placement. Not zeroed, because the caller copies
     /// the whole page over it.
     fn alloc_relocation_frame(&self, old_phys: usize) -> Result<usize, AddressSpaceError> {
-        let old = NonNull::new(old_phys as *mut u8)
+        let old = NonNull::new(phys_to_virt(old_phys) as *mut u8)
             .unwrap_or_else(|| panic!("RISC-V relocation source is a null frame"));
         let raw = allocate_user_frame_uninit_on_node(user_frame_node(old))
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        Ok(raw.as_ptr() as usize)
+        Ok(hhdm_virt_to_phys(raw.as_ptr() as usize))
     }
 
     fn dealloc_user_phys(&self, phys: usize) {
-        let ptr = NonNull::new(phys as *mut u8)
+        let ptr = NonNull::new(phys_to_virt(phys) as *mut u8)
             .unwrap_or_else(|| panic!("RISC-V user-frame dealloc received null pointer"));
         deallocate_user_frame_on(crate::current_hart_id(), ptr);
     }
@@ -593,9 +756,13 @@ impl RiscvUserAddressSpace {
             };
             // SAFETY: `old_phys` is the committed frame from `translate_4k` and
             // `new_phys` is a freshly allocated disjoint `PAGE_SIZE` frame, both
-            // directly addressable through the identity map.
+            // directly addressable through the higher-half direct map.
             unsafe {
-                ptr::copy_nonoverlapping(old_phys as *const u8, new_phys as *mut u8, PAGE_SIZE);
+                ptr::copy_nonoverlapping(
+                    phys_to_virt(old_phys) as *const u8,
+                    phys_to_virt(new_phys) as *mut u8,
+                    PAGE_SIZE,
+                );
             }
             pages.push(RelocationPage {
                 virt: virt_addr,
@@ -972,11 +1139,11 @@ impl AddressSpace for RiscvUserAddressSpace {
             .ok_or(AddressSpaceError::Misaligned)?;
         let layout =
             Layout::from_size_align(bytes, align).map_err(|_| AddressSpaceError::Misaligned)?;
-        // The kernel identity-maps physical memory on this backend, so
-        // the pointer is the physical address.
+        // User-pool runs live in the higher-half direct map; subtract the
+        // direct-map offset to obtain the physical range.
         let raw = allocate_user_run_zeroed_on(crate::current_hart_id(), layout)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let phys = raw.as_ptr() as usize;
+        let phys = hhdm_virt_to_phys(raw.as_ptr() as usize);
         if !placement.accepts(phys as u64, bytes as u64) {
             self.free_pinned_run(phys, bytes, align);
             return Err(AddressSpaceError::OutOfFrames);
@@ -1139,14 +1306,14 @@ impl AddressSpace for RiscvUserAddressSpace {
             .ok_or(AddressSpaceError::NotDemandCommit)?;
         // SAFETY: the walk above ran through live tables, and the leaf
         // it names belongs to a prepared demand-commit region, which
-        // only the fiber running on it ever faults on. This backend
-        // identity-maps physical memory, so the pool's pointer is the
-        // physical address.
+        // only the fiber running on it ever faults on. The pool frame's
+        // pointer lives in the higher-half direct map.
         let entry = unsafe { entry_ptr.read_volatile() };
         if entry & PTE_VALID != 0 {
             return Err(AddressSpaceError::Overlap);
         }
-        let ppn = (frame.as_ptr() as u64) >> PAGE_SHIFT;
+        let phys = hhdm_virt_to_phys(frame.as_ptr() as usize);
+        let ppn = (phys as u64) >> PAGE_SHIFT;
         // SAFETY: as above; the store publishes a complete leaf.
         unsafe {
             entry_ptr.write_volatile(
@@ -1354,7 +1521,7 @@ pub(crate) fn user_address_space_or_panic() -> &'static RiscvUserAddressSpace {
 }
 
 fn user_as() -> &'static RiscvUserAddressSpace {
-    user_address_space().expect("RiscvUserAddressSpace accessed before install_kernel_paging")
+    user_address_space().expect("RiscvUserAddressSpace accessed before adopt_limine_paging")
 }
 
 const ENOMEM: c_int = 12;

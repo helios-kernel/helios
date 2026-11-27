@@ -1,17 +1,18 @@
-// Hibernate restore trampoline for RISC-V 64-bit (Sv48 identity-mapped kernel).
+// Hibernate restore trampoline for RISC-V 64-bit (Sv48 higher-half kernel).
 //
 // Entered from the boot kernel with supervisor interrupts disabled and `a0`
-// pointing to a `RiscvRestoreParams` block placed on the dedicated non-colliding
-// trampoline page (`trampoline_phys`).
+// pointing to a `RiscvRestoreParams` block placed on the dedicated
+// non-colliding trampoline page (mapped in Boot 2's HHDM).
 //
 // Field offsets in `RiscvRestoreParams` (pinned by compile-time assertions
 // in `riscv/src/hibernate.rs`):
 //   0x00: trampoline_satp
-//   0x08: copy_table_phys
+//   0x08: copy_table_virt
 //   0x10: copy_count
-//   0x18: stack_top_phys
-//   0x20: handoff_phys
-//   0x28: ctx_phys
+//   0x18: direct_map_offset
+//   0x20: stack_top_virt
+//   0x28: handoff_phys
+//   0x30: ctx_virt
 //
 // Field offsets in `Riscv64SnapshotContext` (pinned in `riscv/src/hibernate.rs`):
 //   0x00: ra        0x08: sp        0x10: gp        0x18: tp
@@ -37,10 +38,11 @@ __helios_riscv_restore_trampoline:
 
     mv t6, a0
     // Switch to the private stack on the safe trampoline page.
-    ld sp, 0x18(t6)
+    ld sp, 0x20(t6)
 
-    // Switch `satp` to the self-contained 1-page Sv48 identity root table on a
-    // safe frame so displaced copies cannot overwrite active page tables.
+    // Switch `satp` to the self-contained Sv48 trampoline table on safe
+    // frames mapping HHDM, `V_enter -> enter_copy_phys`, and
+    // `V_finish -> image_finish_phys`.
     ld t0, 0x00(t6)
     csrw satp, t0
     sfence.vma zero, zero
@@ -48,12 +50,15 @@ __helios_riscv_restore_trampoline:
     // Linear copy loop over `DisplacedFrameCopy` entries (16 bytes each).
     // Every `src_phys` is disjoint from every `dst_phys` and from the
     // trampoline/table pages, so a forward pass is cycle-free.
-    ld t1, 0x08(t6)         // copy_table_phys
+    ld t1, 0x08(t6)         // copy_table_virt
     ld t2, 0x10(t6)         // copy_count
+    ld a3, 0x18(t6)         // direct_map_offset
 .Lhelios_riscv_copy_loop:
     beqz t2, .Lhelios_riscv_copy_done
     ld t3, 0(t1)            // src_phys
     ld t4, 8(t1)            // dst_phys
+    add t3, t3, a3          // src_virt
+    add t4, t4, a3          // dst_virt
     addi t1, t1, 16
     li t5, 512              // 512 * 8 = 4096 bytes
 .Lhelios_riscv_page_loop:
@@ -76,14 +81,11 @@ __helios_riscv_restore_trampoline_enter_end:
 .balign 4096
 .global __helios_riscv_restore_finish
 __helios_riscv_restore_finish:
-    // Load pointer to saved `Riscv64SnapshotContext` and `handoff_phys`.
-    ld t0, 0x28(t6)         // ctx_phys
-    ld a1, 0x20(t6)         // handoff_phys
-
-    // Switch back to the image kernel's `satp` and flush the TLB.
-    ld t1, 0xf8(t0)         // satp
-    csrw satp, t1
-    sfence.vma zero, zero
+    // Read saved context and handoff physical address while the trampoline
+    // HHDM mapping is still active, so Boot 1 and Boot 2 may use distinct
+    // HHDM offsets.
+    ld t0, 0x30(t6)         // ctx_virt
+    ld a1, 0x28(t6)         // handoff_phys
 
     // Restore supervisor trap/interrupt CSRs while keeping `sstatus.SIE` clear
     // (the caller entered `capture_bsp_state` under `LocalInterruptsMasked`).
@@ -131,9 +133,18 @@ __helios_riscv_restore_finish:
     ld sp,  0x08(t0)
     ld ra,  0x00(t0)
 
+    // Switch to the image kernel's `satp` and flush the TLB. Both tables map
+    // `__helios_riscv_restore_finish` at the same virtual page pointing to
+    // `image_finish_phys`.
+    ld t1, 0xf8(t0)         // satp
+    csrw satp, t1
+    sfence.vma zero, zero
+
     // Return (a0 = 1 (`SnapshotPoint::Resumed`), a1 = handoff_phys) directly
     // into `RiscvCpu::capture_bsp_state`.
     li a0, 1
     ret
+.global __helios_riscv_restore_finish_end
+__helios_riscv_restore_finish_end:
 
 .option pop

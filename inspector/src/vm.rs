@@ -923,7 +923,6 @@ impl VmArch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmBootArtifactKind {
-    KernelBinary,
     LimineUefiDiskImage,
 }
 
@@ -1463,17 +1462,17 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     arch: VmArch::Riscv64,
     qemu_bin: DEFAULT_RISCV_QEMU_BIN,
     cargo_target: "riscv64gc-unknown-none-elf",
-    machine: "virt",
+    machine: "virt,acpi=off",
     kernel_artifact_name: "helios-kernel",
     default_smp: DEFAULT_RISCV_SMP,
     default_memory: DEFAULT_RISCV_MEMORY,
-    default_bios: Some("default"),
+    default_bios: None,
     default_accel: &[],
     default_cpu: None,
-    boot_artifact: VmBootArtifactKind::KernelBinary,
+    boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioMmio),
-    boot_disk: None,
+    boot_disk: Some(VmBootDiskProfile::VirtioPci),
     data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
@@ -1486,10 +1485,8 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     input: VmInputProfile::VirtioInputMmio,
     sound: VmSoundProfile::VirtioSoundMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
-    // QEMU's riscv64 `virt` machine attaches `tpm-tis-device` on the platform
-    // bus; measured boot still requires a firmware event log (#1292).
     tpm: Some(VmTpmProfile::TisMmio),
-    profile_generate_linker_script: Some("riscv/profile-generate.x"),
+    profile_generate_linker_script: Some("riscv/profile-generate.ld"),
     release_kernel_profile: false,
 };
 
@@ -6299,7 +6296,6 @@ fn prepare_boot_artifact(
     runtime_dir: Option<&Path>,
 ) -> Result<PathBuf, VmRuntimeError> {
     match command.profile.boot_artifact {
-        VmBootArtifactKind::KernelBinary => Ok(command.kernel.clone()),
         VmBootArtifactKind::LimineUefiDiskImage => prepare_limine_uefi_image(command, runtime_dir),
     }
 }
@@ -6365,10 +6361,8 @@ fn prepare_limine_uefi_image(
 fn limine_efi_arch_argument(arch: VmArch) -> &'static str {
     match arch {
         VmArch::Aarch64 => "aarch64",
+        VmArch::Riscv64 => "riscv64",
         VmArch::X86_64 => "x86-64",
-        VmArch::Riscv64 => {
-            panic!("riscv64 does not use Limine UEFI boot artifacts")
-        }
     }
 }
 
@@ -7331,16 +7325,6 @@ impl VmRuntime {
             qemu.arg("-global").arg("virtio-mmio.force-legacy=false");
         }
         configure_firmware(&mut qemu, command, runtime_dir.path())?;
-        match command.profile.boot_artifact {
-            VmBootArtifactKind::KernelBinary => {
-                // riscv64's `-kernel` boot is the one path without a
-                // bootloader to hand modules over; the payload rides as
-                // the initrd, whose range `/chosen` publishes.
-                qemu.arg("-kernel").arg(&artifact);
-                qemu.arg("-initrd").arg(&command.bootfs);
-            }
-            VmBootArtifactKind::LimineUefiDiskImage => {}
-        }
         configure_machine_devices(
             &mut qemu,
             command,
@@ -7891,8 +7875,8 @@ fn configure_firmware(
 fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf, VmRuntimeError> {
     let env_var = match arch {
         VmArch::Aarch64 => "HELIOS_EDK2_AARCH64_CODE",
+        VmArch::Riscv64 => "HELIOS_EDK2_RISCV64_CODE",
         VmArch::X86_64 => "HELIOS_EDK2_X86_64_CODE",
-        VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
     };
     if let Some(path) = std::env::var_os(env_var).map(PathBuf::from) {
         if path.is_file() {
@@ -7909,6 +7893,13 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf, VmR
         qemu_bin.into()
     };
     let mut candidates = Vec::new();
+    if arch == VmArch::Riscv64 {
+        // Prefer Helios's TPM2-enabled RISC-V EDK2 build when installed (as
+        // baked into the CI image) over distro builds that omit TCG2.
+        candidates.push(PathBuf::from(
+            "/usr/share/helios-edk2-riscv64/RISCV_VIRT_CODE.fd",
+        ));
+    }
     if let Some(prefix) = qemu_bin.parent().and_then(Path::parent) {
         candidates.push(prefix.join("share/qemu").join(edk2_code_filename(arch)));
     }
@@ -7917,14 +7908,16 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf, VmR
         PathBuf::from("/usr/local/share/qemu").join(edk2_code_filename(arch)),
         PathBuf::from("/usr/share/qemu").join(edk2_code_filename(arch)),
     ]);
-    // Debian/Ubuntu package EDK2 as OVMF/AAVMF under their own names.
+    // Debian/Ubuntu package EDK2 as OVMF/AAVMF/qemu-efi-riscv64 under their own names.
     match arch {
         VmArch::X86_64 => candidates.extend([
             PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             PathBuf::from("/usr/share/OVMF/OVMF_CODE.fd"),
         ]),
         VmArch::Aarch64 => candidates.extend([PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.fd")]),
-        VmArch::Riscv64 => {}
+        VmArch::Riscv64 => candidates.extend([PathBuf::from(
+            "/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd",
+        )]),
     }
     candidates
         .into_iter()
@@ -7938,8 +7931,8 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf, VmR
 fn edk2_code_filename(arch: VmArch) -> &'static str {
     match arch {
         VmArch::Aarch64 => "edk2-aarch64-code.fd",
+        VmArch::Riscv64 => "edk2-riscv-code.fd",
         VmArch::X86_64 => "edk2-x86_64-code.fd",
-        VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
     }
 }
 
@@ -7963,17 +7956,22 @@ fn discover_qemu_edk2_vars(arch: VmArch, code: &Path) -> Result<PathBuf, VmRunti
 }
 
 fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
-    // The OVMF/AAVMF names cover Debian/Ubuntu firmware packages, whose
-    // variable stores sit next to the code image under their own names.
+    // The OVMF/AAVMF/RISCV_VIRT names cover Debian/Ubuntu and custom EDK2
+    // builds, whose variable stores sit next to the code image under their own
+    // names.
     let names: &'static [&'static str] = match arch {
         VmArch::Aarch64 => &["edk2-aarch64-vars.fd", "edk2-arm-vars.fd", "AAVMF_VARS.fd"],
+        VmArch::Riscv64 => &[
+            "edk2-riscv-vars.fd",
+            "edk2-riscv64-vars.fd",
+            "RISCV_VIRT_VARS.fd",
+        ],
         VmArch::X86_64 => &[
             "edk2-x86_64-vars.fd",
             "edk2-i386-vars.fd",
             "OVMF_VARS_4M.fd",
             "OVMF_VARS.fd",
         ],
-        VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
     };
     names.iter().copied()
 }
@@ -9661,17 +9659,20 @@ mod tests {
     #[test]
     fn riscv64_profile_matches_qemu_first_baseline() {
         assert_eq!(RISCV64_VM_PROFILE.arch, VmArch::Riscv64);
-        assert_eq!(RISCV64_VM_PROFILE.machine, "virt");
+        assert_eq!(RISCV64_VM_PROFILE.machine, "virt,acpi=off");
         assert_eq!(RISCV64_VM_PROFILE.default_memory, DEFAULT_RISCV_MEMORY);
         assert_eq!(
             RISCV64_VM_PROFILE.boot_artifact,
-            VmBootArtifactKind::KernelBinary
+            VmBootArtifactKind::LimineUefiDiskImage
         );
         assert_eq!(
             RISCV64_VM_PROFILE.network,
             Some(VmNetworkProfile::VirtioMmio)
         );
-        assert_eq!(RISCV64_VM_PROFILE.boot_disk, None);
+        assert_eq!(
+            RISCV64_VM_PROFILE.boot_disk,
+            Some(VmBootDiskProfile::VirtioPci)
+        );
         assert_eq!(RISCV64_VM_PROFILE.data_disk, VmDataDiskProfile::VirtioMmio);
         assert_eq!(
             RISCV64_VM_PROFILE.host_share,

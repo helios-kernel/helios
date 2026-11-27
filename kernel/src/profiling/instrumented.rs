@@ -4,7 +4,7 @@
 //! still refers to lives here: `__llvm_profile_runtime`, the symbol rustc
 //! would otherwise satisfy by injecting compiler-rt, and the section bounds
 //! the linker script defines around the instrumentation
-//! (`aarch64/profile-generate.ld`, `riscv/profile-generate.x`; the
+//! (`aarch64/profile-generate.ld`, `riscv/profile-generate.ld`; the
 //! `x86_64-unknown-none` link uses LLD's own layout and its synthesised
 //! `__start_`/`__stop_` symbols).
 //!

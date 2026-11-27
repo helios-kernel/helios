@@ -208,6 +208,8 @@ def main() -> int:
             "http-client",
             "--no-compiler-plugin",
             "shell",
+            "--shell",
+            "/bin/dash",
             "-c",
             Path(__file__).with_suffix(".sh").read_text(),
         ]

@@ -114,11 +114,16 @@ struct PciMemoryWindow {
 impl PciHostController {
     pub(crate) fn discover(fdt: &Fdt<'_>) -> Option<Self> {
         let node = fdt.find_compatible(&["pci-host-ecam-generic"])?;
-        let ecam_base = node
+        let ecam_region = node
             .reg()
             .and_then(|mut reg| reg.next())
-            .map(|region| region.starting_address as usize)
             .unwrap_or_else(|| panic!("PCI ECAM host node is missing a CPU-addressable reg"));
+        let ecam_size = ecam_region
+            .size
+            .filter(|&size| size != 0)
+            .unwrap_or_else(|| panic!("PCI ECAM host node has zero-sized reg"));
+        let ecam_base =
+            crate::vmm::map_mmio_range(ecam_region.starting_address as usize, ecam_size);
         let domain = node.property("linux,pci-domain").map_or(0, |property| {
             let domain = read_be_u32(property.value);
             u16::try_from(domain)
@@ -458,13 +463,14 @@ impl PciMmioMapper for PciHostController {
     fn map_region(
         &self,
         physical_address: u64,
-        _size: usize,
+        size: usize,
     ) -> helios_hal::io::IoResult<NonNull<u8>> {
         let bus_address = usize::try_from(physical_address).unwrap_or_else(|_| {
             panic!("PCI MMIO address {physical_address:#x} does not fit in usize")
         });
-        let cpu_address = self.translate_mmio_address(bus_address);
-        NonNull::new(cpu_address as *mut u8).ok_or(helios_hal::io::IoError::DeviceFault)
+        let cpu_phys = self.translate_mmio_address(bus_address);
+        let virt = crate::vmm::map_mmio_range(cpu_phys, size.max(1));
+        NonNull::new(virt as *mut u8).ok_or(helios_hal::io::IoError::DeviceFault)
     }
 }
 

@@ -339,10 +339,11 @@ impl InterruptDomains {
         let domains = helios_virtio::plic_descriptions(fdt, bootstrap_hart.id())
             .filter_map(|plic| {
                 let taking = plic.taking?;
+                let plic_virt = crate::vmm::map_mmio_range(plic.controller.base(), 0x0400_0000);
                 // SAFETY: the device tree names this window as a PLIC's
-                // registers, and the kernel's identity map covers the
-                // platform's MMIO.
-                let registers = unsafe { Plic::from_addr(plic.controller.base()) };
+                // registers, and `map_mmio_range` maps the 64 MiB PLIC
+                // register window in the higher-half direct map.
+                let registers = unsafe { Plic::from_addr(plic_virt) };
                 Some(ExternalInterrupts::new(
                     registers,
                     plic.controller,
@@ -738,7 +739,8 @@ fn discover_network_device(
     let candidate = helios_virtio::mmio_candidates(fdt)
         .find(|candidate| crate::matches_virtio_mmio_device(candidate.base, DeviceType::Network))?;
     let base = candidate.base;
-    let header = core::ptr::NonNull::new(base as *mut u8)
+    let virt_base = crate::vmm::map_mmio_range(base, candidate.size);
+    let header = core::ptr::NonNull::new(virt_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
     let line = candidate
         .interrupt

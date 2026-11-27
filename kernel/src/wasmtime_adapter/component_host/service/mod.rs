@@ -3076,7 +3076,11 @@ where
                 };
                 (
                     condemn,
-                    self.run_compile(exec_context, job, instance, phases),
+                    // Box the compile future so `compile_session` (which
+                    // `compile_raw_component` constructs on the caller's fiber
+                    // stack before handing to `spawn_detached`) does not embed
+                    // `run_compile`'s ~40 KiB state machine inline.
+                    Box::pin(self.run_compile(exec_context, job, instance, phases)),
                 )
             },
             |end| self.finish_compiled(exec_context, profile, end),

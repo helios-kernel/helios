@@ -119,16 +119,15 @@ the export instead of writing a file `llvm-profdata` misreads.
 
 #### Keeping the sections
 
-`aarch64/profile-generate.ld` and `riscv/profile-generate.x` place
+`aarch64/profile-generate.ld` and `riscv/profile-generate.ld` place
 `__llvm_prf_data`, `__llvm_prf_names`, `__llvm_prf_vnds`,
 `__llvm_prf_bits` and `__llvm_prf_cnts` with `KEEP` and define a
 `__start_`/`__stop_` pair for each. Both targets bring their own linker
-script, so the sections have to be placed: on riscv64 an orphan would
-land outside `__sdata .. __edata`, the window `_start` copies from the
-image, and the per-function records — which carry link-time relative
-pointers, not zeroes — would never reach RAM. The fragments are added
-with an extra `-T` by the instrumented build alone, so a plain image is
-byte-for-byte what the base script produces.
+script naming explicit `PT_LOAD` segments, so the sections have to be
+placed into `:data` rather than left as orphans outside the segment the
+loader zero-fills. The fragments are added with an extra `-T` by the
+instrumented build alone, so a plain image is byte-for-byte what the base
+script produces.
 
 `x86_64-unknown-none` has no fragment and needs none: it links with
 LLD's own layout, which places the sections as ordinary orphans, keeps

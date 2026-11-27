@@ -3358,10 +3358,7 @@ where
     if !p1_file_fdflags_supported(fdflags) {
         return Ok(p1::errno::INVAL);
     }
-    let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
-    if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= FsDescriptorFlags::WRITE;
-    }
+    let descriptor_flags = p1_open_descriptor_flags(&base, open_flags, rights, fdflags);
     p1_path_open_resolved(
         caller,
         &memory,
@@ -5412,6 +5409,31 @@ pub(super) fn p1_open_flags(flags: u16) -> fs_types::OpenFlags {
     result
 }
 
+/// Translates WASI preview1 / WASIX `path_open` rights into kernel
+/// [`FsDescriptorFlags`] relative to `base`.
+///
+/// Preview1 and WASIX libc implementations (`wasi-libc`, Rust's `File::open`)
+/// pass a broad `fs_rights_base` mask on `O_RDONLY` opens expecting the host
+/// to intersect ambient rights (such as `FD_FILESTAT_SET_TIMES` and `PATH_*`
+/// mutation bits) with the base directory's rights. Explicit write intent
+/// (`P1_RIGHT_FD_WRITE`, `CREATE`, `TRUNCATE`) is preserved unmasked so
+/// opening read-write or mutating through a read-only preopen still fails
+/// with `EROFS`.
+pub(super) fn p1_open_descriptor_flags(
+    base: &FsDescriptor,
+    open_flags: fs_types::OpenFlags,
+    rights: u64,
+    fdflags: u16,
+) -> FsDescriptorFlags {
+    let explicit_write = rights & P1_RIGHT_FD_WRITE;
+    let effective_rights = (rights & p1_node_rights(base)) | explicit_write;
+    let mut descriptor_flags = p1_descriptor_flags(effective_rights, fdflags);
+    if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
+        descriptor_flags |= FsDescriptorFlags::WRITE;
+    }
+    descriptor_flags
+}
+
 pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> FsDescriptorFlags {
     let mut flags = FsDescriptorFlags::empty();
     if rights & P1_RIGHT_FD_READ != 0 || rights & P1_RIGHT_FD_READDIR != 0 {
@@ -5702,6 +5724,39 @@ mod tests {
             .expect("the owner reads back");
             assert_eq!(contents.as_ref(), "日本語 한국어".as_bytes());
         }
+    }
+
+    #[test]
+    fn path_open_intersects_ambient_rights_with_read_only_base() {
+        let ro_base = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+            open: None,
+        };
+        let broad_rdonly = P1_RIGHT_FD_READ
+            | P1_RIGHT_FD_READDIR
+            | P1_RIGHT_FD_FILESTAT_SET_TIMES
+            | P1_RIGHT_PATH_MUTATE_MASK;
+        assert_eq!(
+            p1_open_descriptor_flags(&ro_base, fs_types::OpenFlags::empty(), broad_rdonly, 0),
+            FsDescriptorFlags::READ
+        );
+        assert!(
+            p1_open_descriptor_flags(
+                &ro_base,
+                fs_types::OpenFlags::empty(),
+                P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE,
+                0,
+            )
+            .contains(FsDescriptorFlags::WRITE)
+        );
+        assert!(
+            p1_open_descriptor_flags(&ro_base, fs_types::OpenFlags::TRUNCATE, P1_RIGHT_FD_READ, 0,)
+                .contains(FsDescriptorFlags::WRITE)
+        );
     }
 
     /// A namespace with one file, `/data`, and the time it was last

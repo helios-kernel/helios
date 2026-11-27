@@ -79,10 +79,9 @@ fn mapping_granule() -> u64 {
     PhysFrame::SIZE as u64
 }
 
-/// The kernel identity-maps physical memory on this backend, so a
-/// frame's kernel address is its physical address.
+/// A physical frame's kernel address in the higher-half direct map.
 fn kernel_alias(frame: PhysFrame) -> VirtAddr {
-    VirtAddr::new(frame.phys_addr())
+    VirtAddr::new(crate::vmm::phys_to_virt(frame.phys_addr()))
 }
 
 static VM_HOOKS: DeviceVmHooks = DeviceVmHooks {

@@ -59,18 +59,12 @@ the trusted roots (`kernel/src/signing_key.rs`).
 
 ## How each backend hands it over
 
-- **x86-64 and aarch64** boot the Limine UEFI disk image
+- **x86-64, aarch64 and riscv64** boot the Limine UEFI disk image
   `helios-cli limine-uefi-image` writes. The image places the payload at
   `/boot/helios-bootfs` and the entry's `module_path` names it, so it
   arrives as a Limine module. The backend takes the module whose path
   ends in `helios-bootfs` and panics naming every module present when
   none matches — a kernel without a payload has no init to run.
-- **riscv64** boots `-kernel` directly; there is no Limine handoff. QEMU
-  delivers the payload as the initrd (`-initrd`), publishes its physical
-  range in the device tree's `/chosen` `linux,initrd-start` and
-  `linux,initrd-end`, and the backend carves that range out of the
-  memory the allocator is primed with before parsing it through the
-  identity map.
 - **hosted** takes the path on its command line: `helios --bootfs
   <path>`. The file is read once at start-up; absent or malformed is a
   hard error, the same contract the bare-metal paths enforce.
@@ -83,7 +77,7 @@ of generated statics.
 
 ## Bootloader splash and early framebuffer panic console
 
-On `x86-64` and `aarch64`, `helios-cli limine-uefi-image` rasterises the
+On `x86-64`, `aarch64` and `riscv64`, `helios-cli limine-uefi-image` rasterises the
 Helios emblem from `docs/logo.svg` in memory (`cli/src/splash.rs`) as a
 360×360 RGB8 PNG on `#FFFFFF` and writes it to `/boot/limine/splash.png`
 inside the FAT32 ESP alongside `limine.conf` — no binary image is committed
@@ -125,7 +119,7 @@ secret key:
   and 14 days on other lanes (`release-linux`, `debug`, `debug-cfi`).
 - **Full bootable image** (`helios-image-{arch}-{profile}`): kernel ELF,
   signed `helios-bootfs`, `helios-root-public.key`, prebuilt Limine UEFI disk
-  image `kernel.uefi.img` on `x86-64` and `aarch64`, and `compiler_plugin.wasm`
+  image `kernel.uefi.img`, and `compiler_plugin.wasm`
   when built with the compiler plugin; kept 90 days on the release smoke lanes
   and 14 days on other lanes.
 

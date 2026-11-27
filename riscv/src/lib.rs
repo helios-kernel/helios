@@ -5,6 +5,7 @@ extern crate alloc;
 mod balloon;
 mod block;
 mod device;
+mod efi;
 mod entropy;
 mod gpu;
 mod hibernate;
@@ -87,8 +88,10 @@ impl DebugTransport {
                     node.name
                 )
             });
+        let size = region.size.unwrap_or(0x1000).max(0x1000);
+        let uart_base = vmm::map_mmio_range(region.starting_address as usize, size);
         Some(Self {
-            uart_base: region.starting_address as usize,
+            uart_base,
             plic_line,
         })
     }
@@ -139,12 +142,13 @@ impl ByteSerial for DebugTransport {
 
 use helios_virtio::DeviceType;
 
-/// RISC-V MMIO is identity-mapped, so candidates are probed at their
-/// physical base directly.
+/// Probes a VirtIO MMIO device candidate after mapping its register page into
+/// the higher-half direct map.
 pub(crate) fn matches_virtio_mmio_device(base: usize, expected: DeviceType) -> bool {
+    let virt_base = vmm::map_mmio_range(base, 0x1000);
     // SAFETY: `base` came from `helios_virtio::mmio_candidates(fdt)`, and
-    // RISC-V identity-maps physical MMIO addresses.
-    unsafe { helios_virtio::mmio_device_matches(base, expected) }
+    // `vmm::map_mmio_range` mapped its register page in HHDM.
+    unsafe { helios_virtio::mmio_device_matches(virt_base, expected) }
 }
 
 pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> usize {
@@ -156,14 +160,16 @@ pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> 
 use core::arch::{asm, global_asm};
 use core::num::NonZeroUsize;
 use core::ops::Range;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 
-use arrayvec::ArrayVec;
 use fdt::Fdt;
 use helios_firmware::{DeviceTreeNuma, ProcessorIdentities};
 use helios_hal::boot::{
-    BootMemoryKind, BootMemoryMetadata, BootMemoryRegion, BootPayloadMetadata, BootPhysicalRange,
-    BootReservedRanges, KernelImageSections, KernelSectionRange, usable_node_regions,
+    BootFirmwareTables, BootFramebuffer, BootHandoff, BootKernelImage, BootMemoryKind,
+    BootMemoryMap, BootMemoryMetadata, BootMemoryRegion, BootModule, BootModules,
+    BootPayloadMetadata, BootPhysicalRange, BootPixelChannel, BootPixelLayout, BootReservedRanges,
+    FirmwareKind, KernelImageSections, KernelSectionRange, usable_node_regions,
 };
 use helios_hal::cpu::{
     BspSnapshotContext, Cpu, GUEST_STACK_LIMIT_OFFSET, Instant, ProcessorId, ResumeHandoff,
@@ -171,17 +177,33 @@ use helios_hal::cpu::{
     TimerInterrupt, current_processor,
 };
 use helios_hal::critical_section::ProcessorIdentity;
-use helios_hal::memory::MemoryRegion;
-use helios_hal::numa::NumaTopology;
+use helios_hal::pmm::PhysFrame;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
     DebugSerialAccess, KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer,
     WasmtimeTlsSlots,
 };
+use limine::BaseRevision;
+use limine::file::File;
+use limine::firmware::{
+    FIRMWARE_TYPE_EFI32, FIRMWARE_TYPE_EFI64, FIRMWARE_TYPE_SBI, FIRMWARE_TYPE_X86BIOS,
+};
+use limine::framebuffer::FRAMEBUFFER_RGB;
+use limine::memmap::{
+    Entry, MEMMAP_ACPI_NVS, MEMMAP_ACPI_RECLAIMABLE, MEMMAP_BOOTLOADER_RECLAIMABLE,
+    MEMMAP_EXECUTABLE_AND_MODULES, MEMMAP_RESERVED, MEMMAP_USABLE,
+};
+use limine::mp::MpInfo;
+use limine::paging::PagingMode;
+use limine::request::{
+    BspHartidRequest, DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
+    ExecutableFileRequest, FirmwareTypeRequest, FlantermParamsRequest, FramebufferRequest,
+    HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, PagingModeRequest, StackSizeRequest,
+};
+use r_efi::efi::SystemTable;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
-use riscv_rt::entry;
 use spin::Once;
 
 mod lifecycle;
@@ -189,38 +211,85 @@ mod trap;
 
 pub use trap::{GeneralRegs, TrapFrame};
 
-global_asm!(include_str!("mp_hook.S"));
+const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+global_asm!(
+    include_str!("entry.S"),
+    boot_stack_bytes = const KERNEL_STACK_BYTES,
+);
 global_asm!(include_str!("secondary_entry.S"));
 global_asm!(include_str!("snapshot.S"));
 
-const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
-/// One bit of [`ONLINE_HARTS`] per hart id.
+#[used]
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(6);
+#[used]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+#[used]
+static MEMORY_MAP_REQUEST: MemmapRequest = MemmapRequest::new();
+#[used]
+static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+#[used]
+static EXECUTABLE_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
+#[used]
+static EXECUTABLE_CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+#[used]
+static MODULE_REQUEST: ModulesRequest = ModulesRequest::new();
+#[used]
+static MP_REQUEST: MpRequest = MpRequest::new(0);
+#[used]
+static PAGING_MODE_REQUEST: PagingModeRequest =
+    PagingModeRequest::new_exact(PagingMode::RISCV_SV48);
+#[used]
+static BSP_HARTID_REQUEST: BspHartidRequest = BspHartidRequest::new();
+#[used]
+static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
+#[used]
+static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
+#[used]
+static EFI_SYSTEM_TABLE_REQUEST: EfiRequest = EfiRequest::new();
+#[used]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+/// Advertising `FlantermParamsRequest` instructs Limine v12 to preserve the
+/// bootloader splash pixels on the linear GOP framebuffer across kernel entry
+/// rather than clearing the screen before `_start`.
+#[used]
+static FLANTERM_PARAMS_REQUEST: FlantermParamsRequest = FlantermParamsRequest::new();
+#[used]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
+/// The firmware's TPM event log, which the measured-boot discovery reads
+/// to learn whether Limine measured the kernel (`tpm::discover`).
+#[used]
+static TPM_EVENT_LOG_REQUEST: helios_kernel::LimineTpmEventLogRequest =
+    helios_kernel::LimineTpmEventLogRequest::new();
+
+/// One bit of [`ONLINE_HARTS`] and [`STARTED_HARTS`] per hart id.
 const MAX_TRACKED_HARTS: usize = usize::BITS as usize;
 const SSTATUS_SPP_BIT: usize = 1 << 8;
 
-static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
-/// Harts that have entered [`run_hart`] and can therefore be parked in `wfi`.
-///
-/// SBI only accepts `sbi_send_ipi` for harts the firmware currently reports as
-/// started, suspended, or resume-pending: OpenSBI's `sbi_ipi_send_many`
-/// intersects the requested mask with the interruptible harts and rejects the
-/// whole call with `SBI_ERR_INVALID_PARAM` when any requested hart drops out.
-/// The kernel scheduler legitimately nudges secondaries while the bootstrap
-/// hart is still bringing up devices, long before it hands them to
-/// `sbi_hart_start`, so the backend tracks which harts are actually running
-/// kernel code. A hart that has not entered the kernel is not parked and needs
-/// no nudge: it drains the run queues as soon as it reaches the scheduler.
+/// Harts that have entered the kernel and can therefore be parked in `wfi` or
+/// targeted by SBI `send_ipi` / `remote_sfence_vma`.
 static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
+/// Harts already released from Limine's SMP spin loop via `MpInfo::bootstrap`.
+static STARTED_HARTS: AtomicUsize = AtomicUsize::new(0);
+static MP_INFOS: Once<[Option<&'static MpInfo>; MAX_TRACKED_HARTS]> = Once::new();
+static SECONDARY_BOOT_STATE: Once<SecondaryBootState> = Once::new();
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
-static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
-static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
 /// Shared monotonic tick offset added to the RISC-V `time` CSR so [`Cpu::now`]
 /// continues strictly forward across hibernate/resume and [`Cpu::set_deadline`]
 /// translates deadlines back into raw `time` CSR ticks for `sbi_rt::set_timer`.
 static TIMEBASE_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-use core::ptr::NonNull;
+#[derive(Clone)]
+struct SecondaryBootState {
+    cpu: RiscvCpu,
+    watchdog: watchdog::RiscvWatchdog,
+    debug_state: debug_state::RuntimeState,
+    mirror_to_uart: bool,
+    devices: DeviceInventory,
+    dma_model: DmaModel,
+    boot_memory: BootMemoryMetadata,
+}
 
 const SSTATUS_SIE_BIT: usize = 1 << 1;
 const SSTATUS_SPIE_BIT: usize = 1 << 5;
@@ -460,21 +529,14 @@ pub struct RiscvCpu {
     bootstrap_hart: ProcessorId,
     hart_count: usize,
     timebase: Timebase,
-    fdt_addr: usize,
 }
 
 impl RiscvCpu {
-    pub(crate) fn new(
-        bootstrap_hart: ProcessorId,
-        hart_count: usize,
-        timebase: Timebase,
-        fdt_addr: usize,
-    ) -> Self {
+    pub(crate) fn new(bootstrap_hart: ProcessorId, hart_count: usize, timebase: Timebase) -> Self {
         Self {
             bootstrap_hart,
             hart_count,
             timebase,
-            fdt_addr,
         }
     }
 }
@@ -588,34 +650,13 @@ impl Cpu for RiscvCpu {
     }
 
     fn start_processor(&self, hart: ProcessorId) {
-        match hart_status(hart) {
-            sbi_spec::hsm::hart_state::STARTED => {
-                self.wake_processor(hart);
-            }
-            sbi_spec::hsm::hart_state::STOPPED => {
-                lifecycle::assert_never_stopped(hart);
-                let ret = sbi_rt::hart_start(
-                    hart.id() as usize,
-                    core::ptr::addr_of!(_secondary_start).addr(),
-                    self.fdt_addr,
-                );
-                if ret.is_ok() {
-                    return;
-                }
-
-                panic!(
-                    "failed to start hart {} via SBI HSM: error={} value={}",
-                    hart.id(),
-                    ret.error,
-                    ret.value
-                );
-            }
-            state => panic!(
-                "hart {} reported unexpected SBI HSM state {}",
-                hart.id(),
-                state
-            ),
+        let bit = hart_bit(hart);
+        if STARTED_HARTS.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+            self.wake_processor(hart);
+            return;
         }
+        lifecycle::assert_never_stopped(hart);
+        mp_info_for_hart(hart).bootstrap(_limine_secondary_entry, 0);
     }
 
     fn stop_current(&self) {
@@ -758,12 +799,12 @@ impl Cpu for RiscvCpu {
             *context = BspSnapshotContext::from_riscv64(&raw);
             Ok(SnapshotPoint::Captured)
         } else {
-            let handoff_ptr = core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(
-                result.handoff_phys as usize,
-            );
-            // SAFETY: RISC-V identity-maps physical RAM, and the restore
-            // trampoline wrote a valid `ResumeHandoffWire` at
-            // `result.handoff_phys` on the safe trampoline page.
+            let handoff_virt = vmm::phys_to_virt(result.handoff_phys as usize);
+            let handoff_ptr =
+                core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(handoff_virt);
+            // SAFETY: the restore trampoline wrote a valid `ResumeHandoffWire`
+            // at `result.handoff_phys` on the safe trampoline page, reachable
+            // through this kernel's higher-half direct map.
             let wire = unsafe { core::ptr::read(handoff_ptr) };
             // Wipe the handoff copy (which contains fresh boot entropy) once consumed.
             // SAFETY: `handoff_ptr` is exclusively owned by this resuming BSP.
@@ -785,18 +826,743 @@ impl Cpu for RiscvCpu {
     }
 }
 
-#[entry]
-fn main(hart_id: usize, fdt_addr: usize, opaque: usize) -> ! {
-    let _ = opaque;
-    run_hart(hart_id, fdt_addr)
-}
-
 mod vmm;
 pub use vmm::RiscvUserAddressSpace;
 
+#[derive(Clone, Copy)]
+struct LimineMemoryMap {
+    entries: &'static [&'static Entry],
+}
+
+impl BootMemoryMap for LimineMemoryMap {
+    type Iter = core::iter::Map<
+        core::iter::Copied<core::slice::Iter<'static, &'static Entry>>,
+        fn(&'static Entry) -> BootMemoryRegion,
+    >;
+
+    fn regions(&self) -> Self::Iter {
+        self.entries.iter().copied().map(convert_memory_region)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LimineModules {
+    files: &'static [&'static File],
+}
+
+impl BootModules<'static> for LimineModules {
+    type Iter = core::iter::Map<
+        core::iter::Copied<core::slice::Iter<'static, &'static File>>,
+        fn(&'static File) -> BootModule<'static>,
+    >;
+
+    fn modules(&self) -> Self::Iter {
+        self.files.iter().copied().map(convert_module)
+    }
+}
+
+pub(crate) type LimineBootHandoff = BootHandoff<'static, LimineMemoryMap, LimineModules>;
+
+fn physical_memory_offset() -> usize {
+    HHDM_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an HHDM response"))
+        .offset as usize
+}
+
+fn efi_system_table() -> Option<NonNull<SystemTable>> {
+    EFI_SYSTEM_TABLE_REQUEST.response().map(|response| {
+        NonNull::new(response.address.cast::<SystemTable>().cast_mut())
+            .unwrap_or_else(|| panic!("Limine's EFI system table response holds a null address"))
+    })
+}
+
+fn limine_boot_handoff() -> LimineBootHandoff {
+    let memory_map = LimineMemoryMap {
+        entries: MEMORY_MAP_REQUEST
+            .response()
+            .unwrap_or_else(|| panic!("Limine did not provide a memory map response"))
+            .entries(),
+    };
+    let executable_address = EXECUTABLE_ADDRESS_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an executable address response"));
+    let executable_file = EXECUTABLE_FILE_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an executable file response"))
+        .executable_file();
+    let firmware = FIRMWARE_TYPE_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide a firmware type response"))
+        .firmware_type;
+    let firmware = convert_firmware_kind(firmware);
+    assert!(
+        firmware == FirmwareKind::Uefi64,
+        "RISC-V backend requires Limine UEFI64 boot, got {firmware:?}"
+    );
+    BootHandoff {
+        memory_map,
+        kernel: BootKernelImage {
+            physical_base: executable_address.physical_base,
+            virtual_base: executable_address.virtual_base,
+            file_address: executable_file.data().as_ptr() as usize,
+            size: executable_file.data().len() as u64,
+        },
+        command_line: EXECUTABLE_CMDLINE_REQUEST
+            .response()
+            .unwrap_or_else(|| panic!("Limine did not provide an executable command-line response"))
+            .cmdline()
+            .as_bytes(),
+        modules: LimineModules {
+            files: MODULE_REQUEST
+                .response()
+                .map(|response| response.modules())
+                .unwrap_or(&[]),
+        },
+        firmware,
+        tables: BootFirmwareTables {
+            acpi_rsdp: None,
+            device_tree_blob: DEVICE_TREE_BLOB_REQUEST
+                .response()
+                .map(|response| response.dtb_ptr as usize),
+            measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
+        },
+        framebuffer: limine_framebuffer(),
+    }
+}
+
+fn limine_framebuffer() -> Option<BootFramebuffer> {
+    let response = FRAMEBUFFER_REQUEST.response()?;
+    response.framebuffers().iter().copied().find_map(|fb| {
+        if fb.memory_model != FRAMEBUFFER_RGB {
+            return None;
+        }
+        let base = NonNull::new(fb.address().cast::<u8>())?;
+        let width = u32::try_from(fb.width).ok()?;
+        let height = u32::try_from(fb.height).ok()?;
+        let pitch = u32::try_from(fb.pitch).ok()?;
+        let framebuffer = BootFramebuffer {
+            base,
+            width,
+            height,
+            pitch,
+            bpp: fb.bpp,
+            layout: BootPixelLayout::new(
+                BootPixelChannel::new(fb.red_mask_size, fb.red_mask_shift),
+                BootPixelChannel::new(fb.green_mask_size, fb.green_mask_shift),
+                BootPixelChannel::new(fb.blue_mask_size, fb.blue_mask_shift),
+            ),
+        };
+        framebuffer.is_valid().then_some(framebuffer)
+    })
+}
+
+fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {
+    BootMemoryRegion {
+        start: entry.base,
+        end: entry.base + entry.length,
+        kind: if entry.type_ == MEMMAP_USABLE {
+            BootMemoryKind::Usable
+        } else if entry.type_ == MEMMAP_BOOTLOADER_RECLAIMABLE {
+            BootMemoryKind::BootloaderReclaimable
+        } else if entry.type_ == MEMMAP_EXECUTABLE_AND_MODULES {
+            BootMemoryKind::KernelAndModules
+        } else if entry.type_ == MEMMAP_ACPI_RECLAIMABLE {
+            BootMemoryKind::AcpiReclaimable
+        } else if entry.type_ == MEMMAP_ACPI_NVS {
+            BootMemoryKind::AcpiNvs
+        } else if entry.type_ == MEMMAP_RESERVED {
+            BootMemoryKind::Reserved
+        } else {
+            BootMemoryKind::Unusable
+        },
+    }
+}
+
+fn convert_module(file: &'static File) -> BootModule<'static> {
+    BootModule {
+        address: file.data().as_ptr() as usize,
+        size: file.data().len(),
+        path: file.path().as_bytes(),
+        command_line: file.cmdline().as_bytes(),
+    }
+}
+
+fn convert_firmware_kind(firmware: u64) -> FirmwareKind {
+    if firmware == FIRMWARE_TYPE_EFI32 {
+        FirmwareKind::Uefi32
+    } else if firmware == FIRMWARE_TYPE_EFI64 {
+        FirmwareKind::Uefi64
+    } else if firmware == FIRMWARE_TYPE_SBI {
+        FirmwareKind::Sbi
+    } else if firmware == FIRMWARE_TYPE_X86BIOS {
+        panic!("Limine BIOS boot is not supported on RISC-V")
+    } else {
+        panic!("Limine reported an unknown firmware type {firmware:#x}")
+    }
+}
+
+pub(crate) fn mp_info_for_hart(hart: ProcessorId) -> &'static MpInfo {
+    let table = MP_INFOS
+        .get()
+        .expect("Limine MP table accessed before bootstrap initialization");
+    table
+        .get(usize::from(hart.id()))
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| panic!("no Limine MP entry recorded for hart {}", hart.id()))
+}
+
+fn register_limine_mp_infos(hart_count: usize) {
+    let response = MP_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide a RISC-V MP response"));
+    let cpus = response.cpus();
+    assert_eq!(
+        cpus.len(),
+        hart_count,
+        "Limine MP response reported {} harts, but FDT described {hart_count}",
+        cpus.len()
+    );
+    let mut table = [None; MAX_TRACKED_HARTS];
+    for &info in cpus {
+        let id = usize::try_from(info.hartid)
+            .unwrap_or_else(|_| panic!("Limine MP hartid {} does not fit in usize", info.hartid));
+        assert!(
+            id < hart_count,
+            "Limine MP hartid {id} is outside dense range 0..{hart_count}"
+        );
+        assert!(
+            table[id].is_none(),
+            "Limine MP response listed duplicate hartid {id}"
+        );
+        table[id] = Some(info);
+    }
+    MP_INFOS.call_once(|| table);
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
-    run_hart(hart_id, fdt_addr)
+extern "C" fn riscv_kernel_main() -> ! {
+    assert!(
+        BASE_REVISION.is_supported() || BASE_REVISION.actual_revision() == Some(6),
+        "Limine bootloader does not support the required base protocol revision"
+    );
+    let bsp_hart_id = BSP_HARTID_REQUEST
+        .response()
+        .map(|response| response.bsp_hartid)
+        .or_else(|| MP_REQUEST.response().map(|response| response.bsp_hartid))
+        .unwrap_or_else(|| panic!("Limine did not provide the RISC-V bootstrap hart id"));
+    let bsp_hart_id = usize::try_from(bsp_hart_id)
+        .unwrap_or_else(|_| panic!("RISC-V bootstrap hart id {bsp_hart_id} does not fit in usize"));
+    write_hart_identity(ProcessorIdentity::bootstrapping(bsp_hart_id));
+
+    let paging = PAGING_MODE_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide a paging mode response"));
+    assert_eq!(
+        paging.mode,
+        PagingMode::RISCV_SV48,
+        "RISC-V backend requires Sv48 paging"
+    );
+
+    let handoff = limine_boot_handoff();
+    if let Some(framebuffer) = handoff.framebuffer {
+        helios_kernel::attach_panic_framebuffer(framebuffer);
+    }
+    let hhdm_offset = physical_memory_offset();
+    // SAFETY: called once on the bootstrap hart before any secondary hart
+    // starts or any dynamic mapping is created.
+    unsafe {
+        vmm::adopt_limine_paging(
+            hhdm_offset,
+            handoff.kernel.virtual_base as usize,
+            handoff.kernel.physical_base as usize,
+        );
+    }
+    vmm::install_runtime_memory_hooks();
+
+    let limine_dtb_addr = handoff
+        .tables
+        .device_tree_blob
+        .unwrap_or_else(|| panic!("Limine did not provide a device tree blob response"));
+    // Prefer the untouched firmware DTB from the UEFI configuration table so
+    // `/memory` nodes with `numa-node-id` are preserved (Limine strips them
+    // from its `DtbRequest` copy). Reserve its physical range out of the
+    // bootstrap allocator in case firmware left it in `MEMMAP_USABLE`.
+    let (fdt, firmware_dtb_range) = match efi::FirmwareTreeLocator::new(
+        efi_system_table(),
+        handoff.memory_map.entries,
+        hhdm_offset,
+    )
+    .open()
+    .unwrap_or_else(|error| panic!("failed to read firmware device tree from EFI table: {error}"))
+    {
+        Some(tree) => (tree.fdt, Some(tree.physical_range)),
+        None => {
+            // SAFETY: Limine mapped the DTB copy in HHDM and keeps it alive for
+            // the kernel's lifetime.
+            let fdt = unsafe { Fdt::from_ptr(limine_dtb_addr as *const u8) }
+                .expect("Limine did not provide a valid FDT");
+            (fdt, None)
+        }
+    };
+
+    let mut cpus = fdt.cpus().filter(|cpu| cpu_is_usable(*cpu));
+    let first_cpu = cpus.next().expect("FDT does not describe any usable CPU");
+    let hart_count = 1 + cpus.count();
+    for cpu in fdt.cpus().filter(|cpu| cpu_is_usable(*cpu)) {
+        let id = cpu.ids().first();
+        assert!(
+            id < hart_count,
+            "FDT describes usable hart {id} but only {hart_count} harts are usable; \
+             processor ids are hart ids and must be dense"
+        );
+    }
+    assert!(
+        hart_count <= MAX_TRACKED_HARTS,
+        "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
+    );
+    assert!(
+        bsp_hart_id < hart_count,
+        "bootstrap hart {bsp_hart_id} is outside usable hart range 0..{hart_count}"
+    );
+    register_limine_mp_infos(hart_count);
+
+    let timebase = Timebase::new(first_cpu.timebase_frequency() as u64);
+    let numa = DeviceTreeNuma::new(&fdt, HartIds { harts: hart_count })
+        .unwrap_or_else(|error| panic!("FDT NUMA description refused: {error}"));
+    let bootstrap_processor = ProcessorId::new(bsp_hart_id as u16);
+    STARTED_HARTS.fetch_or(hart_bit(bootstrap_processor), Ordering::Release);
+    mark_hart_online(bootstrap_processor);
+
+    let reserved_ranges = boot_reserved_ranges(&handoff, firmware_dtb_range.clone());
+    let memory_regions = handoff.memory_map.regions().flat_map(|region| {
+        // SAFETY: Limine's usable entries are RAM nothing else owns, mapped in
+        // the higher-half direct map at `hhdm_offset`, and the kernel image is
+        // reserved out.
+        unsafe { usable_node_regions(region, &reserved_ranges, hhdm_offset, &numa) }
+    });
+    let pool = helios_kernel::prime_bootstrap_allocator(memory_regions, &numa, bootstrap_processor);
+
+    let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
+    let debug_state = debug_state::RuntimeState::new(
+        timebase,
+        hart_count,
+        riscv::register::time::read64(),
+        payload,
+        // The RISC-V `Cpu` answers no feature probe (`native_feature_probe`).
+        helios_kernel::GuestIsa::for_build_target(None),
+    );
+    let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
+    let watchdog = watchdog::discover(&fdt);
+    let pci = pci::PciHostController::discover(&fdt);
+    let pci_virtio = pci.as_ref().map(pci::PciHostController::virtio_functions);
+    let iommu_topology = pci.as_ref().and_then(pci::PciHostController::iommu);
+    let has_vsock = vsock::has_vsock_device(&fdt, pci_virtio.as_ref());
+    let mirror_to_uart = has_debug_transport;
+    let console = kernel_console(debug_state.clone(), mirror_to_uart);
+    let cpu = RiscvCpu::new(bootstrap_processor, hart_count, timebase);
+
+    let mut devices = DeviceInventory::new();
+    if has_debug_transport {
+        devices = devices.with_debug_serial();
+    }
+    if net::has_network_device(&fdt, pci_virtio.as_ref()) {
+        devices = devices.with_network();
+    }
+    let block_device_count = block::count_block_devices(&fdt, pci_virtio.as_ref());
+    if block_device_count != 0 {
+        devices = devices.with_block_devices(block_device_count);
+    }
+    if host_fs::has_9p_device(&fdt, pci_virtio.as_ref()) {
+        devices = devices.with_host_share();
+    }
+    if entropy::has_entropy_device(&fdt, pci_virtio.as_ref()) {
+        devices = devices.with_entropy_device();
+    }
+    if balloon::has_balloon_device(&fdt, pci_virtio.as_ref()) {
+        devices = devices.with_memory_balloon();
+    }
+    if has_vsock {
+        devices = devices.with_vsock();
+    }
+    let has_display = gpu::has_display_device(&fdt, pci_virtio.as_ref());
+    let input_count = input::count_input_devices(&fdt, pci_virtio.as_ref());
+    let has_sound = snd::has_sound_device(&fdt, pci_virtio.as_ref());
+
+    let (measured_boot, measured_boot_discovery) = tpm::discover(&fdt, &handoff, cpu.clone());
+    let dma_model = if iommu_topology.is_some() {
+        DmaModel::Iommu
+    } else {
+        DmaModel::Translated
+    };
+    let boot_memory =
+        collect_boot_memory_metadata(&handoff, hhdm_offset, &debug_state.payload_digest());
+    let kernel = helios_kernel::init_with_watchdog(
+        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog.clone())
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_timer_frequency_hz(timebase.frequency())
+            .with_dma_model(dma_model)
+            .with_devices(devices)
+            .with_measured_boot(measured_boot)
+            .with_boot_memory(boot_memory.clone()),
+    );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
+    if !has_display {
+        tracing::info!("no virtio-gpu device discovered; this machine has no display");
+    }
+    if input_count == 0 {
+        tracing::info!("no virtio-input device discovered; this machine has no input device");
+    }
+    if !has_sound {
+        tracing::info!("no virtio-snd device discovered; this machine has no sound device");
+    }
+    if let Some(pci) = pci.as_ref() {
+        pci.reserve_assigned_memory_bars();
+    }
+    let mut confinement = match (pci.as_ref(), pci_virtio.as_ref(), iommu_topology) {
+        (Some(pci), Some(pci_virtio), Some(topology)) => {
+            let confined = pci_virtio.addresses();
+            let confinement = iommu::confine_devices(pci, topology, &confined);
+            let report = confinement.report();
+            debug_state.install_iommu_report(report.clone());
+            kernel.spawn_detached(iommu::watch_faults(
+                confinement.device(),
+                report,
+                kernel.timer(),
+            ));
+            Some(confinement)
+        }
+        _ => {
+            tracing::info!(
+                "no virtio-iommu in the device tree topology; device DMA reaches physical \
+                 memory directly"
+            );
+            None
+        }
+    };
+    let mut dma_arenas = iommu::RiscvDmaArenas::new(helios_kernel::UserPoolChunks::new(pool));
+    let entropy_device = entropy::bring_up(
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        hart_count,
+    );
+    let generation = helios_kernel::MachineGeneration::new(None);
+    debug_state.install_machine_generation(generation.clone());
+    let root_entropy = helios_kernel::seed_root_entropy(
+        &cpu,
+        helios_hal::entropy::device_tree_seed(&fdt),
+        entropy_device.as_ref().map(|entropy| &entropy.device),
+        generation,
+    );
+    debug_state.install_root_entropy(root_entropy.clone());
+    helios_kernel::settle_boot_signing_keys(&kernel, &debug_state);
+    let rtc = rtc::discover(&fdt);
+    match &rtc {
+        Some(rtc) => {
+            debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
+        }
+        None => {
+            tracing::warn!("no goldfish RTC in the device tree; the wall clock reads as uptime");
+        }
+    }
+    let mut hibernate_devices =
+        hibernate::RiscvHibernateDevices::new(cpu.clone(), debug_state.machine_generation_handle());
+    hibernate_devices.iommu = confinement.as_ref().map(iommu::Confinement::device);
+
+    let mut domains = net::InterruptDomains::discover(&fdt, bootstrap_processor);
+    device::install_hooks();
+    if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
+        assert!(
+            domains.takes(transport.plic_line.controller),
+            "the device tree wires the debug UART to the interrupt controller at {:#x}, in \
+             which no hart has a PLIC supervisor-external context; the serial line could \
+             only be polled",
+            transport.plic_line.controller.base()
+        );
+        domains.attach_debug_serial(
+            transport.plic_line,
+            DebugTransport::console().interrupt_handler::<DebugTransport>(),
+        );
+    }
+    if let Some(network) = net::install_network_service(
+        &cpu,
+        &kernel,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+    ) {
+        hibernate_devices.network = Some(network.device.device().clone());
+        domains.attach_network(network);
+    }
+    if let Some(host_fs) = host_fs::install(
+        &cpu,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+    ) {
+        hibernate_devices.host_fs = Some(host_fs.transport.clone());
+        domains.attach_host_fs(host_fs);
+    }
+    if let Some(entropy) = entropy_device {
+        hibernate_devices.entropy = Some(entropy.device.device().clone());
+        entropy::install(&kernel, &entropy, root_entropy.clone());
+        domains.attach_entropy(entropy);
+    }
+    if let Some(balloon) = balloon::install(
+        &cpu,
+        &kernel,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        debug_state.machine_generation_handle(),
+    ) {
+        hibernate_devices.balloon = Some(balloon.handler.device().clone());
+        debug_state.install_memory_balloon(balloon.handle.clone());
+        domains.attach_balloon(balloon);
+    }
+    if let Some(vsock) = vsock::install(
+        &kernel,
+        &cpu,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+    ) {
+        hibernate_devices.vsock = Some(vsock.device.device().clone());
+        domains.attach_vsock(vsock);
+    }
+    if let Some(display) = gpu::install(
+        &cpu,
+        &kernel,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+    ) {
+        hibernate_devices.display = Some(display.device.device().clone());
+        domains.attach_display(display);
+    }
+    for device in input::install(
+        &cpu,
+        &kernel,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+    ) {
+        hibernate_devices
+            .inputs
+            .push(device.device.device().clone());
+        domains.attach_input(device);
+    }
+    if let Some(sound) = snd::install(
+        &cpu,
+        &kernel,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+    ) {
+        hibernate_devices.sound = Some(sound.device.device().clone());
+        domains.attach_sound(sound);
+    }
+    for block in block::install(
+        &cpu,
+        &kernel,
+        &fdt,
+        pci.as_ref(),
+        pci_virtio.as_ref(),
+        &mut dma_arenas,
+        confinement.as_mut(),
+        &debug_state,
+        root_entropy.clone(),
+    ) {
+        hibernate_devices.blocks.push(block.device.device().clone());
+        domains.attach_block(block);
+    }
+    kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
+        dma_arenas,
+        kernel.timer(),
+    ));
+    let extra_protected = firmware_dtb_range.map(|range| (range.start as u64)..(range.end as u64));
+    hibernate::probe_and_resume_if_present(
+        &cpu,
+        &kernel,
+        &watchdog,
+        &debug_state,
+        pool,
+        &root_entropy,
+        rtc.as_ref(),
+        &mut hibernate_devices,
+        extra_protected.as_slice(),
+    );
+    let hibernate_receiver = debug_state.install_hibernate_service();
+    kernel.spawn_local_detached(hibernate::serve_hibernate_requests(
+        cpu.clone(),
+        kernel.hibernate_handle(),
+        debug_state.clone(),
+        pool,
+        hibernate_devices,
+        hibernate_receiver,
+        DEBUG_SERIAL_WRITER,
+        mirror_to_uart,
+    ));
+    helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
+    let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
+    for (line, route) in grants {
+        domains.attach_device(line, route);
+    }
+    net::publish_interrupt_domains(domains);
+    helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
+
+    SECONDARY_BOOT_STATE.call_once(|| SecondaryBootState {
+        cpu: cpu.clone(),
+        watchdog: watchdog.clone(),
+        debug_state: debug_state.clone(),
+        mirror_to_uart,
+        devices,
+        dma_model,
+        boot_memory,
+    });
+
+    let hart_runtime = HartRuntime {
+        trap_stack: trap::allocate_trap_stack(),
+        guest_stack_limit: AtomicUsize::new(usize::MAX),
+        hart_id: bootstrap_processor,
+        timer: kernel.timer(),
+        wasmtime_tls: WasmtimeTlsSlots::new(),
+        external_interrupts: net::HartInterrupts::of(bootstrap_processor),
+        program_service: Once::new(),
+        hand_over_stack: trap::allocate_trap_stack(),
+        hand_over_probe: trap::HandOverProbe::new(),
+    };
+    hart_runtime.install();
+    if let Some(interrupts) = hart_runtime.external_interrupts {
+        interrupts.open();
+    }
+    let program_service = helios_kernel::install_component_host_program_service(
+        &kernel,
+        &cpu,
+        &debug_state,
+        read_debug_serial,
+        DEBUG_SERIAL_WRITER,
+    )
+    .unwrap_or_else(|| {
+        debug_state
+            .program_service()
+            .unwrap_or_else(|| panic!("RISC-V bootstrap hart failed to install program service"))
+    });
+    hart_runtime.program_service.call_once(|| program_service);
+    // SAFETY: `hart_runtime` is installed with its trap stack, hand-over
+    // stack, external interrupts, and `program_service` initialised.
+    unsafe {
+        configure_interrupts();
+    }
+    for processor in
+        helios_kernel::component_host_processors_to_start(hart_count, bootstrap_processor)
+    {
+        cpu.start_processor(processor);
+    }
+    helios_kernel::run_component_host_processor_forever(
+        cpu,
+        kernel,
+        debug_state,
+        read_debug_serial,
+        DEBUG_SERIAL_WRITER,
+    );
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn riscv_secondary_main(mp_info: &'static MpInfo) -> ! {
+    let hart_id = usize::try_from(mp_info.hartid)
+        .unwrap_or_else(|_| panic!("secondary hartid {} does not fit in usize", mp_info.hartid));
+    write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
+    let current_hart = ProcessorId::new(hart_id as u16);
+    // Join `ONLINE_HARTS` before flushing the local TLB so any remote fence
+    // either preceded this join or targets this hart.
+    mark_hart_online(current_hart);
+    // SAFETY: bootstrap hart already adopted Limine's Sv48 root table.
+    unsafe {
+        vmm::activate_paging();
+    }
+    let state = SECONDARY_BOOT_STATE
+        .get()
+        .expect("secondary hart entered before bootstrap published SecondaryBootState");
+    let cpu = state.cpu.clone();
+    let debug_state = state.debug_state.clone();
+    let console = kernel_console(debug_state.clone(), state.mirror_to_uart);
+    let kernel = helios_kernel::init_with_watchdog(
+        helios_kernel::Platform::with_watchdog(console, cpu.clone(), state.watchdog.clone())
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(
+                    cpu.bootstrap_processor(),
+                    cpu.processor_count(),
+                )
+                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_timer_frequency_hz(cpu.timebase().frequency())
+            .with_dma_model(state.dma_model)
+            .with_devices(state.devices)
+            .with_boot_memory(state.boot_memory.clone()),
+    );
+    let hart_runtime = HartRuntime {
+        trap_stack: trap::allocate_trap_stack(),
+        guest_stack_limit: AtomicUsize::new(usize::MAX),
+        hart_id: current_hart,
+        timer: kernel.timer(),
+        wasmtime_tls: WasmtimeTlsSlots::new(),
+        external_interrupts: net::HartInterrupts::of(current_hart),
+        program_service: Once::new(),
+        hand_over_stack: trap::allocate_trap_stack(),
+        hand_over_probe: trap::HandOverProbe::new(),
+    };
+    hart_runtime.install();
+    if let Some(interrupts) = hart_runtime.external_interrupts {
+        interrupts.open();
+    }
+    let program_service = debug_state.program_service().unwrap_or_else(|| {
+        panic!("RISC-V hart {hart_id} started before program service installation")
+    });
+    hart_runtime.program_service.call_once(|| program_service);
+    // SAFETY: `hart_runtime` is installed with its trap stack, hand-over
+    // stack, external interrupts, and `program_service` initialised.
+    unsafe {
+        configure_interrupts();
+    }
+    helios_kernel::run_component_host_processor_forever(
+        cpu,
+        kernel,
+        debug_state,
+        read_debug_serial,
+        DEBUG_SERIAL_WRITER,
+    );
 }
 
 /// The Rust half of the supervisor trap entry in `trap.S`.
@@ -852,501 +1618,6 @@ fn trap_dispatch(tf: &mut TrapFrame) {
     }
 }
 
-fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
-    // Every hart takes critical sections long before it builds its runtime,
-    // and several harts run this prologue concurrently. Seeding `tp` with the
-    // hart's own bootstrapping identity here is what keeps those acquires
-    // distinguishable; sharing one sentinel makes a second hart's acquire look
-    // like the first hart's nested re-acquire and voids mutual exclusion.
-    write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
-    // SAFETY: OpenSBI (or `sbi_rt::hart_start` for secondaries) passes a
-    // valid device-tree blob physical address in `fdt_addr`, and physical
-    // memory is directly addressable before paging is enabled.
-    let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
-        .expect("OpenSBI did not provide a valid FDT");
-    let mut cpus = fdt.cpus().filter(|cpu| cpu_is_usable(*cpu));
-    let first_cpu = cpus.next().expect("FDT does not describe any usable CPU");
-    let hart_count = 1 + cpus.count();
-    // Processor ids are the hart ids and the possible set is dense, so the
-    // usable harts must be exactly `0..hart_count`: a gap would name a
-    // processor the machine cannot start, and an id past the count one
-    // the kernel never sizes for.
-    for cpu in fdt.cpus().filter(|cpu| cpu_is_usable(*cpu)) {
-        let id = cpu.ids().first();
-        assert!(
-            id < hart_count,
-            "FDT describes usable hart {id} but only {hart_count} harts are usable; \
-             processor ids are hart ids and must be dense"
-        );
-    }
-    assert!(
-        hart_count <= MAX_TRACKED_HARTS,
-        "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
-    );
-    let timebase = Timebase::new(first_cpu.timebase_frequency() as u64);
-    // QEMU delivers the user payload through `-initrd` and publishes its
-    // physical range in `/chosen`; the bytes stay borrowed for the
-    // kernel's lifetime, so the range is carved out of the memory the
-    // allocator is primed with below.
-    let initrd = initrd_range(&fdt);
-    let allocator_window = allocator_window();
-    // A tree without `numa-node-id` describes one node holding every hart
-    // and all of memory.
-    let numa = DeviceTreeNuma::new(&fdt, HartIds { harts: hart_count })
-        .unwrap_or_else(|error| panic!("FDT NUMA description refused: {error}"));
-    let memory_regions = collect_memory_regions(&fdt, allocator_window.clone(), &initrd, &numa);
-    let current_hart = ProcessorId::new(hart_id as u16);
-    let bootstrap_processor = remember_bootstrap_hart(hart_id);
-    mark_hart_online(current_hart);
-    // Bring up Sv48 paging on every hart before any allocator or
-    // driver work. The bootstrap hart populates the root table once
-    // (identity-mapping the kernel's 512 GiB physical window with a
-    // single root-level leaf), then every hart writes its own `satp` to
-    // switch into paged execution. Identity mapping makes the transition
-    // transparent for kernel addresses; the 32 TiB user-VA window above
-    // the identity map is owned by `RiscvUserAddressSpace`, which is
-    // where the runtime's linear-memory reservations live.
-    for region in &memory_regions {
-        let (start, end) = (region.start(), region.end());
-        assert!(
-            end <= vmm::KERNEL_IDENTITY_LIMIT,
-            "firmware reports physical memory at {start:#x}..{end:#x}, past the {:#x} the Sv48 \
-             kernel identity map reaches",
-            vmm::KERNEL_IDENTITY_LIMIT
-        );
-    }
-    if current_hart == bootstrap_processor {
-        // SAFETY: only the bootstrap hart executes this branch, once, before
-        // any hart activates paging or releases early-boot secondaries.
-        unsafe {
-            vmm::install_kernel_paging();
-        }
-        vmm::install_runtime_memory_hooks();
-    }
-    // SAFETY: `install_kernel_paging` completed on the bootstrap hart before
-    // this hart reached here, and every address in flight is identity-mapped.
-    unsafe {
-        vmm::activate_paging();
-    }
-    let user_pool = (current_hart == bootstrap_processor).then(|| {
-        helios_kernel::prime_bootstrap_allocator(
-            memory_regions.iter().copied(),
-            &numa,
-            bootstrap_processor,
-        )
-    });
-
-    let debug_state = shared_debug_state(timebase, hart_count, initrd.clone());
-    let has_debug_transport = publish_debug_transport(DebugTransport::discover(&fdt));
-    let watchdog = shared_watchdog(&fdt);
-    let pci = pci::PciHostController::discover(&fdt);
-    let pci_virtio = pci.as_ref().map(pci::PciHostController::virtio_functions);
-    let iommu_topology = pci.as_ref().and_then(pci::PciHostController::iommu);
-    let has_vsock = vsock::has_vsock_device(&fdt, pci_virtio.as_ref());
-    // The boot UART carries kernel tracing when a vsock device is present for
-    // inspector RPC framing, keeping the UART clear for binary serial RPC on
-    // machines without vsock. A machine whose device tree describes no console
-    // has no line to carry it at all.
-    let console = kernel_console(debug_state.clone(), has_debug_transport && has_vsock);
-    let cpu = RiscvCpu::new(bootstrap_processor, hart_count, timebase, fdt_addr);
-    let mut devices = DeviceInventory::new();
-    if has_debug_transport {
-        devices = devices.with_debug_serial();
-    }
-    if net::has_network_device(&fdt, pci_virtio.as_ref()) {
-        devices = devices.with_network();
-    }
-    let block_device_count = block::count_block_devices(&fdt, pci_virtio.as_ref());
-    if block_device_count != 0 {
-        devices = devices.with_block_devices(block_device_count);
-    }
-    if host_fs::has_9p_device(&fdt, pci_virtio.as_ref()) {
-        devices = devices.with_host_share();
-    }
-    if entropy::has_entropy_device(&fdt, pci_virtio.as_ref()) {
-        devices = devices.with_entropy_device();
-    }
-    if balloon::has_balloon_device(&fdt, pci_virtio.as_ref()) {
-        devices = devices.with_memory_balloon();
-    }
-    if has_vsock {
-        devices = devices.with_vsock();
-    }
-    let has_display = gpu::has_display_device(&fdt, pci_virtio.as_ref());
-    let input_count = input::count_input_devices(&fdt, pci_virtio.as_ref());
-    let has_sound = snd::has_sound_device(&fdt, pci_virtio.as_ref());
-    let (measured_boot, measured_boot_discovery) = if current_hart == bootstrap_processor {
-        tpm::discover(&fdt, cpu.clone())
-    } else {
-        (None, helios_tpm::Discovery::NotDescribed)
-    };
-    let boot_memory =
-        collect_boot_memory_metadata(&fdt, fdt_addr, &initrd, &debug_state.payload_digest());
-    let kernel = helios_kernel::init_with_watchdog(
-        helios_kernel::Platform::with_watchdog(console, cpu.clone(), watchdog.clone())
-            .with_topology(
-                ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
-                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-            )
-            .with_timer_frequency_hz(timebase.frequency())
-            .with_dma_model(if iommu_topology.is_some() {
-                DmaModel::Iommu
-            } else {
-                DmaModel::Identity
-            })
-            .with_devices(devices)
-            .with_measured_boot(measured_boot)
-            .with_boot_memory(boot_memory),
-    );
-    if current_hart == bootstrap_processor {
-        if measured_boot_discovery.is_refusal() {
-            tracing::warn!("{measured_boot_discovery}");
-        } else {
-            tracing::info!("{measured_boot_discovery}");
-        }
-    }
-    // Only the bootstrap hart brings devices up.
-    if let Some(pool) = user_pool {
-        if !has_display {
-            tracing::info!("no virtio-gpu device discovered; this machine has no display");
-        }
-        if input_count == 0 {
-            tracing::info!("no virtio-input device discovered; this machine has no input device");
-        }
-        if !has_sound {
-            tracing::info!("no virtio-snd device discovered; this machine has no sound device");
-        }
-        if let Some(pci) = pci.as_ref() {
-            pci.reserve_assigned_memory_bars();
-        }
-        // Confine every virtio-PCI function in its own domain before any
-        // driver (including PCI virtio-rng) touches its queues.
-        let mut confinement = match (pci.as_ref(), pci_virtio.as_ref(), iommu_topology) {
-            (Some(pci), Some(pci_virtio), Some(topology)) => {
-                let confined = pci_virtio.addresses();
-                let confinement = iommu::confine_devices(pci, topology, &confined);
-                let report = confinement.report();
-                debug_state.install_iommu_report(report.clone());
-                kernel.spawn_detached(iommu::watch_faults(
-                    confinement.device(),
-                    report,
-                    kernel.timer(),
-                ));
-                Some(confinement)
-            }
-            _ => {
-                tracing::info!(
-                    "no virtio-iommu in the device tree topology; device DMA reaches physical \
-                     memory directly"
-                );
-                None
-            }
-        };
-        let mut dma_arenas = iommu::RiscvDmaArenas::new(helios_kernel::UserPoolChunks::new(pool));
-        // The entropy device comes up after IOMMU confinement (so a PCI
-        // virtio-rng is never touched unconfined) and before the root DRBG
-        // is seeded (so a platform whose firmware leaves no
-        // `/chosen/rng-seed` still seeds from hardware entropy).
-        let entropy_device = entropy::bring_up(
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            hart_count,
-        );
-        // No VM generation ID window is discovered on this platform yet,
-        // so the machine generation moves only through `advance`.
-        let generation = helios_kernel::MachineGeneration::new(None);
-        debug_state.install_machine_generation(generation.clone());
-        let root_entropy = helios_kernel::seed_root_entropy(
-            &cpu,
-            helios_hal::entropy::device_tree_seed(&fdt),
-            entropy_device.as_ref().map(|entropy| &entropy.device),
-            generation,
-        );
-        debug_state.install_root_entropy(root_entropy.clone());
-        // Settle the TPM-sealed machine seed early so `HibernateAuthKey` is
-        // available for the early-boot resume probe below without settling twice.
-        helios_kernel::settle_boot_signing_keys(&kernel, &debug_state);
-        // The calendar is read once, on the bootstrap hart, before any
-        // component can ask what time it is. The hart timer carries wall
-        // time forward from that reading; only a machine restore re-reads
-        // it, which the reactions task does with the same clock.
-        let rtc = rtc::discover(&fdt);
-        match &rtc {
-            Some(rtc) => {
-                debug_state.seed_wall_clock(cpu.now().ticks(), rtc);
-            }
-            None => {
-                tracing::warn!(
-                    "no goldfish RTC in the device tree; the wall clock reads as uptime"
-                );
-            }
-        }
-        let mut hibernate_devices = hibernate::RiscvHibernateDevices::new(
-            cpu.clone(),
-            debug_state.machine_generation_handle(),
-        );
-        hibernate_devices.iommu = confinement.as_ref().map(iommu::Confinement::device);
-
-        // A machine may carry several PLICs — QEMU's `virt` gives every
-        // socket its own and wires devices to different ones — so each
-        // PLIC is its own domain, taken by one hart with a context in
-        // it, and each device attaches to the domain its node's
-        // interrupt parent names.
-        let mut domains = net::InterruptDomains::discover(&fdt, bootstrap_processor);
-        // The device path's platform surface comes up before any grant
-        // is published, which the registry enforces.
-        device::install_hooks();
-        if let Some(transport) = DEBUG_TRANSPORT.get().copied() {
-            assert!(
-                domains.takes(transport.plic_line.controller),
-                "the device tree wires the debug UART to the interrupt controller at {:#x}, in \
-                 which no hart has a PLIC supervisor-external context; the serial line could \
-                 only be polled",
-                transport.plic_line.controller.base()
-            );
-            domains.attach_debug_serial(
-                transport.plic_line,
-                DebugTransport::console().interrupt_handler::<DebugTransport>(),
-            );
-        }
-        if let Some(network) = net::install_network_service(
-            &cpu,
-            &kernel,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-        ) {
-            hibernate_devices.network = Some(network.device.device().clone());
-            domains.attach_network(network);
-        }
-        if let Some(host_fs) = host_fs::install(
-            &cpu,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-        ) {
-            hibernate_devices.host_fs = Some(host_fs.transport.clone());
-            domains.attach_host_fs(host_fs);
-        }
-        if let Some(entropy) = entropy_device {
-            hibernate_devices.entropy = Some(entropy.device.device().clone());
-            entropy::install(&kernel, &entropy, root_entropy.clone());
-            domains.attach_entropy(entropy);
-        }
-        if let Some(balloon) = balloon::install(
-            &cpu,
-            &kernel,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            debug_state.machine_generation_handle(),
-        ) {
-            hibernate_devices.balloon = Some(balloon.handler.device().clone());
-            debug_state.install_memory_balloon(balloon.handle.clone());
-            domains.attach_balloon(balloon);
-        }
-        if let Some(vsock) = vsock::install(
-            &kernel,
-            &cpu,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-        ) {
-            hibernate_devices.vsock = Some(vsock.device.device().clone());
-            domains.attach_vsock(vsock);
-        }
-        if let Some(display) = gpu::install(
-            &cpu,
-            &kernel,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-        ) {
-            hibernate_devices.display = Some(display.device.device().clone());
-            domains.attach_display(display);
-        }
-        for device in input::install(
-            &cpu,
-            &kernel,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-        ) {
-            hibernate_devices
-                .inputs
-                .push(device.device.device().clone());
-            domains.attach_input(device);
-        }
-        if let Some(sound) = snd::install(
-            &cpu,
-            &kernel,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-        ) {
-            hibernate_devices.sound = Some(sound.device.device().clone());
-            domains.attach_sound(sound);
-        }
-        for block in block::install(
-            &cpu,
-            &kernel,
-            &fdt,
-            pci.as_ref(),
-            pci_virtio.as_ref(),
-            &mut dma_arenas,
-            confinement.as_mut(),
-            &debug_state,
-            root_entropy.clone(),
-        ) {
-            hibernate_devices.blocks.push(block.device.device().clone());
-            domains.attach_block(block);
-        }
-        kernel.spawn_detached(helios_kernel::maintain_dma_arenas(
-            dma_arenas,
-            kernel.timer(),
-        ));
-        // Early-boot hibernate resume probe: runs on the bootstrap hart with
-        // interrupts disabled, BEFORE starting secondary harts, enabling
-        // swap/init, or unmasking interrupts. If a valid authenticated
-        // hibernate image is present on `"helios-hibernate"`, enters the
-        // restore trampoline and never returns.
-        hibernate::probe_and_resume_if_present(
-            &cpu,
-            &kernel,
-            &watchdog,
-            &debug_state,
-            pool,
-            &root_entropy,
-            rtc.as_ref(),
-            &mut hibernate_devices,
-            &[],
-        );
-        let hibernate_receiver = debug_state.install_hibernate_service();
-        kernel.spawn_local_detached(hibernate::serve_hibernate_requests(
-            cpu.clone(),
-            kernel.hibernate_handle(),
-            debug_state.clone(),
-            pool,
-            hibernate_devices,
-            hibernate_receiver,
-            DEBUG_SERIAL_WRITER,
-            has_debug_transport && has_vsock,
-        ));
-        helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
-        let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
-        for (line, route) in grants {
-            domains.attach_device(line, route);
-        }
-        net::publish_interrupt_domains(domains);
-        helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapHooks);
-        release_early_boot_harts();
-    }
-    let hart_runtime = HartRuntime {
-        trap_stack: trap::allocate_trap_stack(),
-        guest_stack_limit: AtomicUsize::new(usize::MAX),
-        hart_id: current_hart,
-        timer: kernel.timer(),
-        wasmtime_tls: WasmtimeTlsSlots::new(),
-        external_interrupts: net::HartInterrupts::of(current_hart),
-        program_service: Once::new(),
-        hand_over_stack: trap::allocate_trap_stack(),
-        hand_over_probe: trap::HandOverProbe::new(),
-    };
-    hart_runtime.install();
-    // Only now, on the hart itself: the firmware reset this hart's PLIC
-    // contexts when it started it, after the bootstrap hart's bring-up.
-    if let Some(interrupts) = hart_runtime.external_interrupts {
-        interrupts.open();
-    }
-    // Every hart's timer preempts the guest running on it, so every hart
-    // holds the service: the bootstrap hart installs it, and the others,
-    // which it starts only afterwards, take the installed one.
-    let program_service = helios_kernel::install_component_host_program_service(
-        &kernel,
-        &cpu,
-        &debug_state,
-        read_debug_serial,
-        DEBUG_SERIAL_WRITER,
-    )
-    .unwrap_or_else(|| {
-        debug_state.program_service().unwrap_or_else(|| {
-            panic!("RISC-V hart {hart_id} started before program service installation")
-        })
-    });
-    hart_runtime.program_service.call_once(|| program_service);
-    // SAFETY: `hart_runtime` is installed with its trap stack, hand-over
-    // stack, external interrupts, and `program_service` initialised.
-    unsafe {
-        configure_interrupts();
-    }
-    if current_hart == bootstrap_processor {
-        for processor in
-            helios_kernel::component_host_processors_to_start(hart_count, bootstrap_processor)
-        {
-            cpu.start_processor(processor);
-        }
-    }
-    helios_kernel::run_component_host_processor_forever(
-        cpu,
-        kernel,
-        debug_state,
-        read_debug_serial,
-        DEBUG_SERIAL_WRITER,
-    );
-}
-
-fn shared_debug_state(
-    timebase: Timebase,
-    hart_count: usize,
-    initrd: Range<usize>,
-) -> debug_state::RuntimeState {
-    DEBUG_STATE
-        .call_once(|| {
-            // The Sv48 identity map is already active, so the initrd's
-            // physical range reads directly.
-            // SAFETY: `initrd` is a non-empty valid physical range from `/chosen`
-            // reserved out of allocator memory, readable through the identity map,
-            // and immutable for the kernel's lifetime.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(initrd.start as *const u8, initrd.len()) };
-            let payload = helios_kernel::BootPayload::parse(bytes).unwrap_or_else(|error| {
-                panic!("initrd is not a valid helios-bootfs payload: {error}")
-            });
-            debug_state::RuntimeState::new(
-                timebase,
-                hart_count,
-                riscv::register::time::read64(),
-                payload,
-                // The RISC-V `Cpu` answers no feature probe (`native_feature_probe`).
-                helios_kernel::GuestIsa::for_build_target(None),
-            )
-        })
-        .clone()
-}
-
 /// Whether a `/cpus/cpu*` node describes a hart the machine can run.
 ///
 /// The device tree specification defaults `status` to `okay` when absent;
@@ -1362,10 +1633,6 @@ fn cpu_is_usable(cpu: fdt::standard_nodes::Cpu<'_, '_>) -> bool {
     })
 }
 
-fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
-    WATCHDOG_STATE.call_once(|| watchdog::discover(fdt)).clone()
-}
-
 #[repr(C)]
 struct RiscvCaptureResult {
     status: u64,
@@ -1373,22 +1640,17 @@ struct RiscvCaptureResult {
 }
 
 unsafe extern "C" {
-    static __stext: u8;
-    static __etext: u8;
-    static __srodata: u8;
-    static __erodata: u8;
-    static __sdata: u8;
-    static __edata: u8;
-    static __sbss: u8;
-    static __ebss: u8;
-    static __suninit: u8;
-    static __euninit: u8;
-    static __estack: u8;
-    static __sstack: u8;
-    static _stack_start: u8;
-    static _secondary_start: u8;
+    static __helios_text_start: u8;
+    static __helios_text_end: u8;
+    static __helios_rodata_start: u8;
+    static __helios_rodata_end: u8;
+    static __helios_data_start: u8;
+    static __helios_data_end: u8;
+    static __helios_bss_start: u8;
+    static __helios_bss_end: u8;
     static _hart_restart: u8;
-    fn _release_mp_harts();
+    static _hart_restart_virtual: u8;
+    fn _limine_secondary_entry(mp_info: &MpInfo) -> !;
     fn __helios_riscv_capture_bsp_state(ctx: *mut Riscv64SnapshotContext) -> RiscvCaptureResult;
 }
 
@@ -1402,116 +1664,133 @@ const _: () = {
     assert!(core::mem::offset_of!(Riscv64SnapshotContext, fcsr) == 0xe0);
 };
 
-fn riscv_section_range(start_sym: *const u8, end_sym: *const u8) -> KernelSectionRange {
-    let start = start_sym.addr() as u64;
-    let end = end_sym.addr() as u64;
-    let len = end
-        .checked_sub(start)
-        .unwrap_or_else(|| panic!("RISC-V kernel section end {end:#x} precedes start {start:#x}"));
-    KernelSectionRange::new(start, start, len)
+fn kernel_section_range(start_sym: *const u8, end_sym: *const u8) -> KernelSectionRange {
+    let vstart = start_sym.addr();
+    let vend = end_sym.addr();
+    let len = vend.checked_sub(vstart).unwrap_or_else(|| {
+        panic!("RISC-V kernel section end {vend:#x} precedes start {vstart:#x}")
+    });
+    let pstart = vmm::kernel_virt_to_phys(vstart) as u64;
+    KernelSectionRange::new(pstart, vstart as u64, len as u64)
+}
+
+fn boot_reserved_ranges(
+    handoff: &LimineBootHandoff,
+    firmware_dtb_range: Option<Range<usize>>,
+) -> BootReservedRanges {
+    let mut reserved = BootReservedRanges::new();
+    let image_end_virt = [
+        (&raw const __helios_text_end).addr(),
+        (&raw const __helios_rodata_end).addr(),
+        (&raw const __helios_data_end).addr(),
+        (&raw const __helios_bss_end).addr(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(handoff.kernel.virtual_base as usize);
+    let image_len = image_end_virt
+        .saturating_sub(handoff.kernel.virtual_base as usize)
+        .next_multiple_of(PhysFrame::SIZE);
+    let start = handoff.kernel.physical_base as usize;
+    reserved.reserve(start..start.saturating_add(image_len));
+    if let Some(dtb_range) = firmware_dtb_range {
+        let aligned_start = dtb_range.start & !(PhysFrame::SIZE - 1);
+        let aligned_end = dtb_range.end.next_multiple_of(PhysFrame::SIZE);
+        reserved.reserve(aligned_start..aligned_end);
+    }
+    reserved
 }
 
 fn collect_boot_memory_metadata(
-    fdt: &Fdt<'_>,
-    fdt_addr: usize,
-    initrd: &Range<usize>,
+    handoff: &LimineBootHandoff,
+    physical_memory_offset: usize,
     payload_sha256: &[u8; 32],
 ) -> BootMemoryMetadata {
-    let uninit = riscv_section_range(&raw const __suninit, &raw const __euninit);
-    let stack = riscv_section_range(&raw const __estack, &raw const __sstack);
+    let text = kernel_section_range(&raw const __helios_text_start, &raw const __helios_text_end);
+    let rodata = kernel_section_range(
+        &raw const __helios_rodata_start,
+        &raw const __helios_rodata_end,
+    );
+    let data = kernel_section_range(&raw const __helios_data_start, &raw const __helios_data_end);
+    let bss = kernel_section_range(&raw const __helios_bss_start, &raw const __helios_bss_end);
+    let image_end_virt = [
+        text.virtual_end(),
+        rodata.virtual_end(),
+        data.virtual_end(),
+        bss.virtual_end(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(handoff.kernel.virtual_base);
+    let image_len = image_end_virt
+        .saturating_sub(handoff.kernel.virtual_base)
+        .next_multiple_of(PhysFrame::SIZE as u64);
     let mut metadata = BootMemoryMetadata {
         kernel_sections: KernelImageSections {
-            image: None,
-            text: riscv_section_range(&raw const __stext, &raw const __etext),
-            rodata: riscv_section_range(&raw const __srodata, &raw const __erodata),
-            data: riscv_section_range(&raw const __sdata, &raw const __edata),
-            bss: riscv_section_range(&raw const __sbss, &raw const __ebss),
-            uninit: (!uninit.is_empty()).then_some(uninit),
-            stack: (!stack.is_empty()).then_some(stack),
+            image: Some(KernelSectionRange::new(
+                handoff.kernel.physical_base,
+                handoff.kernel.virtual_base,
+                image_len,
+            )),
+            text,
+            rodata,
+            data,
+            bss,
+            uninit: None,
+            stack: None,
         },
-        device_tree_blob: Some(BootPhysicalRange::from_start_len(
-            fdt_addr as u64,
-            fdt.total_size() as u64,
-        )),
-        boot_payload: Some(BootPayloadMetadata {
-            physical_address: initrd.start as u64,
-            len: initrd.len() as u64,
-            sha256: *payload_sha256,
-        }),
-        physical_memory_offset: 0,
+        physical_memory_offset,
         ..BootMemoryMetadata::default()
     };
 
-    for region in fdt
-        .all_nodes()
-        .filter(|node| {
-            node.property("device_type")
-                .is_some_and(|property| property.value == b"memory\0")
-        })
-        .flat_map(|node| {
-            node.reg().unwrap_or_else(|| {
-                panic!("FDT memory node {} has no usable reg property", node.name)
-            })
-        })
-    {
-        let start = region.starting_address as u64;
-        let end = start
-            .checked_add(region.size.unwrap_or(0) as u64)
-            .expect("FDT memory region overflows u64");
-        let _ = metadata.firmware_memory_map.try_push(BootMemoryRegion {
-            start,
-            end,
-            kind: BootMemoryKind::Usable,
-        });
+    for region in handoff.memory_map.regions() {
+        let _ = metadata.firmware_memory_map.try_push(region);
+        if region.kind == BootMemoryKind::BootloaderReclaimable {
+            let _ = metadata
+                .bootloader_reclaimable
+                .try_push(BootPhysicalRange::new(region.start, region.end));
+        }
+    }
+
+    if let Some(dtb_addr) = handoff.tables.device_tree_blob {
+        // SAFETY: Limine provided a mapped readable device tree blob at `dtb_addr`.
+        if let Ok(fdt) = unsafe { Fdt::from_ptr(dtb_addr as *const u8) } {
+            let phys = dtb_addr
+                .checked_sub(physical_memory_offset)
+                .unwrap_or(dtb_addr) as u64;
+            metadata.device_tree_blob = Some(BootPhysicalRange::from_start_len(
+                phys,
+                fdt.total_size() as u64,
+            ));
+        }
+    }
+
+    for module in handoff.modules.modules() {
+        let is_bootfs = module
+            .path
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .is_some_and(|name| name == b"helios-bootfs");
+        if is_bootfs {
+            let phys = module
+                .address
+                .checked_sub(physical_memory_offset)
+                .unwrap_or(module.address) as u64;
+            metadata.boot_payload = Some(BootPayloadMetadata {
+                physical_address: phys,
+                len: module.size as u64,
+                sha256: *payload_sha256,
+            });
+            break;
+        }
     }
 
     metadata
 }
 
-fn allocator_window() -> Range<usize> {
-    let start = align_up(
-        core::ptr::addr_of!(_stack_start).addr(),
-        core::mem::align_of::<usize>(),
-    );
-    assert!(
-        core::ptr::addr_of!(__ebss).addr() < start,
-        "riscv stack must be linked after kernel bss"
-    );
-    start..usize::MAX
-}
-
-/// The physical range QEMU placed the `-initrd` payload in, published
-/// in `/chosen` as `linux,initrd-start`/`linux,initrd-end`.
-///
-/// riscv64 does not boot through Limine — its Limine protocol entry is
-/// a higher-half handoff with paging already enabled, a different
-/// backend contract — so the payload arrives as an initrd instead.
-/// Absent or malformed properties panic: a kernel without the payload
-/// has no init to run.
-fn initrd_range(fdt: &Fdt<'_>) -> Range<usize> {
-    let chosen = fdt
-        .find_node("/chosen")
-        .unwrap_or_else(|| panic!("FDT has no /chosen node to name the initrd"));
-    let property = |name: &str| {
-        chosen
-            .property(name)
-            .and_then(|property| property.as_usize())
-            .unwrap_or_else(|| {
-                panic!("FDT /chosen/{name} is missing or malformed; the payload needs -initrd")
-            })
-    };
-    let start = property("linux,initrd-start");
-    let end = property("linux,initrd-end");
-    assert!(
-        start < end,
-        "FDT /chosen initrd range {start:#x}..{end:#x} is empty or reversed"
-    );
-    start..end
-}
-
 /// The firmware identity of each processor. A hart's [`ProcessorId`] is its
-/// hart id (`run_hart`), and a devicetree cpu node's `reg` is the hart id
-/// too, so the mapping is the identity.
+/// hart id, and a devicetree cpu node's `reg` is the hart id too, so the
+/// mapping is the identity.
 struct HartIds {
     harts: usize,
 }
@@ -1523,82 +1802,6 @@ impl ProcessorIdentities for HartIds {
 
     fn hardware_id(&self, processor: ProcessorId) -> u64 {
         u64::from(processor.id())
-    }
-}
-
-/// Capacity for the allocator regions: a devicetree carries one `memory`
-/// node per range, and the initrd carve-out splits one of them in two. A
-/// tree that describes more is refused by name below.
-const MAX_MEMORY_REGIONS: usize = 16;
-
-/// Every `reg` range of every node whose `device_type` is `memory`, clipped
-/// to the allocator window with the initrd taken out.
-fn collect_memory_regions<Numa: NumaTopology>(
-    fdt: &Fdt<'_>,
-    allocator_window: Range<usize>,
-    initrd: &Range<usize>,
-    numa: &Numa,
-) -> ArrayVec<MemoryRegion, MAX_MEMORY_REGIONS> {
-    let mut regions = ArrayVec::new();
-    let mut reserved = BootReservedRanges::new();
-    reserved.reserve(initrd.clone());
-
-    for region in fdt
-        .all_nodes()
-        .filter(|node| {
-            node.property("device_type")
-                .is_some_and(|property| property.value == b"memory\0")
-        })
-        .flat_map(|node| {
-            node.reg().unwrap_or_else(|| {
-                panic!("FDT memory node {} has no usable reg property", node.name)
-            })
-        })
-        .map(|region| {
-            let start = region.starting_address as usize;
-            let end = start
-                .checked_add(region.size.unwrap())
-                .expect("FDT memory region overflows usize");
-
-            start..end
-        })
-        .filter_map(|region| intersect(region, allocator_window.clone()))
-        .map(|region| BootMemoryRegion {
-            start: region.start as u64,
-            end: region.end as u64,
-            kind: BootMemoryKind::Usable,
-        })
-        // SAFETY: the memory nodes are RAM nothing else owns, reachable at
-        // its physical address through the kernel identity map, and the
-        // initrd is reserved out.
-        .flat_map(|region| unsafe { usable_node_regions(region, &reserved, 0, numa) })
-    {
-        regions.try_push(region).unwrap_or_else(|_| {
-            panic!("FDT described more memory regions than the kernel supports")
-        });
-    }
-
-    regions
-}
-
-fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
-    let start = left.start.max(right.start);
-    let end = left.end.min(right.end);
-
-    (start < end).then_some(start..end)
-}
-
-use helios_hal::align_up;
-
-fn remember_bootstrap_hart(current_hart: usize) -> ProcessorId {
-    match BOOT_HART_ID.compare_exchange(
-        UNINITIALIZED_BOOT_HART,
-        current_hart,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => ProcessorId::new(current_hart as u16),
-        Err(bootstrap_hart) => ProcessorId::new(bootstrap_hart as u16),
     }
 }
 
@@ -1649,20 +1852,7 @@ fn fence_instruction_streams() {
     );
 }
 
-fn release_early_boot_harts() {
-    // `_mp_hook` keeps every non-winning hart in a tiny early-boot spin loop
-    // until the winner has completed the runtime's RAM initialization. Once
-    // Rust code is safe to execute, publish the release gate so the other harts
-    // can proceed into `helios_kernel::init`, which will park them again until
-    // full kernel bootstrap is complete.
-    // SAFETY: bootstrap initialisation of shared early-boot state is complete
-    // and secondary harts are spinning in `_mp_hook` waiting on this release.
-    unsafe {
-        _release_mp_harts();
-    }
-}
-
-fn hart_status(hart: ProcessorId) -> usize {
+pub(crate) fn hart_status(hart: ProcessorId) -> usize {
     let ret = sbi_rt::hart_get_status(hart.id() as usize);
     if ret.is_ok() {
         return ret.value;

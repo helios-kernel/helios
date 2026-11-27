@@ -31,6 +31,7 @@ pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
     pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     pub(super) signal_callback: Option<Arc<str>>,
+    pub(super) stack_snapshots: Vec<WasixStackSnapshot>,
     pub(super) rewind: WasixRewind,
 }
 
@@ -303,7 +304,9 @@ pub(super) fn find_checkpoint(
 
 /// A stack checkpoint a guest can restore: its window and the asyncify
 /// records, in charged pages the stored entry shares with the rewind that
-/// captured it and with every restore.
+/// captured it, with every restore, and with forked children that `longjmp`
+/// back to a pre-fork `setjmp`.
+#[derive(Clone)]
 pub(super) struct WasixStackSnapshot {
     pub(super) hash: u128,
     pub(super) memory_stack: SharedPages,
@@ -420,6 +423,11 @@ where
     // run ends — on any exit — but only when the caller marked the
     // handle `for_task`.
     let task_trace = timeline.task_guard(exec_context.cpu.clone());
+    // Box each execution branch so `run_program_executable`'s future (which
+    // `spawn_loaded_with_output_mode` constructs on the caller's fiber stack
+    // before handing to `try_spawn_local_detached`) stays well within
+    // `FIBER_STACK_HOST_RESERVE` instead of embedding the largest ~33 KiB
+    // runtime state machine inline.
     let outcome = match executable {
         // A component has no descriptor table of its own: the table a
         // WASIX parent hands down becomes its stdio, and is dropped here
@@ -433,7 +441,7 @@ where
             };
             match stdio {
                 Ok(output_mode) => {
-                    run_program_component(
+                    Box::pin(run_program_component(
                         exec_context,
                         argv,
                         env,
@@ -451,7 +459,7 @@ where
                         launched_instance,
                         output_mode,
                         &timeline,
-                    )
+                    ))
                     .await
                 }
                 Err(refusal) => Err(ProgramExecError {
@@ -461,7 +469,7 @@ where
             }
         }
         ProgramExecutable::CoreModule(compiled) => {
-            run_program_core_module(
+            Box::pin(run_program_core_module(
                 exec_context,
                 argv,
                 env,
@@ -483,7 +491,7 @@ where
                 launched_instance,
                 output_mode,
                 &timeline,
-            )
+            ))
             .await
         }
         // A Linux process holds the descriptor table it is handed as its
@@ -510,7 +518,7 @@ where
                     core_module_instance_pre_cache,
                 }),
             };
-            run_linux_process(
+            Box::pin(run_linux_process(
                 exec_runtime,
                 argv,
                 env,
@@ -525,11 +533,11 @@ where
                 output_mode,
                 executable,
                 &timeline,
-            )
+            ))
             .await
         }
         ProgramExecutable::ForkedCoreModule { compiled, restore } => {
-            run_program_core_module_with_restore(
+            Box::pin(run_program_core_module_with_restore(
                 exec_context,
                 argv,
                 env,
@@ -549,7 +557,7 @@ where
                 launched_instance,
                 output_mode,
                 &timeline,
-            )
+            ))
             .await
         }
     };
@@ -938,6 +946,7 @@ where
             .data()
             .process_signals
             .set_callback(restore.signal_callback);
+        store.data_mut().asyncify.snapshots = restore.stack_snapshots;
         let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare-rewind");
         timeline.record(&run_cpu, LaunchPhase::StorePrepare);
@@ -2263,6 +2272,7 @@ where
         descriptors: store.data().descriptors.snapshot(),
         signal_dispositions: store.data().signal_dispositions.clone(),
         signal_callback: store.data().process_signals.callback(),
+        stack_snapshots: store.data().asyncify.snapshots.clone(),
         rewind: WasixRewind {
             stack_lower,
             stack_upper,
@@ -2884,5 +2894,20 @@ mod tests {
             "a restore commits no pages"
         );
         assert!(find_checkpoint(&snapshots, 8).is_none());
+
+        // A forked child inherits its parent's checkpoints by sharing the same
+        // `SharedPages` handles without copying or charging additional pages,
+        // so `longjmp` (`stack_restore`) to a pre-fork `setjmp` resolves.
+        let inherited = snapshots.clone();
+        let (child_stack, child_records, child_sp) =
+            find_checkpoint(&inherited, 7).expect("fork child inherits pre-fork checkpoint");
+        assert!(SharedPages::ptr_eq(&child_stack, &memory_stack));
+        assert!(SharedPages::ptr_eq(&child_records, &rewind_stack));
+        assert_eq!(child_sp, 64);
+        assert_eq!(
+            instance.user_pool_bytes(),
+            held,
+            "inheriting checkpoints across fork commits no extra pages"
+        );
     }
 }

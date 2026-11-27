@@ -37,17 +37,48 @@
 //! ever changed with atomic read-modify-writes.
 
 use core::arch::{asm, global_asm};
+use core::cell::UnsafeCell;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_hal::cpu::ProcessorId;
 
 use super::{
-    _hart_restart, MAX_TRACKED_HARTS, ONLINE_HARTS, hart_bit, hart_status,
+    _hart_restart, _hart_restart_virtual, MAX_TRACKED_HARTS, ONLINE_HARTS, hart_bit, hart_status,
     helios_current_processor, mark_hart_online, trap, vmm,
 };
 
 global_asm!(include_str!("hart_lifecycle.S"));
+
+/// Arguments passed by physical address in `a1` to `_hart_restart` when
+/// restarting a stopped hart via SBI HSM `hart_start`.
+#[repr(C)]
+struct RestartArgs {
+    restart_satp: u64,
+    kernel_satp: u64,
+    virtual_entry: usize,
+    context_virt: usize,
+}
+
+impl RestartArgs {
+    const fn empty() -> Self {
+        Self {
+            restart_satp: 0,
+            kernel_satp: 0,
+            virtual_entry: 0,
+            context_virt: 0,
+        }
+    }
+}
+
+struct RestartSlot(UnsafeCell<RestartArgs>);
+
+// SAFETY: each slot is written exclusively by the one restarter of `hart`
+// while `hart` is `STOPPED` in SBI HSM, and read by `hart` after `hart_start`.
+unsafe impl Sync for RestartSlot {}
+
+static RESTART_ARGS: [RestartSlot; MAX_TRACKED_HARTS] =
+    [const { RestartSlot(UnsafeCell::new(RestartArgs::empty())) }; MAX_TRACKED_HARTS];
 
 /// What `stop_current` must carry across the stop, in the layout
 /// `hart_lifecycle.S` and `secondary_entry.S` index.
@@ -68,6 +99,10 @@ struct SavedContext {
 }
 
 const _: () = {
+    assert!(offset_of!(RestartArgs, restart_satp) == 0x00);
+    assert!(offset_of!(RestartArgs, kernel_satp) == 0x08);
+    assert!(offset_of!(RestartArgs, virtual_entry) == 0x10);
+    assert!(offset_of!(RestartArgs, context_virt) == 0x18);
     assert!(offset_of!(SavedContext, ra) == 0x00);
     assert!(offset_of!(SavedContext, sp) == 0x08);
     assert!(offset_of!(SavedContext, tp) == 0x10);
@@ -249,11 +284,24 @@ pub(super) fn restart_processor(hart: ProcessorId) {
             ),
         }
     }
-    let ret = sbi_rt::hart_start(
-        usize::from(hart.id()),
-        core::ptr::addr_of!(_hart_restart).addr(),
-        context,
-    );
+    let restart_phys = vmm::kernel_virt_to_phys(core::ptr::addr_of!(_hart_restart).addr());
+    let restart_satp = vmm::build_restart_satp(restart_phys);
+    let kernel_satp = vmm::kernel_satp();
+    let slot_index = usize::from(hart.id());
+    let restart_slot = &RESTART_ARGS[slot_index];
+    // SAFETY: `hart` is `STOPPED` in SBI HSM and has not been started again,
+    // so this restarter has exclusive access to `RESTART_ARGS[slot_index]`.
+    unsafe {
+        restart_slot.0.get().write(RestartArgs {
+            restart_satp,
+            kernel_satp,
+            virtual_entry: core::ptr::addr_of!(_hart_restart_virtual).addr(),
+            context_virt: context,
+        });
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let restart_args_phys = vmm::kernel_virt_to_phys(restart_slot.0.get().addr());
+    let ret = sbi_rt::hart_start(slot_index, restart_phys, restart_args_phys);
     assert!(
         ret.is_ok(),
         "failed to restart hart {} via SBI HSM: error={} value={}",

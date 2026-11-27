@@ -20,7 +20,7 @@ use helios_kernel::{
     IommuReport, MAX_IOMMU_ENDPOINTS, SharedDmaArena, Timer, UserPoolChunks,
 };
 use helios_virtio::{
-    DeviceType, IdentityDmaPool, MAX_RESERVED_REGIONS, ReservedRegion, VirtioBusTransport,
+    DeviceType, MAX_RESERVED_REGIONS, OffsetDmaPool, ReservedRegion, VirtioBusTransport,
     VirtioIommuDevice, VirtioPciTransport,
 };
 use pci_types::PciAddress;
@@ -28,7 +28,7 @@ use pci_types::PciAddress;
 use crate::pci::PciHostController;
 
 /// The translation unit the platform exposes, once it has been brought up.
-pub(crate) type RiscvVirtioIommuDevice = VirtioIommuDevice<VirtioPciTransport<IdentityDmaPool>>;
+pub(crate) type RiscvVirtioIommuDevice = VirtioIommuDevice<VirtioPciTransport<OffsetDmaPool>>;
 
 /// Per-device chunk domain backing every virtio driver on RISC-V.
 pub(crate) type RiscvDmaDomain = DeviceChunkDomain<Arc<RiscvVirtioIommuDevice>>;
@@ -78,10 +78,16 @@ pub(crate) fn install(pci: &PciHostController, address: PciAddress) -> Arc<Riscv
         Some(DeviceType::Iommu),
         "the device tree named {address} as the translation unit but it carries no virtio-iommu"
     );
-    let device = helios_virtio::iommu_from_pci(&access, address, pci, IdentityDmaPool, None)
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize the virtio-iommu function at {address}: {error}")
-        });
+    let device = helios_virtio::iommu_from_pci(
+        &access,
+        address,
+        pci,
+        OffsetDmaPool::new(crate::vmm::physical_memory_offset()),
+        None,
+    )
+    .unwrap_or_else(|error| {
+        panic!("failed to initialize the virtio-iommu function at {address}: {error}")
+    });
     // `VirtioPciTransport::new(..., None)` clears INTERRUPT_DISABLE for
     // INTx-driven devices, but `virtio-iommu-pci` is driven synchronously
     // and polled by `watch_faults`. Mask INTx so it never holds a shared
@@ -174,7 +180,7 @@ pub(crate) fn confine_devices(
     let mut domains = IommuDomains::new(
         device.clone(),
         &doorbells[..doorbell_count],
-        0,
+        crate::vmm::physical_memory_offset(),
         device.global_bypass(),
     )
     .unwrap_or_else(|error| panic!("the IOMMU domain layout is not buildable: {error}"));
@@ -212,7 +218,9 @@ pub(crate) fn dma_pool(
         (Some(confinement), Some(address)) => {
             DeviceChunkDomain::Confined(confinement.take_domain(address))
         }
-        _ => DeviceChunkDomain::Direct(DirectChunkDomain::new(0)),
+        _ => {
+            DeviceChunkDomain::Direct(DirectChunkDomain::new(crate::vmm::physical_memory_offset()))
+        }
     };
     SharedDmaArena::new(arenas.arena(domain, chunk_bytes, processors))
 }

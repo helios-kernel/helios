@@ -14,6 +14,7 @@ pub(crate) fn discover(fdt: &Fdt<'_>) -> RiscvWatchdog {
         pci.assign_unassigned_memory_bars(address);
     }
     i6300esb::discover_watchdog(access, bus_range, |bus_address| {
-        pci.translate_mmio_address(bus_address)
+        let cpu_phys = pci.translate_mmio_address(bus_address);
+        crate::vmm::map_mmio_range(cpu_phys, 4096)
     })
 }

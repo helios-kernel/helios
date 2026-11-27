@@ -1,44 +1,47 @@
-// The two ways a hart enters the kernel from SBI `hart_start`:
+// Re-entry of a hart that `Cpu::stop_current` took out of service via SBI HSM
+// `hart_stop`.
 //
-// `_secondary_start` is the first start. `a0` is the hart id and `a1` the
-// device tree; the hart takes the top of its own boot stack.
+// `sbi_rt::hart_start` enters `_hart_restart` at its physical address with
+// paging disabled (`satp = 0`), `a0` holding the hart id and `a1` holding the
+// physical address of `RestartArgs`. Everything in `_hart_restart` is
+// position-independent and touches only `RestartArgs` until Sv48 paging is
+// enabled through the temporary restart root table (which maps both the
+// physical address of `_hart_restart` and the kernel's higher half). Once in
+// `_hart_restart_virtual`, the hart switches to the live kernel `satp`,
+// restores `gp`, `sp`, and `tp`, enables floating point (`sstatus.FS = Initial`,
+// `fcsr = 0`), and tail-calls `helios_hart_resume`.
 //
-// `_hart_restart` is the restart of a hart `Cpu::stop_current` took out of
-// service. `a0` is the hart id and `a1` the `SavedContext` the hart left
-// on its own stack; the hart continues on that stack, below the frame
-// `stop_current` suspended in, and `helios_hart_resume` (`lifecycle.rs`)
-// carries on from there.
-//
-// Both leave `sstatus.FS` and `fcsr` in the same state before any Rust
-// runs, because `sbi_hart_start` leaves them unspecified in either case.
-// The byte offsets below are those of `SavedContext`, which `lifecycle.rs`
-// asserts.
+// The byte offsets below are asserted at compile time in `lifecycle.rs`.
+.equ HELIOS_RESTART_SATP,          0x00
+.equ HELIOS_RESTART_KERNEL_SATP,   0x08
+.equ HELIOS_RESTART_VIRTUAL_ENTRY, 0x10
+.equ HELIOS_RESTART_CONTEXT_VIRT,  0x18
+
 .equ HELIOS_CONTEXT_SP, 0x08
 .equ HELIOS_CONTEXT_TP, 0x10
 
-.section .init.secondary, "ax"
-.global _secondary_start
+.section .text.hart_restart, "ax"
 .global _hart_restart
-_secondary_start:
-    .option push
-    .option arch, +zmmul
-    .option push
-    .option norelax
-    la gp, __global_pointer$
-    .option pop
-
-    mv t2, a0
-    lui t1, %hi(_hart_stack_size)
-    add t1, t1, %lo(_hart_stack_size)
-    mul t0, t2, t1
-    la t1, _stack_start
-    sub t1, t1, t0
-    andi sp, t1, -16
-
-    la t3, secondary_start_rust
-    j .Lhart_enter
-
+.balign 4
 _hart_restart:
+    csrci sstatus, 0x2
+    csrw sie, zero
+
+    ld t0, HELIOS_RESTART_SATP(a1)
+    ld t2, HELIOS_RESTART_KERNEL_SATP(a1)
+    ld t1, HELIOS_RESTART_VIRTUAL_ENTRY(a1)
+    ld a1, HELIOS_RESTART_CONTEXT_VIRT(a1)
+
+    csrw satp, t0
+    sfence.vma zero, zero
+    jr t1
+
+.global _hart_restart_virtual
+.balign 4
+_hart_restart_virtual:
+    csrw satp, t2
+    sfence.vma zero, zero
+
     .option push
     .option norelax
     la gp, __global_pointer$
@@ -46,15 +49,9 @@ _hart_restart:
 
     ld sp, HELIOS_CONTEXT_SP(a1)
     ld tp, HELIOS_CONTEXT_TP(a1)
-    la t3, helios_hart_resume
 
-.Lhart_enter:
-    // Enable floating point, exactly as `riscv-rt`'s `_start` does for the
-    // boot hart: clear `sstatus.FS`, set it to `Initial`, and zero `fcsr`.
-    // `sbi_hart_start` leaves `FS` unspecified, so without this a hart
-    // runs Rust compiled for `lp64d` on whatever the firmware happened to
-    // leave behind — `Off` would fault on the first double, and a
-    // stale `Dirty` would inherit another hart's rounding mode.
+    // Enable floating point (`sstatus.FS = Initial`, `fcsr = 0`):
+    // `sbi_hart_start` leaves `sstatus.FS` unspecified.
     .option push
     .option arch, +f
     li t0, 0x4000
@@ -64,5 +61,4 @@ _hart_restart:
     fscsr x0
     .option pop
 
-    jr t3
-    .option pop
+    tail helios_hart_resume
