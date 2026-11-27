@@ -50,6 +50,7 @@ use wit_component::ComponentEncoder;
 mod artifact_cache;
 mod boot_kernel;
 mod components;
+mod diagnostics;
 mod kernel_image;
 mod prebuilt_artifact;
 mod splash;
@@ -336,7 +337,7 @@ pub(crate) enum WasmBuildError {
         found: PrebuiltArtifactKind,
     },
     #[error(
-        "prebuilt userspace directory {dir} was built for profile {found:?}, expected {expected:?}"
+        "prebuilt userspace directory {dir} was built for profile `{found}`, expected `{expected}`"
     )]
     PrebuiltProfileMismatch {
         dir: String,
@@ -1034,7 +1035,11 @@ impl CacheArgs {
     /// Reports what the run took from the cache.
     fn report(cache: Option<&ArtifactCache>) {
         if let Some(cache) = cache {
-            eprintln!("helios-cli: artifact cache: {}", cache.stats());
+            let colors = diagnostics::stderr_colors_enabled();
+            eprintln!(
+                "{}",
+                diagnostics::format_cache_stats(&cache.stats(), colors)
+            );
         }
     }
 }
@@ -1325,7 +1330,8 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("helios-cli: {error}");
+            let colors = diagnostics::stderr_colors_enabled();
+            eprintln!("{}", diagnostics::format_cli_error(&error, colors));
             ExitCode::FAILURE
         }
     }
@@ -1338,9 +1344,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 &command.cache_dir,
                 UNIX_EPOCH + Duration::from_secs(command.older_than),
             )?;
+            let colors = diagnostics::stderr_colors_enabled();
             eprintln!(
-                "helios-cli: artifact cache: pruned {removed} entries from {}",
-                command.cache_dir.display()
+                "{}",
+                diagnostics::format_cache_pruned(removed, &command.cache_dir, colors)
             );
             Ok(())
         }
@@ -3858,7 +3865,11 @@ fn run_profile_fetch(
     // build can read, or there is no record.
     helios_profdata::validate(&path)?;
     store.publish(&fetched)?;
-    println!("{} {} {}", fetched.label(), repository, path.display());
+    let colors = diagnostics::stdout_colors_enabled();
+    println!(
+        "{}",
+        diagnostics::format_profile_fetch_status(&fetched.label(), repository, &path, colors)
+    );
     Ok(())
 }
 
