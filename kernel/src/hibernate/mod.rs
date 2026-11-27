@@ -14,8 +14,8 @@
 //!   field and **before** performing any heap allocation.
 //! - **Bounded decompression:** Every chunk descriptor is covered by the
 //!   header's `chunk_table_sha256`, and every compressed chunk's SHA-256 is
-//!   verified before handing it to `zrip` with an exact `uncompressed_len`
-//!   limit.
+//!   verified before handing it to `lz4_flex` with an exact `uncompressed_len`
+//!   output buffer.
 //! - **Identity binding:** Every field of [`HibernateIdentity`] (kernel
 //!   immutable sections, boot payload digest & physical placement, firmware
 //!   memory map, processor count, device inventory, and negotiated device
@@ -32,11 +32,11 @@ pub mod verify;
 mod tests;
 
 pub use format::{
-    CHUNK_DESCRIPTOR_BYTES, ChunkDescriptor, DEFAULT_CHUNK_FRAMES,
-    DEFAULT_HIBERNATE_COMPRESSION_LEVEL, DeviceFeatureRecord, FORMAT_VERSION, HEADER_BYTES,
-    HEADER_MAC_BYTES, HEADER_MAC_OFFSET, HEADER_MAGIC, HibernateHeader, HibernateIdentity,
-    MAX_CHUNKS, canonical_dram_regions, canonical_firmware_memory_map_count, hash_device_inventory,
-    hash_firmware_memory_map, hash_negotiated_features,
+    CHUNK_DESCRIPTOR_BYTES, ChunkDescriptor, DEFAULT_CHUNK_FRAMES, DeviceFeatureRecord,
+    FORMAT_VERSION, HEADER_BYTES, HEADER_MAC_BYTES, HEADER_MAC_OFFSET, HEADER_MAGIC,
+    HibernateHeader, HibernateIdentity, MAX_CHUNKS, canonical_dram_regions,
+    canonical_firmware_memory_map_count, hash_device_inventory, hash_firmware_memory_map,
+    hash_negotiated_features,
 };
 pub use helios_hal::cpu::{DisplacedFrameCopy, ResumeHandoff, ResumeHandoffWire};
 pub use resume::{
@@ -46,9 +46,10 @@ pub use resume::{
     plan_frame_placement, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 pub use snapshot::{
-    AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, HIBERNATE_ENCODE_SCRATCH_BYTES,
-    ReservationWriter, SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
-    collect_snapshot_physical_runs, encode_snapshot, normalize_physical_runs,
+    AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, ReservationWriter,
+    SnapshotConfig, SnapshotEncodeScratch, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
+    collect_snapshot_physical_runs, count_snapshot_chunks, encode_snapshot,
+    encode_snapshot_with_scratch, normalize_physical_runs,
 };
 pub use storage::{
     HIBERNATE_HEADER_SECTORS, HIBERNATE_SECTOR_BYTES, HibernateDeviceController,
@@ -102,8 +103,7 @@ pub fn compute_hibernate_reservation_bytes(
     let used_estimate = usable_bytes
         .saturating_sub(free_bytes)
         .saturating_add(HIBERNATE_RESERVATION_HEADROOM_BYTES);
-    let available_for_image = free_bytes.saturating_sub(HIBERNATE_ENCODE_SCRATCH_BYTES);
-    let max_from_free = ((available_for_image / 4).saturating_mul(3)) & page_mask;
+    let max_from_free = ((free_bytes / 4).saturating_mul(3)) & page_mask;
     let mut target = used_estimate.min(max_from_free);
     if let Ok(disk_usize) = usize::try_from(disk_bytes) {
         let disk_aligned = disk_usize & page_mask;
@@ -206,7 +206,7 @@ pub enum HibernateError {
         available_bytes: usize,
     },
 
-    /// Compression failed inside `zrip`.
+    /// Compression failed inside `lz4_flex`.
     #[error("failed to compress hibernate chunk {chunk_index}: {detail}")]
     CompressFailed {
         chunk_index: u32,
@@ -306,7 +306,7 @@ pub enum HibernateError {
     #[error("hibernate chunk {chunk_index} SHA-256 checksum mismatch")]
     ChunkChecksumMismatch { chunk_index: u32 },
 
-    /// `zrip` failed to decompress a chunk within its declared limit.
+    /// `lz4_flex` failed to decompress a chunk within its declared length.
     #[error("hibernate chunk {chunk_index} decompression failed")]
     DecompressFailed { chunk_index: u32 },
 

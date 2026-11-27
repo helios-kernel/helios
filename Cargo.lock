@@ -3608,6 +3608,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "lru 0.16.4",
+ "lz4_flex",
  "noto-sans-mono-bitmap",
  "nu-ansi-term",
  "objectpool",
