@@ -3161,6 +3161,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "clap",
+ "console",
  "directories",
  "ed25519-dalek",
  "fatfs",
