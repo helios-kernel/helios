@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use helios_hal::vmm::{VirtAddr, VirtRange};
+use helios_hal::vmm::VirtRange;
 use spin::{Mutex, RwLock};
 use thiserror::Error;
 use triomphe::Arc;
@@ -270,6 +270,33 @@ impl InspectRegistry {
         prefixes: &PrefixSet,
         limit: u32,
     ) -> InspectSnapshot {
+        self.snapshot_checked(
+            timestamp,
+            caller_id,
+            scope,
+            instance_registry,
+            |range| residency.is_none_or(|res| res.first_swapped(range).is_none()),
+            kernel_telemetry,
+            prefixes,
+            limit,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "snapshot_checked threads the monomorphised residency check alongside explicit snapshot parameters"
+    )]
+    fn snapshot_checked(
+        &self,
+        timestamp: u64,
+        caller_id: InstanceId,
+        scope: Option<AuthorityScope>,
+        instance_registry: &InstanceRegistry,
+        is_resident: impl Fn(VirtRange) -> bool,
+        kernel_telemetry: Option<&KernelTelemetrySnapshot>,
+        prefixes: &PrefixSet,
+        limit: u32,
+    ) -> InspectSnapshot {
         let Some(scope) = scope else {
             return InspectSnapshot {
                 timestamp,
@@ -347,30 +374,17 @@ impl InspectRegistry {
                     continue;
                 };
 
-                if let Some(residency) = residency
-                    && residency
-                        .first_swapped(VirtRange::new(VirtAddr::new(mapped.base), mapped.length))
-                        .is_some()
-                {
-                    publications.push(ComponentPublication {
-                        instance_id: pub_entry.instance_id,
-                        instance_name: pub_entry.instance_name.clone(),
-                        name: pub_entry.name.clone(),
-                        generation: 0,
-                        status: PublicationStatus::SwappedOut,
-                    });
-                    continue;
-                }
-
                 let remaining = effective_limit.saturating_sub(entries.len());
                 // SAFETY: `mapping_guard` prevents the owning store from
                 // revoking or recycling the linear memory, `_pin` prevents
-                // swap eviction via `while_off_processor`, and residency was
-                // verified above. Every access uses aligned atomic loads.
+                // swap eviction via `while_off_processor`, and `is_resident`
+                // verifies the header and active payload ranges before each
+                // aligned atomic load.
                 let outcome = unsafe {
                     buffer::read_span_snapshot(
                         mapped.base,
                         mapped.length,
+                        &is_resident,
                         &mut scratch,
                         &mut path_buf,
                         &root_prefix,
@@ -411,6 +425,15 @@ impl InspectRegistry {
                             name: pub_entry.name.clone(),
                             generation,
                             status: PublicationStatus::Corrupt,
+                        });
+                    }
+                    buffer::SpanReadOutcome::SwappedOut => {
+                        publications.push(ComponentPublication {
+                            instance_id: pub_entry.instance_id,
+                            instance_name: pub_entry.instance_name.clone(),
+                            name: pub_entry.name.clone(),
+                            generation: 0,
+                            status: PublicationStatus::SwappedOut,
                         });
                     }
                 }
@@ -628,5 +651,124 @@ mod bounded_snapshot_tests {
                 .iter()
                 .all(|p| p.status == PublicationStatus::Ok)
         );
+    }
+
+    #[test]
+    fn snapshot_reads_active_payload_when_unused_tail_pages_are_swapped_out() {
+        use core::cell::Cell;
+        use helios_hal::pmm::PhysFrame;
+        use helios_hal::vmm::VirtRange;
+
+        let instances = InstanceRegistry::new();
+        let inst = instances.register("console-session", 1);
+        let registry = InspectRegistry::new();
+
+        let mut words: Box<[AtomicU64]> = (0..(WASM_PAGE_BYTES as usize) / 8)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let base_addr = words.as_ptr() as usize;
+        let gm = GuestMemory::new(VirtAddr::new(base_addr), WASM_PAGE_BYTES);
+
+        let encoded_end = {
+            let raw_ptr = words.as_mut_ptr().cast::<u8>();
+            // SAFETY: `words` is uniquely borrowed and holds `WASM_PAGE_BYTES` aligned bytes.
+            let buf = unsafe { core::slice::from_raw_parts_mut(raw_ptr, WASM_PAGE_BYTES as usize) };
+            encode_buffer(
+                2,
+                &[
+                    ("request_id", InspectValue::Unsigned64(1)),
+                    ("username", InspectValue::Text(String::from("lexo"))),
+                    ("challenge", InspectValue::Blob(vec![0x5a; 96])),
+                ],
+                buf,
+            )
+            .expect("encode small console-auth payload in page 0")
+        };
+        assert!(encoded_end < PhysFrame::SIZE);
+
+        let _pub_handle = registry
+            .publish(
+                inst.id(),
+                "console-session",
+                "console-auth",
+                gm,
+                Span::new(0, WASM_PAGE_BYTES),
+            )
+            .unwrap();
+
+        // 1. Pages 1..15 (`base_addr + 4096 .. base_addr + 65536`) are swapped out,
+        // while page 0 holding the header and active payload is resident.
+        let max_checked_offset = Cell::new(0usize);
+        let snap_ok = registry.snapshot_checked(
+            100,
+            inst.id(),
+            Some(AuthorityScope::Machine),
+            &instances,
+            |range: VirtRange| {
+                let end_offset = range.end().raw().saturating_sub(base_addr);
+                max_checked_offset.set(max_checked_offset.get().max(end_offset));
+                end_offset <= PhysFrame::SIZE
+            },
+            None,
+            &PrefixSet::default(),
+            256,
+        );
+        assert_eq!(max_checked_offset.get(), encoded_end);
+        assert_eq!(snap_ok.publications.len(), 1);
+        assert_eq!(snap_ok.publications[0].status, PublicationStatus::Ok);
+        assert_eq!(snap_ok.entries.len(), 3);
+
+        // 2. Header page 0 itself swapped out -> `SwappedOut` with zero entries.
+        let snap_header_out = registry.snapshot_checked(
+            101,
+            inst.id(),
+            Some(AuthorityScope::Machine),
+            &instances,
+            |_| false,
+            None,
+            &PrefixSet::default(),
+            256,
+        );
+        assert_eq!(snap_header_out.publications.len(), 1);
+        assert_eq!(
+            snap_header_out.publications[0].status,
+            PublicationStatus::SwappedOut
+        );
+        assert!(snap_header_out.entries.is_empty());
+
+        // 3. Multi-page active payload (> 4 KiB) whose second hardware page is
+        // swapped out -> `SwappedOut` without reading into the non-resident page.
+        let large_end = {
+            let raw_ptr = words.as_mut_ptr().cast::<u8>();
+            // SAFETY: `words` is uniquely borrowed and holds `WASM_PAGE_BYTES` aligned bytes.
+            let buf = unsafe { core::slice::from_raw_parts_mut(raw_ptr, WASM_PAGE_BYTES as usize) };
+            encode_buffer(
+                4,
+                &[
+                    ("blob-a", InspectValue::Blob(vec![0x11; 3000])),
+                    ("blob-b", InspectValue::Blob(vec![0x22; 3000])),
+                ],
+                buf,
+            )
+            .expect("encode >4 KiB payload")
+        };
+        assert!(large_end > PhysFrame::SIZE);
+        let snap_payload_out = registry.snapshot_checked(
+            102,
+            inst.id(),
+            Some(AuthorityScope::Machine),
+            &instances,
+            |range: VirtRange| range.end().raw().saturating_sub(base_addr) <= PhysFrame::SIZE,
+            None,
+            &PrefixSet::default(),
+            256,
+        );
+        assert_eq!(snap_payload_out.publications.len(), 1);
+        assert_eq!(
+            snap_payload_out.publications[0].status,
+            PublicationStatus::SwappedOut
+        );
+        assert!(snap_payload_out.entries.is_empty());
     }
 }

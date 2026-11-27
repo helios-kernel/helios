@@ -233,6 +233,12 @@ fn x86_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     let handoff = boot::limine_boot_handoff();
+    // Publish the firmware linear framebuffer for early panic output without
+    // writing a pixel during normal bring-up so Limine's splash remains on
+    // screen until `virtio-gpu` claims scanout.
+    if let Some(framebuffer) = handoff.framebuffer {
+        helios_kernel::attach_panic_framebuffer(framebuffer);
+    }
     let physical_memory_offset = boot::physical_memory_offset();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let reserved_wakeup_page = reserve_wakeup_page(&handoff, &reserved_ranges);

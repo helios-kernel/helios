@@ -2266,7 +2266,7 @@ async fn run_trace(
                 "timestamp",
                 Value::int(i64::try_from(ev.timestamp).unwrap_or(i64::MAX), head),
             );
-            rec.push("level", Value::string(format!("{:?}", ev.level), head));
+            rec.push("level", Value::string(trace_level_label(ev.level), head));
             rec.push("target", Value::string(ev.target, head));
             rec.push("message", Value::string(message, head));
             Value::record(rec, head)
@@ -2538,7 +2538,7 @@ fn ops_to_env_err(err: OpsError) -> EnvError {
             detail: format!("invalid capability grant `{spec}`: {reason}"),
         },
         OpsError::ExecRefused { kind, detail } => EnvError::Process {
-            detail: format!("{kind:?}: {detail}"),
+            detail: format!("{}: {detail}", exec_error_kind_label(kind)),
         },
         OpsError::Http(http) => EnvError::Http {
             detail: http.to_string(),
@@ -2546,6 +2546,33 @@ fn ops_to_env_err(err: OpsError) -> EnvError {
         other => EnvError::Io {
             detail: other.to_string(),
         },
+    }
+}
+
+fn trace_level_label(level: proto_tracing::Level) -> &'static str {
+    match level {
+        proto_tracing::Level::Error => "error",
+        proto_tracing::Level::Warn => "warn",
+        proto_tracing::Level::Info => "info",
+        proto_tracing::Level::Debug => "debug",
+        proto_tracing::Level::Trace => "trace",
+    }
+}
+
+fn exec_error_kind_label(kind: rpc_programs::ExecErrorKind) -> &'static str {
+    match kind {
+        rpc_programs::ExecErrorKind::InvalidBinary => "invalid binary",
+        rpc_programs::ExecErrorKind::MissingEntry => "missing entry point",
+        rpc_programs::ExecErrorKind::UnsupportedImport => "unsupported import",
+        rpc_programs::ExecErrorKind::InvalidSignature => "invalid signature",
+        rpc_programs::ExecErrorKind::InvalidPath => "invalid path",
+        rpc_programs::ExecErrorKind::PermissionDenied => "permission denied",
+        rpc_programs::ExecErrorKind::InvalidHint => "invalid hint",
+        rpc_programs::ExecErrorKind::OutOfMemory => "out of memory",
+        rpc_programs::ExecErrorKind::Unavailable => "unavailable",
+        rpc_programs::ExecErrorKind::Internal => "internal error",
+        rpc_programs::ExecErrorKind::NotFound => "not found",
+        rpc_programs::ExecErrorKind::Io => "i/o error",
     }
 }
 

@@ -1,0 +1,39 @@
+description = "Privilege-separated interactive VT2 console login and shell session manager"
+name = "console-session"
+runner = "wasm"
+sharding = "singleton"
+program = "/bin/console-session"
+optional = true
+startup = "eager"
+requires = ["display", "input"]
+lifecycle = "service"
+restart = "on-failure"
+restart_backoff = "250ms"
+oom_tier = "protected"
+
+[[use]]
+interface = "helios:console/tty"
+from = "/plugins/compositor"
+channel = "console-tty"
+
+[capabilities]
+directories = [
+  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
+]
+network = ["tcp", "udp", "dns", "privileged-bind", "multicast", "admin"]
+allow_all_tcp_ports = true
+allow_all_vsock_ports = true
+clock = ["set-wall-clock"]
+terminal = ["input", "output", "control"]
+process = ["spawn", "exec", "fork", "join", "signal"]
+link = ["source", "target-directory", "symlink-create", "symlink-read"]
+mount = ["mount", "unmount"]
+devices = ["gpu", "audio"]
+inspect_read = "machine"
+trace_read = "machine"
+profile_read = "machine"
+diagnostics_control = true
+instance_control = "machine"
+settings_write = true
+machine = ["control", "identity", "virtualize"]
+wit_interfaces = ["helios:console/tty"]

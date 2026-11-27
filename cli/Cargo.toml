@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 askama = "0.15.6"
 clap = { version = "4.5.38", features = ["derive", "env"] }
+console = "0.16.1"
 directories = "6.0.0"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc", "rand_core"] }
 fatfs = "0.3.6"
@@ -19,6 +20,8 @@ helios-workspace-root.workspace = true
 mbrman = "0.5.4"
 # Writes the kernel image onto the boot disk without its DWARF (#451).
 object = { version = "0.39", default-features = false, features = ["build", "std"] }
+# Encodes the Limine UEFI bootloader splash wallpaper at image-build time.
+png = { version = "0.18.1", default-features = false }
 rand = "0.10.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

@@ -21,7 +21,11 @@ shortage.
 
 Holding the display is a right, not a race. An instance may claim it
 only when its `ProcessAuthority` carries the display device class, which
-the kernel grants to the compositor it starts and to the debugger, and
+the component topology grants exclusively to `/plugins/compositor` (whose
+capability ceiling holds only `devices = ["display", "input"]`,
+`inspect_read = "machine"`, `trace_read = "machine"`, and the routed
+`helios:console/tty` IPC channel — zero filesystem, network, process, or
+identity authority) and to the inspector worker when authorized, and
 which a program receives only from a parent that holds it. Every other
 program is told what a machine with no display tells it: `unavailable`.
 

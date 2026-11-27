@@ -1,9 +1,11 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use bytes::Bytes;
+use spin::Mutex;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
@@ -215,13 +217,253 @@ pub enum ComponentOutputRoute {
     Discard,
 }
 
+/// Maximum bytes buffered for a single unterminated serial line before
+/// forcing a chunk flush to the trace log.
+const SERIAL_TRACE_LINE_MAX_BYTES: usize = 4096;
+
+/// Capacity retained on a serial trace line buffer after flushing, matching
+/// [`crate::RecordingConsole`] so one long line never pins an oversized buffer.
+const SERIAL_TRACE_BUFFER_RETAINED_CAPACITY: usize = 4096;
+
+/// Bounded per-stream UTF-8 line accumulator for mirroring serial stdout/stderr
+/// writes into [`crate::TraceLog`] without altering raw serial wire framing.
+#[derive(Debug, Default)]
+pub(crate) struct SerialLineBuffer {
+    pending: Vec<u8>,
+}
+
+impl SerialLineBuffer {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feeds `bytes` into the line buffer, invoking `emit` for every completed
+    /// line (with any trailing `\r` stripped) and for any chunk forced out when
+    /// an unterminated line reaches [`SERIAL_TRACE_LINE_MAX_BYTES`].
+    pub(crate) fn push_bytes(&mut self, mut bytes: &[u8], mut emit: impl FnMut(&str)) {
+        while !bytes.is_empty() {
+            if let Some(newline_pos) = bytes.iter().position(|&byte| byte == b'\n') {
+                let segment = &bytes[..newline_pos];
+                self.push_unterminated(segment, &mut emit);
+                self.emit_pending(&mut emit);
+                bytes = &bytes[newline_pos + 1..];
+            } else {
+                self.push_unterminated(bytes, &mut emit);
+                break;
+            }
+        }
+    }
+
+    /// Flushes any remaining unterminated partial line on stream/store finish.
+    pub(crate) fn flush(&mut self, mut emit: impl FnMut(&str)) {
+        self.emit_pending(&mut emit);
+    }
+
+    fn push_unterminated(&mut self, mut bytes: &[u8], emit: &mut impl FnMut(&str)) {
+        while !bytes.is_empty() {
+            let available = SERIAL_TRACE_LINE_MAX_BYTES.saturating_sub(self.pending.len());
+            if available == 0 {
+                self.flush_overlong_chunk(emit);
+                continue;
+            }
+            let take = bytes.len().min(available);
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.pending.len() >= SERIAL_TRACE_LINE_MAX_BYTES {
+                self.flush_overlong_chunk(emit);
+            }
+        }
+    }
+
+    fn flush_overlong_chunk(&mut self, emit: &mut impl FnMut(&str)) {
+        if self.pending.is_empty() {
+            return;
+        }
+        // Preserve an incomplete multi-byte UTF-8 sequence at the cut boundary
+        // when valid text precedes it so split CJK/UTF-8 characters reassemble.
+        let split_at = match core::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
+                error.valid_up_to()
+            }
+            Err(_) => self.pending.len(),
+        };
+        let chunk = strip_trailing_cr(&self.pending[..split_at]);
+        emit_utf8_or_lossy(chunk, emit);
+        self.pending.drain(..split_at);
+        self.shrink_if_oversized();
+    }
+
+    fn emit_pending(&mut self, emit: &mut impl FnMut(&str)) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let line = strip_trailing_cr(&self.pending);
+        emit_utf8_or_lossy(line, emit);
+        self.pending.clear();
+        self.shrink_if_oversized();
+    }
+
+    fn shrink_if_oversized(&mut self) {
+        if self.pending.capacity() > SERIAL_TRACE_BUFFER_RETAINED_CAPACITY {
+            self.pending
+                .shrink_to(SERIAL_TRACE_BUFFER_RETAINED_CAPACITY);
+        }
+    }
+}
+
+fn strip_trailing_cr(mut bytes: &[u8]) -> &[u8] {
+    while let Some(rest) = bytes.strip_suffix(b"\r") {
+        bytes = rest;
+    }
+    bytes
+}
+
+fn emit_utf8_or_lossy(bytes: &[u8], emit: &mut impl FnMut(&str)) {
+    if bytes.is_empty() {
+        return;
+    }
+    match core::str::from_utf8(bytes) {
+        Ok(line) => emit(line),
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(bytes);
+            if !lossy.is_empty() {
+                emit(&lossy);
+            }
+        }
+    }
+}
+
+/// Shareable per-stream line buffer handle owned by [`ComponentStoreData`] and
+/// passed into [`LocalOutputSink::write_mirrored`] so component output stream
+/// consumers can buffer lines across polls without holding any lock across
+/// `.await` or while invoking `record_console_text`.
+#[derive(Clone, Debug)]
+pub(crate) struct SerialLineMirror {
+    buffer: Arc<Mutex<SerialLineBuffer>>,
+}
+
+impl SerialLineMirror {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(SerialLineBuffer::new())),
+        }
+    }
+
+    /// Buffers `bytes` and emits every completed line after releasing the
+    /// buffer lock so `emit` (which acquires `TraceLog`'s `IrqSafeMutex`) never
+    /// nests inside this spinlock.
+    pub(crate) fn push_bytes(&self, bytes: &[u8], mut emit: impl FnMut(&str)) {
+        let mut completed = Vec::new();
+        {
+            let mut guard = self.buffer.lock();
+            guard.push_bytes(bytes, |line| completed.push(String::from(line)));
+        }
+        for line in &completed {
+            emit(line);
+        }
+    }
+
+    /// Flushes any trailing partial line after releasing the buffer lock.
+    pub(crate) fn flush(&self, mut emit: impl FnMut(&str)) {
+        let mut flushed = None;
+        {
+            let mut guard = self.buffer.lock();
+            guard.flush(|line| flushed = Some(String::from(line)));
+        }
+        if let Some(line) = flushed {
+            emit(&line);
+        }
+    }
+}
+
+/// Per-store serial-to-trace line mirrors that flush any partial trailing
+/// stdout/stderr line when the store drops.
+struct SerialStreamTrace<CpuImpl, RuntimeStateImpl>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+{
+    cpu: CpuImpl,
+    runtime_state: RuntimeStateImpl,
+    instance: InstanceId,
+    stdout: Option<SerialLineMirror>,
+    stderr: Option<SerialLineMirror>,
+}
+
+impl<CpuImpl, RuntimeStateImpl> SerialStreamTrace<CpuImpl, RuntimeStateImpl>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+{
+    fn new(
+        cpu: CpuImpl,
+        runtime_state: RuntimeStateImpl,
+        instance: InstanceId,
+        output_mode: &ComponentOutputMode,
+    ) -> Self {
+        let stdout = matches!(
+            output_mode.sink(ComponentOutputStreamKind::Stdout, instance),
+            ComponentOutputSink::Local(LocalOutputSink::Serial(_))
+        )
+        .then(SerialLineMirror::new);
+        let stderr = matches!(
+            output_mode.sink(ComponentOutputStreamKind::Stderr, instance),
+            ComponentOutputSink::Local(LocalOutputSink::Serial(_))
+        )
+        .then(SerialLineMirror::new);
+        Self {
+            cpu,
+            runtime_state,
+            instance,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn mirror(&self, stream: ComponentOutputStreamKind) -> Option<SerialLineMirror> {
+        match stream {
+            ComponentOutputStreamKind::Stdout => self.stdout.clone(),
+            ComponentOutputStreamKind::Stderr => self.stderr.clone(),
+        }
+    }
+}
+
+impl<CpuImpl, RuntimeStateImpl> Drop for SerialStreamTrace<CpuImpl, RuntimeStateImpl>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+{
+    fn drop(&mut self) {
+        if self.stdout.is_none() && self.stderr.is_none() {
+            return;
+        }
+        let ticks = self.cpu.now().ticks();
+        let runtime_state = &self.runtime_state;
+        let instance = self.instance;
+        if let Some(stdout) = &self.stdout {
+            stdout.flush(|line| {
+                runtime_state.record_console_text(ticks, Some(instance), line);
+            });
+        }
+        if let Some(stderr) = &self.stderr {
+            stderr.flush(|line| {
+                runtime_state.record_console_text(ticks, Some(instance), line);
+            });
+        }
+    }
+}
+
 impl ComponentOutputRoute {
     /// Borrow this route as a sink so every writer path matches on one
-    /// exhaustive set of destinations. `instance` is the writer; a
-    /// [`LocalOutputSink::Trace`] attributes what it records to it.
+    /// exhaustive set of destinations. `instance` is the writer; both
+    /// [`LocalOutputSink::Serial`] and [`LocalOutputSink::Trace`] attribute
+    /// what they record in the trace log to it.
     pub fn sink(&self, instance: InstanceId) -> ComponentOutputSink<'_> {
         match self {
-            Self::Serial => ComponentOutputSink::Local(LocalOutputSink::Serial),
+            Self::Serial => ComponentOutputSink::Local(LocalOutputSink::Serial(instance)),
             Self::Trace => ComponentOutputSink::Local(LocalOutputSink::Trace(instance)),
             Self::Child(writer) => ComponentOutputSink::Child(writer),
             Self::Discard => ComponentOutputSink::Local(LocalOutputSink::Discard),
@@ -250,7 +492,9 @@ pub enum ComponentOutputSink<'a> {
 /// between the guest and the bytes' destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalOutputSink {
-    Serial,
+    /// Debug UART byte stream, mirrored line-by-line into the observer trace
+    /// log attributed to the instance that wrote it.
+    Serial(InstanceId),
     /// Observer console text, attributed to the instance that wrote it.
     Trace(InstanceId),
     Discard,
@@ -276,8 +520,48 @@ impl LocalOutputSink {
         CpuImpl: Cpu + Clone,
         RuntimeStateImpl: ComponentRuntimeState,
     {
+        self.write_mirrored(cpu, runtime_state, serial_writer, None, bytes)
+    }
+
+    /// Like [`Self::write`], using a persistent per-stream [`SerialLineMirror`]
+    /// when provided so split writes across chunks reassemble into whole lines
+    /// in the observer trace log while keeping `serial_writer.write_stream`
+    /// byte-for-byte unchanged.
+    #[must_use]
+    pub(crate) fn write_mirrored<CpuImpl, RuntimeStateImpl>(
+        self,
+        cpu: &CpuImpl,
+        runtime_state: &RuntimeStateImpl,
+        serial_writer: crate::DebugSerialWriter,
+        line_mirror: Option<&SerialLineMirror>,
+        bytes: &[u8],
+    ) -> usize
+    where
+        CpuImpl: Cpu + Clone,
+        RuntimeStateImpl: ComponentRuntimeState,
+    {
         match self {
-            Self::Serial => serial_writer.write_stream(bytes),
+            Self::Serial(instance) => {
+                let written = serial_writer.write_stream(bytes);
+                if written != 0 {
+                    let accepted = &bytes[..written];
+                    let ticks = cpu.now().ticks();
+                    if let Some(mirror) = line_mirror {
+                        mirror.push_bytes(accepted, |line| {
+                            runtime_state.record_console_text(ticks, Some(instance), line);
+                        });
+                    } else {
+                        let mut scratch = SerialLineBuffer::new();
+                        scratch.push_bytes(accepted, |line| {
+                            runtime_state.record_console_text(ticks, Some(instance), line);
+                        });
+                        scratch.flush(|line| {
+                            runtime_state.record_console_text(ticks, Some(instance), line);
+                        });
+                    }
+                }
+                written
+            }
             Self::Trace(instance) => {
                 let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
                     panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
@@ -382,15 +666,17 @@ impl ComponentOutputMode {
     }
 
     /// Resolve where `kind` goes without cloning a writer handle.
-    /// `instance` is the writer; a [`LocalOutputSink::Trace`] attributes
-    /// what it records to it.
+    /// `instance` is the writer; both [`LocalOutputSink::Serial`] and
+    /// [`LocalOutputSink::Trace`] attribute what they record to it.
     pub fn sink(
         &self,
         kind: ComponentOutputStreamKind,
         instance: InstanceId,
     ) -> ComponentOutputSink<'_> {
         match (self, kind) {
-            (ComponentOutputMode::Serial, _) => ComponentOutputSink::Local(LocalOutputSink::Serial),
+            (ComponentOutputMode::Serial, _) => {
+                ComponentOutputSink::Local(LocalOutputSink::Serial(instance))
+            }
             (ComponentOutputMode::Trace, _) => {
                 ComponentOutputSink::Local(LocalOutputSink::Trace(instance))
             }
@@ -581,6 +867,9 @@ where
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
+    /// Per-stream line buffers mirroring `Serial` stdout/stderr into the trace
+    /// log, flushing any partial trailing line when the store drops.
+    serial_trace: SerialStreamTrace<CpuImpl, RuntimeStateImpl>,
     /// Every buffer and device region shown in this instance's linear
     /// memory.
     ///
@@ -658,6 +947,12 @@ where
     ) -> Self {
         let entropy = EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let clock = KernelClock::new(cpu.clone(), runtime_state.clone());
+        let serial_trace = SerialStreamTrace::new(
+            cpu.clone(),
+            runtime_state.clone(),
+            instance.id(),
+            &output_mode,
+        );
         Self {
             table,
             inherited_sockets: crate::InheritedSockets::new(),
@@ -680,6 +975,7 @@ where
             ),
             serial_reader,
             serial_writer,
+            serial_trace,
             views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),
@@ -816,6 +1112,13 @@ where
         self.serial_writer
     }
 
+    pub(crate) fn serial_trace_mirror(
+        &self,
+        stream: ComponentOutputStreamKind,
+    ) -> Option<SerialLineMirror> {
+        self.serial_trace.mirror(stream)
+    }
+
     pub fn now_nanos(&self) -> u64 {
         self.clock.monotonic_nanos()
     }
@@ -901,10 +1204,16 @@ where
                 // poll is not lost.
                 let serial_wait = serial_wait
                     .get_or_insert_with(|| self.serial_writer.debug_serial_output_waiter());
+                let line_mirror = self.serial_trace_mirror(stream);
                 loop {
                     let chunk = pending.take().expect("the chunk was present a line ago");
-                    let taken =
-                        local.write(&self.cpu, &self.runtime_state, self.serial_writer, &chunk);
+                    let taken = local.write_mirrored(
+                        &self.cpu,
+                        &self.runtime_state,
+                        self.serial_writer,
+                        line_mirror.as_ref(),
+                        &chunk,
+                    );
                     if taken == chunk.len() {
                         return core::task::Poll::Ready(());
                     }
@@ -1022,3 +1331,303 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
 }
 
 // Runtime-adapter trait impls live in the concrete adapter module.
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use spin::Mutex;
+
+    use helios_hal::serial::ByteSerial;
+
+    use super::{
+        ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
+        ComponentRuntimeState, LocalOutputSink, SERIAL_TRACE_LINE_MAX_BYTES, SerialLineBuffer,
+        SerialLineMirror, SerialStreamTrace,
+    };
+    use crate::test_support::TestCpu;
+    use crate::{
+        DebugConsole, DebugSerialAccess, DebugSerialWriter, InstanceId, MachineObservation,
+        PrefixSet, ProfileScope, TraceFilter, TraceLog, TraceValue,
+    };
+
+    static SERIAL_WIRE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static SERIAL_CONSOLE: DebugConsole = DebugConsole::new();
+
+    struct RecordingSerialPort;
+
+    impl ByteSerial for RecordingSerialPort {
+        fn try_read_byte(&self) -> Option<u8> {
+            None
+        }
+
+        fn write_bytes(&self, bytes: &[u8]) {
+            SERIAL_WIRE.lock().extend_from_slice(bytes);
+        }
+
+        fn enable_receive_interrupt(&self) {}
+
+        fn disable_receive_interrupt(&self) {}
+    }
+
+    impl DebugSerialAccess for RecordingSerialPort {
+        type Port = Self;
+
+        fn port() -> Self {
+            Self
+        }
+
+        fn console() -> &'static DebugConsole {
+            &SERIAL_CONSOLE
+        }
+    }
+
+    const SERIAL_WRITER: DebugSerialWriter = DebugSerialWriter::of::<RecordingSerialPort>();
+
+    #[derive(Clone)]
+    struct TraceRecordingState {
+        trace_log: alloc::sync::Arc<TraceLog>,
+    }
+
+    impl TraceRecordingState {
+        fn new() -> Self {
+            Self {
+                trace_log: alloc::sync::Arc::new(TraceLog::new(64)),
+            }
+        }
+
+        fn events(&self) -> Vec<(Option<InstanceId>, String)> {
+            let filter = TraceFilter {
+                min_level: None,
+                target_prefixes: PrefixSet::default(),
+            };
+            self.trace_log
+                .recent(&MachineObservation, &filter, 64)
+                .into_iter()
+                .map(|event| {
+                    let message = event
+                        .fields
+                        .iter()
+                        .find_map(|field| match &field.value {
+                            TraceValue::Text(text) if field.key == "message" => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    (event.origin, message)
+                })
+                .collect()
+        }
+    }
+
+    impl ComponentRuntimeState for TraceRecordingState {
+        fn uptime_nanos(&self, current_ticks: u64) -> u64 {
+            current_ticks
+        }
+
+        fn wall_clock_offset_nanos(&self) -> i128 {
+            0
+        }
+
+        fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
+            self.trace_log
+                .record_console_text(current_ticks, origin, text);
+        }
+
+        fn root_entropy(&self) -> &crate::RootEntropy {
+            panic!("serial trace test state has no root entropy")
+        }
+
+        fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle> {
+            None
+        }
+
+        fn device_grants(&self) -> &crate::device::DeviceGrantRegistry {
+            panic!("serial trace test state has no device grants")
+        }
+
+        fn display_service(&self) -> Option<crate::display::DisplayService> {
+            None
+        }
+
+        fn input_service(&self) -> Option<crate::input::InputService> {
+            None
+        }
+
+        fn gpu3d_service(&self) -> Option<crate::gpu::Gpu3dService> {
+            None
+        }
+
+        fn surface_service(&self) -> crate::surface::SurfaceService {
+            panic!("serial trace test state has no surface service")
+        }
+
+        fn audio_service(&self) -> Option<crate::audio::AudioService> {
+            None
+        }
+
+        fn profiling_enabled(&self) -> bool {
+            false
+        }
+
+        fn record_profile_stack_nanos(&self, _: ProfileScope, _: String, _: u64) {}
+
+        fn record_user_profile(&self, _: InstanceId, _: &str, _: u64) {}
+
+        fn record_perf_metric_parts(
+            &self,
+            _: ProfileScope,
+            _: &str,
+            _: &str,
+            _: crate::PerfSample,
+        ) {
+        }
+
+        fn retire_network_handles(&self, _: &crate::component::SocketRetirementQueue) {}
+
+        fn release_snapshot_hold(&self, _: u64) {}
+    }
+
+    #[test]
+    fn serial_line_buffer_handles_crlf_split_cjk_overlong_lines_and_invalid_utf8() {
+        let mut buf = SerialLineBuffer::new();
+        let mut emitted = Vec::new();
+
+        // Split multi-byte UTF-8 across CJK (Chinese, Japanese, Korean) and CRLF.
+        let cjk_line = "中文・日本語・한국어\r\n";
+        let cjk_bytes = cjk_line.as_bytes();
+        buf.push_bytes(&cjk_bytes[..2], |line| emitted.push(String::from(line)));
+        assert!(emitted.is_empty());
+        buf.push_bytes(&cjk_bytes[2..cjk_bytes.len() - 1], |line| {
+            emitted.push(String::from(line))
+        });
+        assert!(emitted.is_empty());
+        buf.push_bytes(&cjk_bytes[cjk_bytes.len() - 1..], |line| {
+            emitted.push(String::from(line))
+        });
+        assert_eq!(emitted, alloc::vec![String::from("中文・日本語・한국어")]);
+        emitted.clear();
+
+        // Overlong single line without newline flushes bounded chunks and preserves
+        // a 3-byte UTF-8 character straddling the 4096-byte boundary.
+        let mut overlong = alloc::vec![b'a'; SERIAL_TRACE_LINE_MAX_BYTES - 1];
+        overlong.extend_from_slice("中".as_bytes());
+        overlong.push(b'\n');
+        buf.push_bytes(&overlong, |line| emitted.push(String::from(line)));
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].len(), SERIAL_TRACE_LINE_MAX_BYTES - 1);
+        assert_eq!(emitted[1], "中");
+        assert!(buf.pending.is_empty());
+        emitted.clear();
+
+        // Invalid UTF-8 bytes never panic and decode lossily.
+        buf.push_bytes(b"bad-\xff-byte\n", |line| emitted.push(String::from(line)));
+        assert_eq!(emitted, alloc::vec![String::from("bad-\u{FFFD}-byte")]);
+        emitted.clear();
+
+        // Partial trailing line flushes on explicit flush.
+        buf.push_bytes(b"trailing-no-newline\r", |line| {
+            emitted.push(String::from(line))
+        });
+        assert!(emitted.is_empty());
+        buf.flush(|line| emitted.push(String::from(line)));
+        assert_eq!(emitted, alloc::vec![String::from("trailing-no-newline")]);
+    }
+
+    #[test]
+    fn serial_sink_mirrors_complete_lines_to_trace_log_and_preserves_raw_serial_bytes() {
+        SERIAL_WIRE.lock().clear();
+        let cpu = TestCpu::with_entropy(0x41);
+        let state = TraceRecordingState::new();
+        let instance = InstanceId::from_raw(42);
+        let mirror = SerialLineMirror::new();
+        let sink = LocalOutputSink::Serial(instance);
+
+        let chunks: [&[u8]; 4] = [
+            b"helios init: ",
+            b"booting services\r\n",
+            b"[KDBG run:begin]\n",
+            b"partial-tail",
+        ];
+        let mut expected_wire = Vec::new();
+        for chunk in chunks {
+            expected_wire.extend_from_slice(chunk);
+            let mut offset = 0;
+            while offset < chunk.len() {
+                let written = sink.write_mirrored(
+                    &cpu,
+                    &state,
+                    SERIAL_WRITER,
+                    Some(&mirror),
+                    &chunk[offset..],
+                );
+                assert!(written > 0);
+                offset += written;
+            }
+        }
+
+        // Raw wire output is 100% byte-for-byte unchanged.
+        assert_eq!(*SERIAL_WIRE.lock(), expected_wire);
+
+        // Only completed lines are in TraceLog before flush/drop.
+        assert_eq!(
+            state.events(),
+            alloc::vec![
+                (
+                    Some(instance),
+                    String::from("helios init: booting services")
+                ),
+                (Some(instance), String::from("[KDBG run:begin]")),
+            ]
+        );
+
+        // Dropping SerialStreamTrace flushes any partial stdout/stderr line.
+        {
+            let trace = SerialStreamTrace::new(
+                cpu,
+                state.clone(),
+                instance,
+                &ComponentOutputMode::RoutedChild {
+                    stdin: super::ComponentInputRoute::Closed,
+                    stdout: ComponentOutputRoute::Serial,
+                    stderr: ComponentOutputRoute::Serial,
+                },
+            );
+            let stdout_mirror = trace
+                .mirror(ComponentOutputStreamKind::Stdout)
+                .expect("serial stdout gets mirror");
+            let stderr_mirror = trace
+                .mirror(ComponentOutputStreamKind::Stderr)
+                .expect("serial stderr gets mirror");
+            let _ = sink.write_mirrored(
+                &cpu,
+                &state,
+                SERIAL_WRITER,
+                Some(&stdout_mirror),
+                b"stdout-unterminated",
+            );
+            let _ = sink.write_mirrored(
+                &cpu,
+                &state,
+                SERIAL_WRITER,
+                Some(&stderr_mirror),
+                b"stderr-unterminated",
+            );
+            assert_eq!(state.events().len(), 2);
+        }
+
+        assert_eq!(
+            state.events(),
+            alloc::vec![
+                (
+                    Some(instance),
+                    String::from("helios init: booting services")
+                ),
+                (Some(instance), String::from("[KDBG run:begin]")),
+                (Some(instance), String::from("stdout-unterminated")),
+                (Some(instance), String::from("stderr-unterminated")),
+            ]
+        );
+    }
+}

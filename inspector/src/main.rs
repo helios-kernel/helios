@@ -1,3 +1,4 @@
+mod diagnostics;
 mod frame_reader;
 mod image;
 mod linux_suite;
@@ -18,6 +19,7 @@ mod workload_bench;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use crate::ops_cli::{
     AccountCommand, BridgeCommand, BundleCommand, ComponentCommand, ContainerCommand, ExecCommand,
@@ -32,7 +34,7 @@ use crate::tui::TerminalError;
 
 /// Why a `helios` run ended other than by doing what it was asked.
 #[derive(Debug, thiserror::Error)]
-enum InspectorError {
+pub(crate) enum InspectorError {
     #[error(
         "a target is required (`-t/--target`, `--device`, a default in `targets.toml`, or `helios vm`)"
     )]
@@ -335,7 +337,20 @@ pub(crate) struct TracingCommand {
     enable_target: Vec<String>,
 }
 
-fn main() -> Result<(), InspectorError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            if let Some(code) = diagnostics::direct_exit_code(&err) {
+                return code;
+            }
+            eprintln!("{}", diagnostics::render_error(&err));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), InspectorError> {
     let args = Args::parse();
     match args.command {
         Some(Command::Vm(command)) => Ok(vm::run(*command, args.ops)?),
@@ -924,6 +939,23 @@ mod tests {
                 assert_eq!(application, "ssh:helios-prod");
             }
             other => panic!("expected Account::Create --fido2, got {other:?}"),
+        }
+
+        let create_replace =
+            Args::try_parse_from(["helios", "account", "create", "lexo", "--p256", "--replace"])
+                .expect("`helios account create --replace` must parse");
+        match create_replace.command {
+            Some(Command::Account(AccountCommand::Create {
+                username,
+                p256,
+                replace,
+                ..
+            })) => {
+                assert_eq!(username, "lexo");
+                assert!(p256);
+                assert!(replace);
+            }
+            other => panic!("expected Account::Create --replace, got {other:?}"),
         }
 
         for argv in [

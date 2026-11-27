@@ -1,4 +1,5 @@
 use core::ops::Range;
+use core::ptr::NonNull;
 
 use arrayvec::ArrayVec;
 
@@ -297,6 +298,153 @@ impl<'a> BootModules<'a> for NoBootModules {
     }
 }
 
+/// Bit-field position and width of one RGB colour channel inside a packed
+/// linear framebuffer pixel word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootPixelChannel {
+    /// Width of the channel field in bits (for example, `8` for 8-bit RGB).
+    pub mask_size: u8,
+    /// Bit offset of the channel's least-significant bit inside the pixel word.
+    pub mask_shift: u8,
+}
+
+impl BootPixelChannel {
+    pub const fn new(mask_size: u8, mask_shift: u8) -> Self {
+        Self {
+            mask_size,
+            mask_shift,
+        }
+    }
+
+    /// Packs an 8-bit colour component (`0..=255`) into this channel's
+    /// bit-field position using integer arithmetic only.
+    pub const fn pack(self, value: u8) -> u32 {
+        if self.mask_size == 0 || self.mask_shift >= 32 {
+            return 0;
+        }
+        let scaled = if self.mask_size >= 8 {
+            value as u32
+        } else {
+            (value as u32) >> (8 - self.mask_size)
+        };
+        let mask = if self.mask_size >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << self.mask_size) - 1
+        };
+        (scaled & mask) << self.mask_shift
+    }
+}
+
+/// RGB pixel channel masks and shifts reported by firmware or the bootloader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootPixelLayout {
+    pub red: BootPixelChannel,
+    pub green: BootPixelChannel,
+    pub blue: BootPixelChannel,
+}
+
+impl BootPixelLayout {
+    pub const fn new(
+        red: BootPixelChannel,
+        green: BootPixelChannel,
+        blue: BootPixelChannel,
+    ) -> Self {
+        Self { red, green, blue }
+    }
+
+    /// Standard 32-bit `BGRX8888` (`0x00RRGGBB` in little-endian memory).
+    pub const BGRX8888: Self = Self {
+        red: BootPixelChannel::new(8, 16),
+        green: BootPixelChannel::new(8, 8),
+        blue: BootPixelChannel::new(8, 0),
+    };
+
+    /// Standard 32-bit `RGBX8888` (`0x00BBGGRR` in little-endian memory).
+    pub const RGBX8888: Self = Self {
+        red: BootPixelChannel::new(8, 0),
+        green: BootPixelChannel::new(8, 8),
+        blue: BootPixelChannel::new(8, 16),
+    };
+
+    /// Packs 8-bit `(red, green, blue)` components into the framebuffer's
+    /// little-endian pixel word.
+    pub const fn pack_rgb(self, red: u8, green: u8, blue: u8) -> u32 {
+        self.red.pack(red) | self.green.pack(green) | self.blue.pack(blue)
+    }
+}
+
+/// A firmware-provisioned linear RGB framebuffer handed over at boot.
+///
+/// The backing memory is mapped writable in the kernel's higher-half direct
+/// map and stays untouched across normal bring-up so any bootloader splash
+/// remains on screen until the native display driver claims scanout. Only an
+/// early fatal panic writes to it before handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootFramebuffer {
+    /// Virtual address of the top-left pixel in the kernel address space.
+    pub base: NonNull<u8>,
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Distance between consecutive scanlines in bytes.
+    pub pitch: u32,
+    /// Bits per pixel (`16`, `24`, or `32`).
+    pub bpp: u16,
+    /// RGB channel layout inside each pixel word.
+    pub layout: BootPixelLayout,
+}
+
+// SAFETY: `BootFramebuffer` describes a firmware-owned linear framebuffer
+// mapping at a fixed kernel virtual address that remains valid until detached
+// when the native display driver takes over; callers synchronize access.
+unsafe impl Send for BootFramebuffer {}
+// SAFETY: same as `Send`.
+unsafe impl Sync for BootFramebuffer {}
+
+impl BootFramebuffer {
+    /// Bytes occupied by one pixel for supported linear RGB formats (`16`,
+    /// `24`, or `32` bpp).
+    pub const fn bytes_per_pixel(&self) -> Option<usize> {
+        match self.bpp {
+            16 => Some(2),
+            24 => Some(3),
+            32 => Some(4),
+            _ => None,
+        }
+    }
+
+    /// Total byte extent of the visible scanlines (`height * pitch`).
+    pub const fn byte_len(&self) -> Option<usize> {
+        (self.height as usize).checked_mul(self.pitch as usize)
+    }
+
+    /// Whether the geometry and pixel stride form a well-formed, addressable
+    /// linear RGB framebuffer.
+    pub const fn is_valid(&self) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return false;
+        }
+        let Some(bytes_per_pixel) = self.bytes_per_pixel() else {
+            return false;
+        };
+        let Some(row_bytes) = (self.width as usize).checked_mul(bytes_per_pixel) else {
+            return false;
+        };
+        if (self.pitch as usize) < row_bytes {
+            return false;
+        }
+        matches!(self.byte_len(), Some(len) if len > 0 && len <= isize::MAX as usize)
+    }
+
+    /// Packs 8-bit `(red, green, blue)` components into this framebuffer's
+    /// native pixel word.
+    pub const fn pack_rgb(&self, red: u8, green: u8, blue: u8) -> u32 {
+        self.layout.pack_rgb(red, green, blue)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootHandoff<'a, MemoryMap, Modules> {
     pub memory_map: MemoryMap,
@@ -305,6 +453,7 @@ pub struct BootHandoff<'a, MemoryMap, Modules> {
     pub modules: Modules,
     pub firmware: FirmwareKind,
     pub tables: BootFirmwareTables,
+    pub framebuffer: Option<BootFramebuffer>,
 }
 
 /// The bootloader-owned ranges carved out of the usable memory map.
@@ -493,12 +642,65 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        BootMemoryKind, BootMemoryRegion, BootReservedRanges, usable_node_regions,
-        usable_region_segments,
+        BootFramebuffer, BootMemoryKind, BootMemoryRegion, BootPixelChannel, BootPixelLayout,
+        BootReservedRanges, usable_node_regions, usable_region_segments,
     };
     use crate::cpu::ProcessorId;
     use crate::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology};
     use core::ops::Range;
+    use core::ptr::NonNull;
+
+    #[test]
+    fn pixel_layout_packs_bgrx_rgbx_and_rgb565_using_integers() {
+        assert_eq!(
+            BootPixelLayout::BGRX8888.pack_rgb(0xFF, 0x6A, 0x00),
+            0x00FF_6A00
+        );
+        assert_eq!(
+            BootPixelLayout::RGBX8888.pack_rgb(0xFF, 0x6A, 0x00),
+            0x0000_6AFF
+        );
+
+        let rgb565 = BootPixelLayout::new(
+            BootPixelChannel::new(5, 11),
+            BootPixelChannel::new(6, 5),
+            BootPixelChannel::new(5, 0),
+        );
+        // Full red (0x1f << 11), half green (~0x20 << 5), full blue (0x1f).
+        assert_eq!(
+            rgb565.pack_rgb(0xFF, 0x80, 0xFF),
+            (0x1F << 11) | (0x20 << 5) | 0x1F
+        );
+        assert_eq!(BootPixelChannel::new(0, 0).pack(0xFF), 0);
+        assert_eq!(BootPixelChannel::new(8, 32).pack(0xFF), 0);
+    }
+
+    #[test]
+    fn boot_framebuffer_validates_geometry_and_bpp() {
+        let mut backing = [0u8; 64];
+        let base = NonNull::new(backing.as_mut_ptr()).expect("stack slice is non-null");
+        let valid = BootFramebuffer {
+            base,
+            width: 4,
+            height: 4,
+            pitch: 16,
+            bpp: 32,
+            layout: BootPixelLayout::BGRX8888,
+        };
+        assert!(valid.is_valid());
+        assert_eq!(valid.bytes_per_pixel(), Some(4));
+        assert_eq!(valid.byte_len(), Some(64));
+        assert_eq!(valid.pack_rgb(0x12, 0x34, 0x56), 0x0012_3456);
+
+        let too_narrow_pitch = BootFramebuffer { pitch: 12, ..valid };
+        assert!(!too_narrow_pitch.is_valid());
+
+        let unsupported_bpp = BootFramebuffer { bpp: 8, ..valid };
+        assert!(!unsupported_bpp.is_valid());
+
+        let zero_height = BootFramebuffer { height: 0, ..valid };
+        assert!(!zero_height.is_valid());
+    }
 
     #[test]
     fn usable_region_without_overlap_stays_single_segment() {

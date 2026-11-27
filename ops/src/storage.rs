@@ -18,7 +18,7 @@ use helios_wit_rpc::inspector::wasi::filesystem::preopens as rpc_preopens;
 use helios_wit_rpc::inspector_fs::MountBtrfsRequest;
 use serde::{Deserialize, Serialize};
 
-use crate::error::OpsError;
+use crate::error::{OpsError, format_btrfs_error_kind, format_kind_detail};
 use crate::session::{Session, normalize_absolute_path};
 use crate::target::GrantRight;
 
@@ -782,7 +782,7 @@ fn map_btrfs_error(operation: &'static str, path: &Path, err: BtrfsError) -> Sub
         _ => SubvolumeError::Backend {
             operation,
             path: path.to_path_buf(),
-            detail: format!("{:?}: {}", err.kind, err.detail),
+            detail: format_kind_detail(format_btrfs_error_kind(err.kind), &err.detail),
         },
     }
 }
@@ -790,13 +790,18 @@ fn map_btrfs_error(operation: &'static str, path: &Path, err: BtrfsError) -> Sub
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
     use std::sync::Mutex;
 
     use async_io::Async;
+    use helios_oci::SubvolumeError;
     use helios_wit_rpc::Endpoint;
+    use helios_wit_rpc::inspector::helios::system::btrfs::{BtrfsError, BtrfsErrorKind};
     use helios_wit_rpc::inspector::helios::system::mounts::{
         self as rpc_mounts, MountError, MountErrorKind, MountRequest, MountSharing, MountSource,
     };
+
+    use super::map_btrfs_error;
 
     use crate::session::{Session, SessionOptions};
     use crate::target::Target;
@@ -870,5 +875,24 @@ mod tests {
         assert!(mounts.unmount("/mnt/scratch").await.is_err());
 
         server_task.abort();
+    }
+
+    #[test]
+    fn map_btrfs_error_formats_backend_detail_without_debug_tokens() {
+        let mapped = map_btrfs_error(
+            "delete-subvolume",
+            Path::new("/data/sub"),
+            BtrfsError {
+                kind: BtrfsErrorKind::SubvolumeNotEmpty,
+                detail: "child exists".to_owned(),
+            },
+        );
+        match mapped {
+            SubvolumeError::Backend { detail, .. } => {
+                assert_eq!(detail, "subvolume is not empty: child exists");
+                assert!(!detail.contains("SubvolumeNotEmpty"));
+            }
+            other => panic!("expected SubvolumeError::Backend, got {other:?}"),
+        }
     }
 }

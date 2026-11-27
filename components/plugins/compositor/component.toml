@@ -12,15 +12,11 @@ restart = "always"
 restart_backoff = "250ms"
 oom_tier = "plugin"
 
+[[expose]]
+interface = "helios:console/tty"
+channel = "console-tty"
+
 [capabilities]
-directories = [
-  { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },
-]
-network = ["tcp", "udp", "dns", "privileged-bind", "multicast", "admin"]
-allow_all_tcp_ports = true
-clock = ["set-wall-clock"]
-terminal = ["input", "output", "control"]
-process = ["spawn", "exec", "fork", "join", "signal"]
-link = ["source", "target-directory", "symlink-create", "symlink-read"]
-mount = ["mount", "unmount"]
 devices = ["display", "input"]
+inspect_read = "machine"
+trace_read = "machine"

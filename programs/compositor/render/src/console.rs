@@ -28,8 +28,7 @@ pub const CONSOLE_FOREGROUND: Colour = Colour::new(0xE8, 0xEA, 0xED);
 pub const CONSOLE_HINT_FOREGROUND: Colour = Colour::new(0x8B, 0x94, 0x9E);
 
 /// Default keyboard shortcut hint shown on the bottom console strip.
-pub const DEFAULT_CONSOLE_HINT: &str =
-    "[VT1: System Log]  PgUp/PgDn: Scroll  Esc: Splash  Alt+F2: Console";
+pub const DEFAULT_CONSOLE_HINT: &str = "[Enter / Alt+F2: Terminal  |  Shift+PgUp/PgDn: Scroll]";
 
 /// Service readiness badge printed on console startup lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +177,10 @@ impl LogConsole {
     pub fn scroll_page_down(&mut self) {
         let page = self.terminal.rows().saturating_sub(1).max(1);
         self.terminal.scroll_down(page);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.terminal.scroll_to_top();
     }
 
     pub fn scroll_to_bottom(&mut self) {

@@ -10,12 +10,14 @@ helios-api = { path = "../../api", default-features = false, features = [
     "compositor",
     "display",
     "input",
+    "inspect",
     "io",
-    "programs",
+    "ipc",
     "task",
+    "tracing",
 ] }
 helios-compositor-render = { path = "render" }
-thiserror = { version = "2.0.20", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
 
 [lib]
 name = "helios_compositor"

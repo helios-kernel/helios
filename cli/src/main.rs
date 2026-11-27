@@ -22,7 +22,10 @@ use helios_artifact::{
     CwasmTarget, IsaLevelError, cwasm_target_isa_levels, cwasm_target_supports_wasm_simd,
 };
 use helios_compiler_support::AotCompileHint;
-use helios_inspector_protocol::auth::{AuthError, AuthPolicy, INSPECTOR_POLICY_PATH};
+use helios_inspector_protocol::auth::{
+    AccountPolicy, AuthError, AuthPolicy, CONSOLE_SHELL_FLAG_PATH, HELIOS_ACCOUNTS_POLICY_PATH,
+    INSPECTOR_POLICY_PATH,
+};
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
@@ -47,8 +50,10 @@ use wit_component::ComponentEncoder;
 mod artifact_cache;
 mod boot_kernel;
 mod components;
+mod diagnostics;
 mod kernel_image;
 mod prebuilt_artifact;
+mod splash;
 mod venus_fetch;
 mod wasi_sdk;
 
@@ -214,6 +219,18 @@ pub(crate) enum PrebuildError {
         #[source]
         source: AuthError,
     },
+    #[error("failed to read operator accounts policy {path}: {source}")]
+    ReadAccountsPolicy {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid operator accounts policy {path}: {source}")]
+    InvalidAccountsPolicy {
+        path: String,
+        #[source]
+        source: AuthError,
+    },
 }
 
 /// Why one wasm program could not be built into an artifact.
@@ -320,7 +337,7 @@ pub(crate) enum WasmBuildError {
         found: PrebuiltArtifactKind,
     },
     #[error(
-        "prebuilt userspace directory {dir} was built for profile {found:?}, expected {expected:?}"
+        "prebuilt userspace directory {dir} was built for profile `{found}`, expected `{expected}`"
     )]
     PrebuiltProfileMismatch {
         dir: String,
@@ -600,6 +617,11 @@ pub(crate) enum LimineError {
     RenderConfig {
         #[source]
         source: askama::Error,
+    },
+    #[error("failed to encode Limine splash PNG: {source}")]
+    EncodeSplash {
+        #[source]
+        source: png::EncodingError,
     },
     #[error("failed to open source file {path}: {source}")]
     OpenSource {
@@ -916,6 +938,14 @@ struct KernelPrebuildCommand {
         conflicts_with = "inspector_client_key"
     )]
     inspector_policy: Option<PathBuf>,
+    /// Stage this pre-encoded postcard `AccountPolicy` at
+    /// `etc/helios/accounts.postcard` for VT2 login and remote account auth.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ACCOUNTS_POLICY")]
+    accounts_policy: Option<PathBuf>,
+    /// Stage `/etc/helios/console-shell` so VT2 boots directly into an
+    /// unauthenticated `/bin/nu` shell (for CI desktop smoke tests).
+    #[arg(long, default_value_t = false)]
+    console_shell: bool,
     #[command(flatten)]
     cache: CacheArgs,
 }
@@ -1005,7 +1035,11 @@ impl CacheArgs {
     /// Reports what the run took from the cache.
     fn report(cache: Option<&ArtifactCache>) {
         if let Some(cache) = cache {
-            eprintln!("helios-cli: artifact cache: {}", cache.stats());
+            let colors = diagnostics::stderr_colors_enabled();
+            eprintln!(
+                "{}",
+                diagnostics::format_cache_stats(&cache.stats(), colors)
+            );
         }
     }
 }
@@ -1296,7 +1330,8 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("helios-cli: {error}");
+            let colors = diagnostics::stderr_colors_enabled();
+            eprintln!("{}", diagnostics::format_cli_error(&error, colors));
             ExitCode::FAILURE
         }
     }
@@ -1309,9 +1344,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 &command.cache_dir,
                 UNIX_EPOCH + Duration::from_secs(command.older_than),
             )?;
+            let colors = diagnostics::stderr_colors_enabled();
             eprintln!(
-                "helios-cli: artifact cache: pruned {removed} entries from {}",
-                command.cache_dir.display()
+                "{}",
+                diagnostics::format_cache_pruned(removed, &command.cache_dir, colors)
             );
             Ok(())
         }
@@ -1497,6 +1533,12 @@ fn run_kernel_prebuild(
         source: resolve_bootfs_source(&prepared_inspector.policy_path)?,
         kind: BootAssetKind::File,
     });
+    if let Some(accounts_path) = command.accounts_policy.as_deref() {
+        bootfs_assets.push(prepare_accounts_policy(&command.out_dir, accounts_path)?);
+    }
+    if command.console_shell {
+        bootfs_assets.push(prepare_console_shell_flag(&command.out_dir)?);
+    }
 
     let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
     write_bootfs_image(
@@ -1876,6 +1918,22 @@ fn write_limine_fat_volume(
         limine.efi_bootloader_name,
         &limine.efi_bootloader,
     )?;
+    let splash_png =
+        splash::render_splash_png().map_err(|source| LimineError::EncodeSplash { source })?;
+    let splash_path = "/boot/limine/splash.png";
+    let mut splash_file =
+        limine_dir
+            .create_file("splash.png")
+            .map_err(|source| LimineError::CreateFatEntry {
+                path: splash_path,
+                source,
+            })?;
+    splash_file
+        .write_all(&splash_png)
+        .map_err(|source| LimineError::WriteFatEntry {
+            path: splash_path,
+            source,
+        })?;
     let config = LimineConfigTemplate { baud }
         .render()
         .map_err(|source| LimineError::RenderConfig { source })?;
@@ -3614,6 +3672,53 @@ pub(crate) fn prepare_inspector_auth(
     })
 }
 
+/// Validates a host-supplied `AccountPolicy` postcard file and stages it into
+/// `out_dir` for bootfs packaging at `etc/helios/accounts.postcard`.
+pub(crate) fn prepare_accounts_policy(
+    out_dir: &Path,
+    supplied_policy: &Path,
+) -> Result<BootAsset, PrebuildError> {
+    fs::create_dir_all(out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: out_dir.display().to_string(),
+        source,
+    })?;
+    let raw = fs::read(supplied_policy).map_err(|source| PrebuildError::ReadAccountsPolicy {
+        path: supplied_policy.display().to_string(),
+        source,
+    })?;
+    AccountPolicy::decode_postcard(&raw).map_err(|source| {
+        PrebuildError::InvalidAccountsPolicy {
+            path: supplied_policy.display().to_string(),
+            source,
+        }
+    })?;
+    let staged = out_dir.join("accounts.postcard");
+    write_if_changed(&staged, &raw)?;
+    Ok(BootAsset {
+        path: HELIOS_ACCOUNTS_POLICY_PATH
+            .trim_start_matches('/')
+            .to_owned(),
+        source: resolve_bootfs_source(&staged)?,
+        kind: BootAssetKind::File,
+    })
+}
+
+/// Stages the `/etc/helios/console-shell` marker file into `out_dir` for bootfs
+/// packaging when `--console-shell` is requested.
+pub(crate) fn prepare_console_shell_flag(out_dir: &Path) -> Result<BootAsset, PrebuildError> {
+    fs::create_dir_all(out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: out_dir.display().to_string(),
+        source,
+    })?;
+    let staged = out_dir.join("console-shell");
+    write_if_changed(&staged, b"enabled\n")?;
+    Ok(BootAsset {
+        path: CONSOLE_SHELL_FLAG_PATH.trim_start_matches('/').to_owned(),
+        source: resolve_bootfs_source(&staged)?,
+        kind: BootAssetKind::File,
+    })
+}
+
 fn ensure_secret_signing_key(secret_path: &Path) -> Result<SigningKey, KeyError> {
     if secret_path.is_file() {
         return read_signing_key(secret_path);
@@ -3760,7 +3865,11 @@ fn run_profile_fetch(
     // build can read, or there is no record.
     helios_profdata::validate(&path)?;
     store.publish(&fetched)?;
-    println!("{} {} {}", fetched.label(), repository, path.display());
+    let colors = diagnostics::stdout_colors_enabled();
+    println!(
+        "{}",
+        diagnostics::format_profile_fetch_status(&fetched.label(), repository, &path, colors)
+    );
     Ok(())
 }
 
@@ -4617,6 +4726,75 @@ mod tests {
             command.programs,
             ["init", "inspector-host", "compiler-plugin"]
         );
+    }
+
+    #[test]
+    fn limine_config_and_fat_volume_embed_splash_png() {
+        let rendered = LimineConfigTemplate { baud: 115_200 }
+            .render()
+            .expect("limine.conf template renders");
+        assert!(rendered.contains("timeout: 0"));
+        assert!(rendered.contains("verbose: no"));
+        assert!(rendered.contains("terse: yes"));
+        assert!(rendered.contains("serial: no"));
+        assert!(rendered.contains("serial_baudrate: 115200"));
+        assert!(rendered.contains("wallpaper: boot():/boot/limine/splash.png"));
+        assert!(rendered.contains("wallpaper_style: centered"));
+        assert!(rendered.contains("backdrop: ffffff"));
+        assert!(rendered.contains("term_background: ffffffff"));
+        assert!(rendered.contains("measured_boot: yes"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let efi = dir.path().join("BOOTX64.EFI");
+        let bootfs = dir.path().join("helios-bootfs");
+        let image = dir.path().join("limine.img");
+        fs::write(&efi, b"EFI-STUB").expect("write efi stub");
+        fs::write(&bootfs, b"BOOTFS-STUB").expect("write bootfs stub");
+        let limine = LimineToolchain {
+            efi_bootloader: efi,
+            efi_bootloader_name: "BOOTX64.EFI",
+        };
+        let image_bytes = 64 * 1024 * 1024;
+        let mut image_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&image)
+            .expect("create image");
+        image_file.set_len(image_bytes).expect("size image");
+        write_limine_mbr(&mut image_file, image_bytes).expect("write mbr");
+        write_limine_fat_volume(
+            &mut image_file,
+            image_bytes,
+            b"ELF",
+            &bootfs,
+            &limine,
+            115_200,
+        )
+        .expect("write fat volume");
+
+        let partition_offset = u64::from(LIMINE_PARTITION_START_LBA) * LIMINE_SECTOR_BYTES;
+        let partition_len = image_bytes - partition_offset;
+        let partition = FileSlice::new(&mut image_file, partition_offset, partition_len);
+        let volume = FileSystem::new(partition, FsOptions::new()).expect("open fat32");
+        let mut splash_bytes = Vec::new();
+        volume
+            .root_dir()
+            .open_file("boot/limine/splash.png")
+            .expect("splash.png exists on ESP")
+            .read_to_end(&mut splash_bytes)
+            .expect("read splash.png");
+        assert!(splash_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let mut conf_bytes = Vec::new();
+        volume
+            .root_dir()
+            .open_file("boot/limine/limine.conf")
+            .expect("limine.conf exists on ESP")
+            .read_to_end(&mut conf_bytes)
+            .expect("read limine.conf");
+        assert_eq!(conf_bytes, rendered.as_bytes());
     }
 
     fn test_artifact(

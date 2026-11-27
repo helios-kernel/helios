@@ -319,11 +319,11 @@ impl LinuxTtyState {
         ) && rights.contains(TerminalAuthorityRights::INPUT);
         let stdout_tty = matches!(
             output_mode.sink(crate::ComponentOutputStreamKind::Stdout, instance_id),
-            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial(_))
         ) && rights.contains(TerminalAuthorityRights::OUTPUT);
         let stderr_tty = matches!(
             output_mode.sink(crate::ComponentOutputStreamKind::Stderr, instance_id),
-            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial(_))
         ) && rights.contains(TerminalAuthorityRights::OUTPUT);
         Self {
             stdin_tty,
@@ -1998,7 +1998,7 @@ where
             // The terminal is the one destination the stream reaches on
             // the process's own authority; a channel or a log belongs to
             // whoever routed the stream there.
-            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial(_))
                 if self.shared.grants.terminal_output.is_none() =>
             {
                 return Err(WriteError::Denied);
@@ -2035,7 +2035,7 @@ where
             .output_mode
             .sink(kind, self.shared.launched_instance.id())
         {
-            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial(_))
                 if self.shared.grants.terminal_output.is_none() =>
             {
                 Err(WriteError::Denied)
@@ -2155,7 +2155,7 @@ where
             .output_mode
             .sink(kind, self.shared.launched_instance.id())
         {
-            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial(_))
                 if self.shared.grants.terminal_output.is_none() =>
             {
                 READY_ERR

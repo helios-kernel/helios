@@ -32,6 +32,14 @@ pub const INSPECTOR_POLICY_PATH: &str = "/etc/inspector/policy.postcard";
 /// staged for on-screen console login and remote account authentication.
 pub const HELIOS_ACCOUNTS_POLICY_PATH: &str = "/etc/helios/accounts.postcard";
 
+/// Bootfs/VFS marker path staged by `--console-shell` to boot VT2 directly into
+/// a non-interactive shell session (used by CI desktop smoke tests).
+pub const CONSOLE_SHELL_FLAG_PATH: &str = "/etc/helios/console-shell";
+
+/// Shared runtime VFS path (`/run` tmpfs) where the host GUI biometric broker
+/// writes a signed [`ConsoleLoginAuthReply`] for `/console-session`.
+pub const CONSOLE_AUTH_REPLY_PATH: &str = "/run/console-auth/reply.postcard";
+
 /// Host-only filename (mode `0600`) holding the dev/test Ed25519 client seed
 /// paired with the public key written into [`INSPECTOR_POLICY_PATH`] by
 /// `helios-cli kernel-prebuild` / `image-build`.
@@ -979,6 +987,22 @@ pub struct ConsoleLoginChallenge {
     pub issued_at_unix: u64,
 }
 
+impl ConsoleLoginChallenge {
+    pub fn encode_postcard(&self) -> Result<Vec<u8>, AuthError> {
+        postcard::to_allocvec(self).map_err(|source| AuthError::Encode {
+            context: "ConsoleLoginChallenge",
+            source,
+        })
+    }
+
+    pub fn decode_postcard(bytes: &[u8]) -> Result<Self, AuthError> {
+        postcard::from_bytes(bytes).map_err(|source| AuthError::Decode {
+            context: "ConsoleLoginChallenge",
+            source,
+        })
+    }
+}
+
 /// Client response proving possession of the operator account key for a
 /// [`ConsoleLoginChallenge`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -987,6 +1011,38 @@ pub struct ConsoleLoginProof {
     pub username: String,
     pub public_key: AuthPublicKey,
     pub proof: AuthProof,
+}
+
+/// Host broker decision written to [`CONSOLE_AUTH_REPLY_PATH`] in response to a
+/// [`ConsoleLoginChallenge`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsoleLoginAuthReply {
+    Approved(ConsoleLoginProof),
+    Rejected { request_id: u64, reason: String },
+}
+
+impl ConsoleLoginAuthReply {
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        match self {
+            Self::Approved(proof) => proof.request_id,
+            Self::Rejected { request_id, .. } => *request_id,
+        }
+    }
+
+    pub fn encode_postcard(&self) -> Result<Vec<u8>, AuthError> {
+        postcard::to_allocvec(self).map_err(|source| AuthError::Encode {
+            context: "ConsoleLoginAuthReply",
+            source,
+        })
+    }
+
+    pub fn decode_postcard(bytes: &[u8]) -> Result<Self, AuthError> {
+        postcard::from_bytes(bytes).map_err(|source| AuthError::Decode {
+            context: "ConsoleLoginAuthReply",
+            source,
+        })
+    }
 }
 
 /// Verified operator account session returned by [`verify_console_login`].

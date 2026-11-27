@@ -47,6 +47,7 @@ use crate::{
     run_connected,
 };
 
+mod console_auth;
 mod disk;
 mod input;
 mod instruction_profile;
@@ -69,9 +70,10 @@ use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
 use kernel_image_cache::{KernelImageBuild, KernelImageCache};
 use kill::KillAfterLines;
+pub(crate) use network::VmNetworkSetupError;
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
-    VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
+    VmNetworkError, VmNetworkFile, VmNetworkProfile,
 };
 use numa::{NumaError, NumaMachine};
 use prebuilt::{
@@ -188,6 +190,12 @@ pub(crate) enum VmConfigError {
     WorkloadSelection(#[from] WorkloadSelectionError),
     #[error("--root-secret-key {path} cannot be made absolute: {source}")]
     RootSecretKeyPath {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("--accounts-policy {path} cannot be made absolute: {source}")]
+    AccountsPolicyPath {
         path: String,
         #[source]
         source: io::Error,
@@ -314,6 +322,16 @@ pub(crate) enum VmBuildError {
     RootSecretScan(#[from] root_secret_scan::RootSecretScanError),
     #[error("{0}")]
     X86ImageAudit(#[from] x86_image_audit::X86ImageAuditError),
+    #[error("failed to export host operator accounts: {0}")]
+    HostAccounts(#[from] helios_ops::AccountError),
+    #[error("failed to encode host operator accounts policy: {0}")]
+    EncodeHostAccounts(#[from] helios_inspector_protocol::auth::AuthError),
+    #[error("failed to write host operator accounts policy {path}: {source}")]
+    WriteHostAccounts {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// One build or provisioning step run as a child process.
@@ -759,7 +777,10 @@ pub(crate) enum AotBenchError {
         #[source]
         source: helios_wit_rpc::RpcError,
     },
-    #[error("remote AOT iteration {iteration} failed: {kind:?}: {detail}")]
+    #[error(
+        "remote AOT iteration {iteration} failed: {}: {detail}",
+        crate::programs::exec_error_kind_label(*kind)
+    )]
     Refused {
         iteration: u16,
         kind: system_programs::ExecErrorKind,
@@ -1949,6 +1970,12 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) gui: Option<bool>,
     #[serde(default)]
+    pub(crate) accounts_policy: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) no_host_accounts: Option<bool>,
+    #[serde(default)]
+    pub(crate) console_shell: Option<bool>,
+    #[serde(default)]
     pub(crate) display: Option<VmDisplayBackend>,
     #[serde(default)]
     pub(crate) renderer: Option<VmGpuRenderer>,
@@ -2328,6 +2355,26 @@ pub(crate) struct VmCommand {
     /// session subcommand is given.
     #[arg(long, default_value_t = false)]
     pub(crate) gui: bool,
+
+    /// Pre-encoded postcard `AccountPolicy` staged into bootfs at
+    /// `/etc/helios/accounts.postcard` for VT2 login and remote account auth.
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "HELIOS_ACCOUNTS_POLICY",
+        conflicts_with = "no_host_accounts"
+    )]
+    pub(crate) accounts_policy: Option<PathBuf>,
+
+    /// Skip automatically exporting host operator accounts enrolled via
+    /// `helios account create` into `/etc/helios/accounts.postcard`.
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_host_accounts: bool,
+
+    /// Stage `/etc/helios/console-shell` so VT2 boots directly into an
+    /// unauthenticated `/bin/nu` shell (for CI desktop smoke tests).
+    #[arg(long, default_value_t = false)]
+    pub(crate) console_shell: bool,
 
     /// Host display backend QEMU opens for the guest's scanout.
     ///
@@ -3016,6 +3063,12 @@ struct KernelBuildSpec {
     init_wasm: Option<PathBuf>,
     /// Alternate `component.toml` directory passed to `kernel-prebuild --components`.
     components: Option<PathBuf>,
+    /// Explicit postcard `AccountPolicy` staged at `/etc/helios/accounts.postcard`.
+    accounts_policy: Option<PathBuf>,
+    /// When true, do not export host operator accounts from `AccountStore::default_store()`.
+    no_host_accounts: bool,
+    /// When true, stage `/etc/helios/console-shell` into bootfs.
+    console_shell: bool,
 }
 
 /// Which profile a `profile-use` kernel reads, and what that makes of
@@ -3234,6 +3287,14 @@ fn resolve_build(
             }
         }
     }
+    let gui_enabled = command.gui || file.gui.unwrap_or(false);
+    if gui_enabled && !boot_programs.is_empty() {
+        for required in ["compositor", "console-session"] {
+            if !boot_programs.iter().any(|p| p == required) {
+                boot_programs.push(required.to_owned());
+            }
+        }
+    }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
     let guest_programs_profile = command
         .guest_programs_profile
@@ -3250,6 +3311,19 @@ fn resolve_build(
             })
         })
         .transpose()?;
+    let accounts_policy = command
+        .accounts_policy
+        .as_deref()
+        .or(file.accounts_policy.as_deref())
+        .map(|path| {
+            std::path::absolute(path).map_err(|source| VmConfigError::AccountsPolicyPath {
+                path: path.display().to_string(),
+                source,
+            })
+        })
+        .transpose()?;
+    let no_host_accounts = command.no_host_accounts || file.no_host_accounts.unwrap_or(false);
+    let console_shell = command.console_shell || file.console_shell.unwrap_or(false);
     Ok(KernelBuildSpec {
         profile,
         kind,
@@ -3264,6 +3338,9 @@ fn resolve_build(
         bootfs_root: command.bootfs_root.clone(),
         init_wasm: command.init_wasm.clone(),
         components: command.components.clone(),
+        accounts_policy,
+        no_host_accounts,
+        console_shell,
     })
 }
 
@@ -3518,6 +3595,9 @@ fn resolve_resume(
         bootfs_root: None,
         init_wasm: None,
         components: None,
+        accounts_policy: None,
+        no_host_accounts: false,
+        console_shell: false,
     };
     let numa = NumaMachine::resolve(
         manifest.numa_nodes,
@@ -4520,6 +4600,31 @@ fn run_kernel_prebuild(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     if let Some(components) = &command.components {
         prebuild.arg("--components").arg(components);
     }
+    if let Some(accounts_policy) = &command.accounts_policy {
+        prebuild.arg("--accounts-policy").arg(accounts_policy);
+    } else if !command.no_host_accounts {
+        let policy = helios_ops::account::AccountStore::default_store().export_account_policy()?;
+        if !policy.accounts.is_empty() {
+            fs::create_dir_all(&out_dir).map_err(|source| VmBuildError::WriteHostAccounts {
+                path: out_dir.display().to_string(),
+                source,
+            })?;
+            let host_accounts_path = out_dir.join("host-accounts.postcard");
+            let encoded = policy.encode_postcard()?;
+            if fs::read(&host_accounts_path).ok().as_deref() != Some(encoded.as_slice()) {
+                fs::write(&host_accounts_path, &encoded).map_err(|source| {
+                    VmBuildError::WriteHostAccounts {
+                        path: host_accounts_path.display().to_string(),
+                        source,
+                    }
+                })?;
+            }
+            prebuild.arg("--accounts-policy").arg(&host_accounts_path);
+        }
+    }
+    if command.console_shell {
+        prebuild.arg("--console-shell");
+    }
     run_step("prebuilding kernel bootfs", &mut prebuild)?;
     Ok(())
 }
@@ -4767,24 +4872,13 @@ fn connect_and_run(
     }
 }
 
-const GUI_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// Keeps a `--gui` session running without opening the host terminal REPL.
 ///
 /// `client` stays alive across the wait so its background RPC driver keeps
-/// draining the guest transport while the user interacts with the QEMU window.
-/// Returns cleanly when QEMU exits (window closed) or on `Ctrl-C`.
-fn run_gui_session(client: RpcClient, runtime: &mut VmRuntime) -> Result<(), VmSessionError> {
-    println!(
-        "{} guest ready; close the QEMU window or press Ctrl-C to stop",
-        style("gui").green()
-    );
-    crate::run_interruptible(async move {
-        let _client = client;
-        wait_for_child_exit(&mut runtime.child).await
-    })
-}
-
+/// draining the guest transport and brokering VT2 Touch ID / FIDO2 login
+/// challenges while the user interacts with the QEMU window. Returns cleanly
+/// when QEMU exits (window closed) or on `Ctrl-C`.
+#[cfg(test)]
 async fn wait_for_child_exit(child: &mut Child) -> Result<(), VmSessionError> {
     loop {
         if child
@@ -4794,8 +4888,35 @@ async fn wait_for_child_exit(child: &mut Child) -> Result<(), VmSessionError> {
         {
             return Ok(());
         }
-        async_io::Timer::after(GUI_EXIT_POLL_INTERVAL).await;
+        async_io::Timer::after(console_auth::GUI_BROKER_POLL_INTERVAL).await;
     }
+}
+
+fn run_gui_session(client: RpcClient, runtime: &mut VmRuntime) -> Result<(), VmSessionError> {
+    let theme = crate::diagnostics::CliTheme::stderr();
+    eprintln!("{} guest display ready", theme.bold_green("gui"));
+    eprintln!(
+        "  {} / {}  VT2 terminal login",
+        theme.bold("Enter"),
+        theme.bold("Alt+F2"),
+    );
+    eprintln!("  {}          VT1 system log", theme.bold("Alt+F1"));
+    eprintln!("  {} / close window to stop", theme.bold("Ctrl+C"));
+    crate::run_interruptible(async move {
+        let mut broker = console_auth::ConsoleAuthBroker::new();
+        loop {
+            if runtime
+                .child
+                .try_wait()
+                .map_err(|source| VmRuntimeError::PollQemu { source })?
+                .is_some()
+            {
+                return Ok(());
+            }
+            broker.poll_and_broker_once(&client).await;
+            async_io::Timer::after(console_auth::GUI_BROKER_POLL_INTERVAL).await;
+        }
+    })
 }
 
 /// The two ways the vsock hand-off can fail, kept apart so the message
@@ -9660,6 +9781,9 @@ mod tests {
             bootfs_root: None,
             init_wasm: None,
             components: None,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
         };
         let root = Path::new("/checkout");
         for kind in [
@@ -9714,6 +9838,9 @@ mod tests {
                     bootfs_root: None,
                     init_wasm: None,
                     components: None,
+                    accounts_policy: None,
+                    no_host_accounts: false,
+                    console_shell: false,
                 };
                 let arguments = cargo_arguments(&kernel_build_command(root, &build));
                 assert_eq!(
@@ -10243,6 +10370,9 @@ mod tests {
             bootfs_root: None,
             init_wasm: None,
             components: None,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
         };
         for root_secret_key in [None, build.root_secret_key.clone()] {
             build.root_secret_key = root_secret_key;
@@ -10332,6 +10462,9 @@ mod tests {
             virtio_in_order: false,
             desktop: false,
             gui: false,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
             display: None,
             renderer: None,
             renderer_hostmem: None,
@@ -10416,6 +10549,9 @@ mod tests {
             virtio_in_order: false,
             desktop: false,
             gui: false,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
             display: None,
             renderer: None,
             renderer_hostmem: None,
@@ -10536,6 +10672,53 @@ mod tests {
         })
         .expect("--gui --display sdl resolves");
         assert!(resolved_sdl.gui);
+
+        // `--gui` with explicit `--boot-program` auto-includes `compositor` and `console-session`.
+        let parsed_gui_subset = VmLine::try_parse_from([
+            "helios",
+            "--accel",
+            "tcg",
+            "--gui",
+            "--console-shell",
+            "--no-host-accounts",
+            "--boot-program",
+            "nu",
+        ])
+        .expect("`vm --gui --console-shell --no-host-accounts --boot-program nu` must parse");
+        let resolved_gui_subset = resolve(VmCommand {
+            config: Some(missing_config.clone()),
+            ..parsed_gui_subset.command
+        })
+        .expect("gui subset resolves");
+        assert!(resolved_gui_subset.build.console_shell);
+        assert!(resolved_gui_subset.build.no_host_accounts);
+        assert!(
+            resolved_gui_subset
+                .build
+                .boot_programs
+                .iter()
+                .any(|p| p == "compositor")
+        );
+        assert!(
+            resolved_gui_subset
+                .build
+                .boot_programs
+                .iter()
+                .any(|p| p == "console-session")
+        );
+
+        // `--accounts-policy` and `--no-host-accounts` conflict.
+        assert!(
+            VmLine::try_parse_from([
+                "helios",
+                "--accel",
+                "tcg",
+                "--accounts-policy",
+                "/tmp/accounts.postcard",
+                "--no-host-accounts",
+            ])
+            .is_err()
+        );
         assert!(resolved_sdl.desktop);
         assert_eq!(resolved_sdl.display, VmDisplayBackend::Sdl);
 
@@ -11450,6 +11633,9 @@ mod tests {
             virtio_in_order: false,
             desktop: false,
             gui: false,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
             display: None,
             renderer: None,
             renderer_hostmem: None,
@@ -11664,6 +11850,9 @@ mod tests {
             bootfs_root: None,
             init_wasm: None,
             components: None,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
         };
         ResolvedVmCommand {
             profile,
@@ -11894,6 +12083,9 @@ mod tests {
             bootfs_root: None,
             init_wasm: None,
             components: None,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
         };
         ResolvedVmCommand {
             profile,
@@ -12350,6 +12542,9 @@ mod tests {
             bootfs_root: None,
             init_wasm: None,
             components: None,
+            accounts_policy: None,
+            no_host_accounts: false,
+            console_shell: false,
         };
         assert_eq!(build.guest_programs_profile(), "release");
         build.guest_programs_profile = Some(GuestProgramsProfile::Debug);

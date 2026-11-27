@@ -145,6 +145,7 @@ pub struct CreateAccountRequest {
     pub application: String,
     pub grants: SessionGrants,
     pub allowed_transports: TransportMask,
+    pub replace: bool,
 }
 
 impl CreateAccountRequest {
@@ -157,6 +158,7 @@ impl CreateAccountRequest {
             application: DEFAULT_FIDO2_APPLICATION.to_owned(),
             grants: SessionGrants::full_worker_ceiling(),
             allowed_transports: TransportMask::ALL,
+            replace: false,
         }
     }
 }
@@ -412,6 +414,22 @@ impl AccountStore {
         self.dir.join(format!("{username}.toml"))
     }
 
+    /// Validates `username` and checks whether an account can be created in
+    /// this store without invoking any hardware authenticator.
+    pub fn check_creatable(&self, username: &str, replace: bool) -> Result<(), AccountError> {
+        validate_username(username)?;
+        if !replace {
+            let path = self.path_for(username);
+            if path.exists() {
+                return Err(AccountError::AlreadyExists {
+                    username: username.to_owned(),
+                    path,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Enrolls a new operator account using the host's default Touch ID and
     /// FIDO2 providers.
     pub fn create(&self, req: CreateAccountRequest) -> Result<OperatorAccount, AccountError> {
@@ -427,50 +445,82 @@ impl AccountStore {
         touch_id: &dyn TouchIdProvider,
         fido2: &dyn Fido2Provider,
     ) -> Result<OperatorAccount, AccountError> {
-        validate_username(&req.username)?;
+        self.check_creatable(&req.username, req.replace)?;
         req.grants.validate()?;
-
-        let account_path = self.path_for(&req.username);
-        if account_path.exists() {
-            return Err(AccountError::AlreadyExists {
+        if req.authenticator == AccountAuthenticatorChoice::Fido2 && req.application.is_empty() {
+            return Err(AccountError::InvalidAccount {
                 username: req.username,
-                path: account_path,
+                detail: "FIDO2 application string must not be empty".to_owned(),
             });
         }
+
+        let account_path = self.path_for(&req.username);
+        let existing = if req.replace && account_path.exists() {
+            match Self::load_from_path(&account_path, &req.username) {
+                Ok(acct) => Some(acct),
+                Err(AccountError::NotFound { .. }) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        username = %req.username,
+                        path = %account_path.display(),
+                        error = %err,
+                        "ignoring unreadable existing account during replace"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         fs::create_dir_all(&self.dir).map_err(|source| AccountError::WriteAccount {
             path: account_path.clone(),
             source,
         })?;
 
+        let mut fido2_staging: Option<StagedFido2Handle> = None;
         let authenticator = match req.authenticator {
             AccountAuthenticatorChoice::TouchId => {
                 let reason = format!("Create Helios account '{}'", req.username);
                 touch_id.authenticate(&reason)?;
                 let (scalar, pub_sec1) = generate_p256_keypair()?;
-                touch_id.store_secret(TOUCH_ID_KEYCHAIN_SERVICE, &req.username, &*scalar)?;
+                let fp_hex = encode_hex(&AuthPublicKey::P256(pub_sec1).fingerprint_sha256());
+                let keychain_account = format!("{}-{}", req.username, &fp_hex[..12]);
+                touch_id.store_secret(TOUCH_ID_KEYCHAIN_SERVICE, &keychain_account, &*scalar)?;
                 AuthenticatorSpec::TouchId {
                     keychain_service: TOUCH_ID_KEYCHAIN_SERVICE.to_owned(),
-                    keychain_account: req.username.clone(),
+                    keychain_account,
                     public_key_sec1_hex: encode_hex(&pub_sec1),
                 }
             }
             AccountAuthenticatorChoice::Fido2 => {
-                if req.application.is_empty() {
-                    return Err(AccountError::InvalidAccount {
-                        username: req.username,
-                        detail: "FIDO2 application string must not be empty".to_owned(),
-                    });
-                }
-                let key_handle_path = self.dir.join(format!("{}.fido2_sk", req.username));
+                let staging_dir = tempfile::Builder::new()
+                    .prefix(&format!(".{}.fido2-staging-", req.username))
+                    .tempdir_in(&self.dir)
+                    .map_err(|source| AccountError::WriteAccount {
+                        path: account_path.clone(),
+                        source,
+                    })?;
+                let staged_key_handle_path = staging_dir.path().join("id_sk");
+                let final_key_handle_path = self.dir.join(format!("{}.fido2_sk", req.username));
                 let comment = format!("helios:{}", req.username);
-                let enrolled =
-                    fido2.enroll(&key_handle_path, &req.application, req.require_uv, &comment)?;
+                let enrolled = fido2.enroll(
+                    &staged_key_handle_path,
+                    &req.application,
+                    req.require_uv,
+                    &comment,
+                )?;
+                fido2_staging = Some(StagedFido2Handle {
+                    _staging_dir: staging_dir,
+                    staged_path: staged_key_handle_path,
+                    final_path: final_key_handle_path.clone(),
+                });
                 AuthenticatorSpec::Fido2 {
                     key_type: enrolled.key_type,
                     application: enrolled.application,
                     require_uv: req.require_uv,
                     public_key_hex: encode_hex(&enrolled.public_key_bytes),
-                    key_handle_path,
+                    key_handle_path: final_key_handle_path,
                 }
             }
             AccountAuthenticatorChoice::SoftwareP256 => {
@@ -499,14 +549,43 @@ impl AccountStore {
             allowed_transports: req.allowed_transports,
             created_at_unix: unix_now_secs(),
         };
-        let encoded = toml::to_string_pretty(&account)
-            .map_err(|source| AccountError::SerializeAccount { source })?;
-        write_private_file(&account_path, encoded.as_bytes()).map_err(|source| {
-            AccountError::WriteAccount {
-                path: account_path,
-                source,
+        let encoded = match toml::to_string_pretty(&account) {
+            Ok(encoded) => encoded,
+            Err(source) => {
+                rollback_new_touch_id(&account.authenticator, touch_id);
+                return Err(AccountError::SerializeAccount { source });
             }
-        })?;
+        };
+        let staged_toml = match stage_private_file(&self.dir, encoded.as_bytes()) {
+            Ok(tmp) => tmp,
+            Err(source) => {
+                rollback_new_touch_id(&account.authenticator, touch_id);
+                return Err(AccountError::WriteAccount {
+                    path: account_path,
+                    source,
+                });
+            }
+        };
+
+        if let Some(staged) = fido2_staging {
+            install_staged_fido2_handle(&staged).map_err(|source| AccountError::WriteAccount {
+                path: staged.final_path.clone(),
+                source,
+            })?;
+        }
+
+        if let Err(err) = staged_toml.persist(&account_path) {
+            rollback_new_touch_id(&account.authenticator, touch_id);
+            return Err(AccountError::WriteAccount {
+                path: account_path,
+                source: err.error,
+            });
+        }
+
+        if let Some(old) = existing {
+            cleanup_superseded_credential(&old.authenticator, &account.authenticator, touch_id);
+        }
+
         Ok(account)
     }
 
@@ -790,6 +869,20 @@ impl Fido2Provider for OpenSshFido2Provider {
         require_uv: bool,
         comment: &str,
     ) -> Result<Fido2Enrollment, AccountError> {
+        let parent = key_handle_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let staging_dir = tempfile::Builder::new()
+            .prefix(".helios-fido2-")
+            .tempdir_in(parent)
+            .map_err(|err| AccountError::Fido2 {
+                operation: "create FIDO2 staging directory",
+                detail: err.to_string(),
+            })?;
+        let staged_key_path = staging_dir.path().join("id_sk");
+        let staged_pub_path = append_pub_ext(&staged_key_path);
+
         let mut last_err = None;
         for key_type in ["ed25519-sk", "ecdsa-sk"] {
             let mut cmd = Command::new("ssh-keygen");
@@ -804,7 +897,7 @@ impl Fido2Provider for OpenSshFido2Provider {
             cmd.arg("-N")
                 .arg("")
                 .arg("-f")
-                .arg(key_handle_path)
+                .arg(&staged_key_path)
                 .arg("-C")
                 .arg(comment);
 
@@ -813,21 +906,32 @@ impl Fido2Provider for OpenSshFido2Provider {
                 detail: format!("failed to launch ssh-keygen: {err}"),
             })?;
             if output.status.success() {
-                let mut pub_path = key_handle_path.as_os_str().to_os_string();
-                pub_path.push(".pub");
                 let pub_text =
-                    fs::read_to_string(&pub_path).map_err(|err| AccountError::Fido2 {
+                    fs::read_to_string(&staged_pub_path).map_err(|err| AccountError::Fido2 {
                         operation: "read generated FIDO2 public key",
                         detail: err.to_string(),
                     })?;
-                return parse_openssh_sk_public_key(&pub_text);
+                let enrolled = parse_openssh_sk_public_key(&pub_text)?;
+                let final_pub_path = append_pub_ext(key_handle_path);
+                fs::rename(&staged_key_path, key_handle_path).map_err(|err| {
+                    AccountError::Fido2 {
+                        operation: "install FIDO2 key handle",
+                        detail: err.to_string(),
+                    }
+                })?;
+                if let Err(err) = fs::rename(&staged_pub_path, &final_pub_path) {
+                    let _ = remove_if_exists(key_handle_path);
+                    return Err(AccountError::Fido2 {
+                        operation: "install FIDO2 public key",
+                        detail: err.to_string(),
+                    });
+                }
+                return Ok(enrolled);
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let _ = remove_if_exists(key_handle_path);
-            let mut pub_path = key_handle_path.as_os_str().to_os_string();
-            pub_path.push(".pub");
-            let _ = remove_if_exists(Path::new(&pub_path));
+            let _ = remove_if_exists(&staged_key_path);
+            let _ = remove_if_exists(&staged_pub_path);
             last_err = Some(format!("ssh-keygen -t {key_type} failed: {stderr}"));
         }
 
@@ -1191,26 +1295,101 @@ fn remove_if_exists(path: &Path) -> Result<(), AccountError> {
     }
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+struct StagedFido2Handle {
+    _staging_dir: tempfile::TempDir,
+    staged_path: PathBuf,
+    final_path: PathBuf,
+}
+
+fn append_pub_ext(path: &Path) -> PathBuf {
+    let mut pub_path = path.as_os_str().to_os_string();
+    pub_path.push(".pub");
+    PathBuf::from(pub_path)
+}
+
+fn install_staged_fido2_handle(staged: &StagedFido2Handle) -> std::io::Result<()> {
+    let moved_handle = staged.staged_path.exists();
+    if moved_handle {
+        fs::rename(&staged.staged_path, &staged.final_path)?;
+    }
+    let staged_pub = append_pub_ext(&staged.staged_path);
+    let final_pub = append_pub_ext(&staged.final_path);
+    if staged_pub.exists() {
+        fs::rename(&staged_pub, &final_pub)?;
+    } else if moved_handle {
+        let _ = remove_if_exists(&final_pub);
+    }
+    Ok(())
+}
+
+fn rollback_new_touch_id(spec: &AuthenticatorSpec, touch_id: &dyn TouchIdProvider) {
+    if let AuthenticatorSpec::TouchId {
+        keychain_service,
+        keychain_account,
+        ..
+    } = spec
+    {
+        let _ = touch_id.delete_secret(keychain_service, keychain_account);
+    }
+}
+
+fn cleanup_superseded_credential(
+    old: &AuthenticatorSpec,
+    new: &AuthenticatorSpec,
+    touch_id: &dyn TouchIdProvider,
+) {
+    match old {
+        AuthenticatorSpec::TouchId {
+            keychain_service: old_service,
+            keychain_account: old_account,
+            ..
+        } => {
+            let same = matches!(
+                new,
+                AuthenticatorSpec::TouchId {
+                    keychain_service: new_service,
+                    keychain_account: new_account,
+                    ..
+                } if new_service == old_service && new_account == old_account
+            );
+            if !same {
+                let _ = touch_id.delete_secret(old_service, old_account);
+            }
+        }
+        AuthenticatorSpec::Fido2 {
+            key_handle_path: old_path,
+            ..
+        } => {
+            let same = matches!(
+                new,
+                AuthenticatorSpec::Fido2 {
+                    key_handle_path: new_path,
+                    ..
+                } if new_path == old_path
+            );
+            if !same {
+                let _ = remove_if_exists(old_path);
+                let _ = remove_if_exists(&append_pub_ext(old_path));
+            }
+        }
+        AuthenticatorSpec::SoftwareP256 { .. } | AuthenticatorSpec::SoftwareEd25519 { .. } => {}
+    }
+}
+
+fn stage_private_file(dir: &Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".helios-account-")
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-        opts.mode(0o600);
-        let mut file = opts.open(path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    #[cfg(not(unix))]
-    {
-        let mut file = opts.open(path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        Ok(())
-    }
+    tmp.as_file_mut().write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    Ok(tmp)
 }
 
 fn unix_now_secs() -> u64 {
@@ -1916,16 +2095,300 @@ mod tests {
         assert_eq!(decoded.accounts.len(), 5);
 
         // Remove cleans up Keychain and FIDO2 key handles.
+        let touch_keychain_account = match &touch_acct.authenticator {
+            AuthenticatorSpec::TouchId {
+                keychain_account, ..
+            } => keychain_account.clone(),
+            other => panic!("expected TouchId authenticator, got {other:?}"),
+        };
         store
             .remove_with("touch_user", &touch_id)
             .expect("remove touch_user");
         assert!(
             touch_id
-                .load_secret(TOUCH_ID_KEYCHAIN_SERVICE, "touch_user")
+                .load_secret(TOUCH_ID_KEYCHAIN_SERVICE, &touch_keychain_account)
                 .is_err()
         );
         store.remove_with("yk_ed", &touch_id).expect("remove yk_ed");
         assert!(!dir.path().join("accounts/yk_ed.fido2_sk").exists());
         assert!(!dir.path().join("accounts/yk_ed.fido2_sk.pub").exists());
+    }
+
+    struct FailingFido2 {
+        enroll_calls: Mutex<usize>,
+        write_junk_before_error: bool,
+    }
+
+    impl FailingFido2 {
+        fn new(write_junk_before_error: bool) -> Self {
+            Self {
+                enroll_calls: Mutex::new(0),
+                write_junk_before_error,
+            }
+        }
+    }
+
+    impl Fido2Provider for FailingFido2 {
+        fn enroll(
+            &self,
+            key_handle_path: &Path,
+            _application: &str,
+            _require_uv: bool,
+            _comment: &str,
+        ) -> Result<Fido2Enrollment, AccountError> {
+            *self.enroll_calls.lock().expect("lock enroll calls") += 1;
+            if self.write_junk_before_error {
+                let _ = fs::write(key_handle_path, b"corrupted-partial-handle");
+            }
+            Err(AccountError::Fido2 {
+                operation: "enroll FIDO2 security key",
+                detail: "security key unplugged".to_owned(),
+            })
+        }
+
+        fn sign(
+            &self,
+            _key_handle_path: &Path,
+            _namespace: &str,
+            _message: &[u8],
+        ) -> Result<String, AccountError> {
+            Err(AccountError::Fido2 {
+                operation: "sign",
+                detail: "security key unplugged".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn check_creatable_validates_before_invoking_providers() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AccountStore::new(dir.path().join("accounts"));
+        let touch_id = MockTouchId::allowing();
+        let fido2 = FailingFido2::new(false);
+
+        // Invalid usernames are rejected regardless of `replace`.
+        assert!(matches!(
+            store.check_creatable("BadUser", false),
+            Err(AccountError::InvalidUsername { .. })
+        ));
+        assert!(matches!(
+            store.check_creatable("../escape", true),
+            Err(AccountError::InvalidUsername { .. })
+        ));
+
+        // Non-existent valid username is creatable for both replace=false and replace=true.
+        store
+            .check_creatable("alice", false)
+            .expect("new account should be creatable");
+        store
+            .check_creatable("alice", true)
+            .expect("new account should be creatable with replace");
+
+        // Create `alice` with software key so the file exists.
+        store
+            .create_with(
+                CreateAccountRequest::new("alice", AccountAuthenticatorChoice::SoftwareEd25519),
+                &touch_id,
+                &fido2,
+            )
+            .expect("create initial alice");
+
+        // check_creatable rejects existing account when replace=false and accepts when replace=true.
+        assert!(matches!(
+            store.check_creatable("alice", false),
+            Err(AccountError::AlreadyExists { ref username, .. }) if username == "alice"
+        ));
+        store
+            .check_creatable("alice", true)
+            .expect("existing account should be creatable with replace=true");
+
+        // create_with with replace=false must fail BEFORE invoking Touch ID or FIDO2 providers.
+        assert!(matches!(
+            store.create_with(
+                CreateAccountRequest::new("alice", AccountAuthenticatorChoice::TouchId),
+                &touch_id,
+                &fido2,
+            ),
+            Err(AccountError::AlreadyExists { ref username, .. }) if username == "alice"
+        ));
+        assert!(matches!(
+            store.create_with(
+                CreateAccountRequest::new("alice", AccountAuthenticatorChoice::Fido2),
+                &touch_id,
+                &fido2,
+            ),
+            Err(AccountError::AlreadyExists { ref username, .. }) if username == "alice"
+        ));
+        assert!(
+            touch_id.auth_calls.lock().expect("auth calls").is_empty(),
+            "Touch ID provider must not be called when account already exists"
+        );
+        assert_eq!(
+            *fido2.enroll_calls.lock().expect("enroll calls"),
+            0,
+            "FIDO2 provider must not be called when account already exists"
+        );
+    }
+
+    #[test]
+    fn replace_transitions_and_preserves_original_on_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AccountStore::new(dir.path().join("accounts"));
+        let touch_id = MockTouchId::allowing();
+        let fido_ed = MockFido2 {
+            key: MockFido2Key::Ed25519([0x41; 32]),
+            flags: FIDO2_FLAG_UP | FIDO2_FLAG_UV,
+            counter: 5,
+            hash_alg: SshSigHashAlg::Sha512,
+        };
+        let fido_p256 = MockFido2 {
+            key: MockFido2Key::P256([0x42; 32]),
+            flags: FIDO2_FLAG_UP,
+            counter: 9,
+            hash_alg: SshSigHashAlg::Sha256,
+        };
+
+        // 1. Initial Touch ID enrollment.
+        let initial = store
+            .create_with(
+                CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::TouchId),
+                &touch_id,
+                &fido_ed,
+            )
+            .expect("create initial Touch ID");
+        let old_touch_account = match &initial.authenticator {
+            AuthenticatorSpec::TouchId {
+                keychain_account, ..
+            } => keychain_account.clone(),
+            other => panic!("expected TouchId, got {other:?}"),
+        };
+        assert!(
+            touch_id
+                .load_secret(TOUCH_ID_KEYCHAIN_SERVICE, &old_touch_account)
+                .is_ok()
+        );
+
+        // 2. Cancelled Touch ID replacement leaves original TOML & Keychain intact.
+        let denying_touch = MockTouchId::default();
+        let mut req = CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::TouchId);
+        req.replace = true;
+        assert!(matches!(
+            store.create_with(req, &denying_touch, &fido_ed),
+            Err(AccountError::TouchIdFailed { .. })
+        ));
+        let loaded = store.load("ops_admin").expect("original account intact");
+        assert_eq!(loaded.authenticator, initial.authenticator);
+        loaded
+            .verify_self_with(&touch_id, &fido_ed)
+            .expect("original Touch ID still verifies after failed replace");
+
+        // 3. Touch ID -> Touch ID replacement allocates a new keychain_account and deletes the old one.
+        let mut req = CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::TouchId);
+        req.replace = true;
+        let replaced_touch = store
+            .create_with(req, &touch_id, &fido_ed)
+            .expect("replace Touch ID -> Touch ID");
+        let new_touch_account = match &replaced_touch.authenticator {
+            AuthenticatorSpec::TouchId {
+                keychain_account, ..
+            } => keychain_account.clone(),
+            other => panic!("expected TouchId, got {other:?}"),
+        };
+        assert_ne!(
+            old_touch_account, new_touch_account,
+            "Touch ID replacement must use a fresh keychain_account"
+        );
+        assert!(
+            touch_id
+                .load_secret(TOUCH_ID_KEYCHAIN_SERVICE, &old_touch_account)
+                .is_err(),
+            "old Touch ID keychain secret must be deleted after replacement"
+        );
+        assert!(
+            touch_id
+                .load_secret(TOUCH_ID_KEYCHAIN_SERVICE, &new_touch_account)
+                .is_ok(),
+            "new Touch ID keychain secret must be present"
+        );
+        replaced_touch
+            .verify_self_with(&touch_id, &fido_ed)
+            .expect("replaced Touch ID verifies");
+
+        // 4. Touch ID -> FIDO2 replacement removes the old Touch ID keychain secret.
+        let mut req = CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::Fido2);
+        req.replace = true;
+        let replaced_fido = store
+            .create_with(req, &touch_id, &fido_ed)
+            .expect("replace Touch ID -> FIDO2");
+        assert!(
+            touch_id
+                .load_secret(TOUCH_ID_KEYCHAIN_SERVICE, &new_touch_account)
+                .is_err(),
+            "superseded Touch ID secret must be deleted when switching to FIDO2"
+        );
+        let handle_path = match &replaced_fido.authenticator {
+            AuthenticatorSpec::Fido2 {
+                key_handle_path, ..
+            } => key_handle_path.clone(),
+            other => panic!("expected Fido2, got {other:?}"),
+        };
+        assert!(handle_path.exists());
+        let original_handle_bytes = fs::read(&handle_path).expect("read original fido2 handle");
+        let original_toml_bytes = fs::read(store.path_for("ops_admin")).expect("read toml");
+        replaced_fido
+            .verify_self_with(&touch_id, &fido_ed)
+            .expect("FIDO2 account verifies");
+
+        // 5. Failed FIDO2 -> FIDO2 replacement must NOT clobber existing key handle or TOML.
+        let failing_fido = FailingFido2::new(true);
+        let mut req = CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::Fido2);
+        req.replace = true;
+        assert!(matches!(
+            store.create_with(req, &touch_id, &failing_fido),
+            Err(AccountError::Fido2 { .. })
+        ));
+        assert_eq!(
+            fs::read(&handle_path).expect("read handle after failed replace"),
+            original_handle_bytes,
+            "existing FIDO2 key handle must remain untouched when replacement fails"
+        );
+        assert_eq!(
+            fs::read(store.path_for("ops_admin")).expect("read toml after failed replace"),
+            original_toml_bytes,
+            "existing account TOML must remain untouched when replacement fails"
+        );
+        store
+            .load("ops_admin")
+            .expect("reload after failed FIDO2 replace")
+            .verify_self_with(&touch_id, &fido_ed)
+            .expect("original FIDO2 account still verifies");
+
+        // 6. Successful FIDO2 -> FIDO2 replacement swaps in the new key cleanly.
+        let mut req = CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::Fido2);
+        req.replace = true;
+        let replaced_fido_p256 = store
+            .create_with(req, &touch_id, &fido_p256)
+            .expect("replace FIDO2 Ed25519 -> FIDO2 P-256");
+        replaced_fido_p256
+            .verify_self_with(&touch_id, &fido_p256)
+            .expect("replaced FIDO2 P-256 account verifies");
+
+        // 7. FIDO2 -> Touch ID replacement removes old FIDO2 key handle and .pub file.
+        let mut req = CreateAccountRequest::new("ops_admin", AccountAuthenticatorChoice::TouchId);
+        req.replace = true;
+        let back_to_touch = store
+            .create_with(req, &touch_id, &fido_p256)
+            .expect("replace FIDO2 -> Touch ID");
+        assert!(
+            !handle_path.exists(),
+            "old FIDO2 key handle must be removed when switching to Touch ID"
+        );
+        assert!(
+            !append_pub_ext(&handle_path).exists(),
+            "old FIDO2 .pub file must be removed when switching to Touch ID"
+        );
+        back_to_touch
+            .verify_self_with(&touch_id, &fido_p256)
+            .expect("back-to-Touch-ID account verifies");
     }
 }

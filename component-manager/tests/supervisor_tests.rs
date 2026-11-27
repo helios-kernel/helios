@@ -230,6 +230,13 @@ struct SpawnedRecord {
     ipc: BTreeMap<String, MockIpcEnd>,
 }
 
+struct ProviderRecord {
+    slot: ProviderSlot,
+    moniker: String,
+    exit_tx: Sender<ProviderOutcome>,
+    ipc: BTreeMap<String, MockIpcEnd>,
+}
+
 type SocketTrigger = (Sender<()>, Rc<RefCell<VecDeque<Vec<u8>>>>);
 
 struct MockState {
@@ -250,7 +257,7 @@ struct MockState {
     tcp_bind_count: usize,
     vsock_bind_count: usize,
     spawned: Vec<SpawnedRecord>,
-    providers: Vec<(ProviderSlot, String, Sender<ProviderOutcome>)>,
+    providers: Vec<ProviderRecord>,
     ignore_sigterm_monikers: Vec<String>,
 }
 
@@ -471,6 +478,7 @@ impl SupervisorRuntime for MockRuntime {
         &self,
         slot: ProviderSlot,
         node: &ComponentNode,
+        ipc_channels: Vec<(String, Self::IpcEnd)>,
     ) -> Result<Self::Provider, RuntimeError> {
         let (tx, rx) = async_channel::unbounded();
         let mut st = self.state.borrow_mut();
@@ -483,7 +491,13 @@ impl SupervisorRuntime for MockRuntime {
         } else {
             None
         };
-        st.providers.push((slot, node.moniker.to_string(), tx));
+        let ipc: BTreeMap<String, MockIpcEnd> = ipc_channels.into_iter().collect();
+        st.providers.push(ProviderRecord {
+            slot,
+            moniker: node.moniker.to_string(),
+            exit_tx: tx,
+            ipc,
+        });
         Ok(MockProvider {
             id,
             exit_rx: rx,
@@ -1522,9 +1536,9 @@ fn boot_with_pre_ready_hook_installs_providers_before_hook_and_services_after() 
         .borrow()
         .providers
         .iter()
-        .find(|(slot, _, _)| *slot == ProviderSlot::Surface)
+        .find(|p| p.slot == ProviderSlot::Surface)
         .unwrap()
-        .2
+        .exit_tx
         .clone();
     exit_tx.try_send(ProviderOutcome::Exited).unwrap();
     tasks.run_to_completion(sup.step_once()).unwrap(); // ProviderExited -> schedules restart
@@ -1535,7 +1549,7 @@ fn boot_with_pre_ready_hook_installs_providers_before_hook_and_services_after() 
             .borrow()
             .providers
             .iter()
-            .filter(|(slot, _, _)| *slot == ProviderSlot::Surface)
+            .filter(|p| p.slot == ProviderSlot::Surface)
             .count(),
         2
     );
@@ -2207,4 +2221,244 @@ fn has_active_work_stays_true_for_lazy_providers_and_lazy_ipc_routes() {
     );
     tasks2.run_to_completion(sup2.shutdown_all());
     assert!(!sup2.has_active_work());
+}
+
+#[test]
+fn surface_provider_ipc_bridges_survive_fault_and_restart_without_stranding_consumers() {
+    let mut root = base_node("/", None, RunnerSpec::Realm);
+    root.children_indices = Cow::Borrowed(&[1, 2, 3]);
+    root.oom_tier = OomTier::Protected;
+    root.capabilities = full_root_ceiling();
+
+    // 1. Ordinary helper service exposed to the surface provider via `[[use]]`.
+    let mut telemetry = base_node(
+        "/svc/telemetry",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/telemetry"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    telemetry.startup = StartupPolicy::Eager;
+    telemetry.exposes = Cow::Borrowed(&[ExposeSpec {
+        interface: Cow::Borrowed("helios:system/telemetry"),
+        channel: Cow::Borrowed("telemetry-srv"),
+    }]);
+
+    // 2. Singleton `ProviderSlot::Surface` provider exposing `console-session` AND
+    //    consuming `telemetry` over supervisor-routed IPC channels.
+    let mut compositor = base_node(
+        "/compositor",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/compositor"),
+            sharding: WasmSharding::Singleton,
+            provider: Some(ProviderSlot::Surface),
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    compositor.startup = StartupPolicy::Eager;
+    compositor.restart = RestartPolicy::Always;
+    compositor.restart_backoff_ms = 10;
+    compositor.exposes = Cow::Borrowed(&[ExposeSpec {
+        interface: Cow::Borrowed("helios:system/console-session"),
+        channel: Cow::Borrowed("console-srv"),
+    }]);
+    compositor.capabilities.wit_interfaces =
+        NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed("helios:system/telemetry")]));
+    compositor.routes = Cow::Borrowed(&[RouteSpec {
+        interface: Cow::Borrowed("helios:system/telemetry"),
+        provider_index: 1,
+        provider_moniker: Cow::Borrowed("/svc/telemetry"),
+        provider_channel: Cow::Borrowed("telemetry-srv"),
+        consumer_channel: Cow::Borrowed("telemetry-cli"),
+    }]);
+
+    // 3. Ordinary wasm consumer connecting to `/compositor`'s exposed IPC channel.
+    let mut console_session = base_node(
+        "/console-session",
+        Some(0),
+        RunnerSpec::Wasm(WasmRunnerSpec {
+            program: Cow::Borrowed("/bin/console-session"),
+            sharding: WasmSharding::Singleton,
+            provider: None,
+            args: Cow::Borrowed(&[]),
+            env: Cow::Borrowed(&[]),
+            cwd: None,
+            optional: false,
+        }),
+    );
+    console_session.startup = StartupPolicy::Eager;
+    console_session.capabilities.wit_interfaces =
+        NameCeiling::Set(Cow::Borrowed(&[Cow::Borrowed(
+            "helios:system/console-session",
+        )]));
+    console_session.routes = Cow::Borrowed(&[RouteSpec {
+        interface: Cow::Borrowed("helios:system/console-session"),
+        provider_index: 2,
+        provider_moniker: Cow::Borrowed("/compositor"),
+        provider_channel: Cow::Borrowed("console-srv"),
+        consumer_channel: Cow::Borrowed("console-cli"),
+    }]);
+
+    let rt = MockRuntime::new(HardwareInventorySnapshot::default());
+    let tasks = rt.tasks.clone();
+    let mut sup = Supervisor::new(
+        rt.clone(),
+        ComponentTopology {
+            nodes: Cow::Owned(vec![root, telemetry, compositor, console_session]),
+        },
+    )
+    .expect("valid topology");
+
+    tasks.run_to_completion(sup.boot()).expect("boot");
+    assert_eq!(sup.status_of("/compositor"), Some(ComponentStatus::Running));
+    assert_eq!(
+        sup.status_of("/console-session"),
+        Some(ComponentStatus::Running)
+    );
+    assert_eq!(
+        sup.status_of("/svc/telemetry"),
+        Some(ComponentStatus::Running)
+    );
+
+    // Verify generation 1 of `/compositor` received both its exposed and consumed IPC ends.
+    let (gen1_exit_tx, gen1_console_srv, gen1_telemetry_cli) = {
+        let st = rt.state.borrow();
+        let rec = st
+            .providers
+            .iter()
+            .find(|p| p.slot == ProviderSlot::Surface && p.moniker == "/compositor")
+            .expect("surface provider installed");
+        (
+            rec.exit_tx.clone(),
+            rec.ipc
+                .get("console-srv")
+                .expect("surface provider received exposed console-srv end")
+                .clone(),
+            rec.ipc
+                .get("telemetry-cli")
+                .expect("surface provider received consumer telemetry-cli end")
+                .clone(),
+        )
+    };
+    let consumer_ep = {
+        let idx = rt.last_spawned_for("/console-session");
+        rt.state.borrow().spawned[idx]
+            .ipc
+            .get("console-cli")
+            .expect("consumer received console-cli end")
+            .clone()
+    };
+    let telemetry_srv = {
+        let idx = rt.last_spawned_for("/svc/telemetry");
+        rt.state.borrow().spawned[idx]
+            .ipc
+            .get("telemetry-srv")
+            .expect("telemetry service received telemetry-srv end")
+            .clone()
+    };
+
+    // Bidirectional IPC: `/console-session` <-> `/compositor` (gen 1).
+    tasks
+        .run_to_completion(consumer_ep.write(b"hello-gen1".to_vec()))
+        .expect("consumer write gen1");
+    let req1 = tasks
+        .run_to_completion(gen1_console_srv.read(64))
+        .expect("surface read gen1")
+        .expect("non-eof");
+    assert_eq!(req1, b"hello-gen1");
+    tasks
+        .run_to_completion(gen1_console_srv.write(b"ack-gen1".to_vec()))
+        .expect("surface reply gen1");
+    let resp1 = tasks
+        .run_to_completion(consumer_ep.read(64))
+        .expect("consumer read gen1")
+        .expect("non-eof");
+    assert_eq!(resp1, b"ack-gen1");
+
+    // Outbound IPC: `/compositor` (gen 1) -> `/svc/telemetry`.
+    tasks
+        .run_to_completion(gen1_telemetry_cli.write(b"metric-1".to_vec()))
+        .expect("surface write telemetry");
+    let metric1 = tasks
+        .run_to_completion(telemetry_srv.read(64))
+        .expect("telemetry read")
+        .expect("non-eof");
+    assert_eq!(metric1, b"metric-1");
+
+    // Fault generation 1 of `/compositor` and close its old IPC write end (simulating store drop).
+    gen1_exit_tx
+        .try_send(ProviderOutcome::Faulted("compositor trapped".to_owned()))
+        .expect("send fault");
+    tasks.run_to_completion(sup.step_once()).unwrap(); // ProviderExited -> detaches bridge + schedules restart
+
+    // Consumer sends a frame while `/compositor` is restarting; bridge must buffer it cleanly.
+    tasks
+        .run_to_completion(consumer_ep.write(b"queued-during-restart".to_vec()))
+        .expect("consumer write during restart");
+
+    // Restart timer fires and installs generation 2 of `/compositor`.
+    tasks.run_to_completion(sup.step_once()).unwrap(); // RestartTimerFired -> installs gen 2
+    assert_eq!(sup.restarts_of("/compositor"), Some(1));
+    assert_eq!(sup.status_of("/compositor"), Some(ComponentStatus::Running));
+
+    // Close dead gen 1 endpoint *after* gen 2 is attached to verify a late
+    // `ProviderClosed { generation: 1 }` never clears gen 2's active bridge!
+    gen1_console_srv.close_write();
+    drop(gen1_console_srv);
+    tasks.pump();
+
+    let gen2_console_srv = {
+        let st = rt.state.borrow();
+        assert_eq!(
+            st.providers
+                .iter()
+                .filter(|p| p.slot == ProviderSlot::Surface)
+                .count(),
+            2
+        );
+        st.providers
+            .last()
+            .expect("gen2 provider record")
+            .ipc
+            .get("console-srv")
+            .expect("gen2 surface provider received console-srv end")
+            .clone()
+    };
+
+    // Queued frame from before restart arrives on gen 2, and subsequent round-trips work!
+    let queued = tasks
+        .run_to_completion(gen2_console_srv.read(64))
+        .expect("gen2 read queued")
+        .expect("non-eof");
+    assert_eq!(queued, b"queued-during-restart");
+    tasks
+        .run_to_completion(gen2_console_srv.write(b"ack-gen2".to_vec()))
+        .expect("gen2 reply");
+    let resp2 = tasks
+        .run_to_completion(consumer_ep.read(64))
+        .expect("consumer read gen2")
+        .expect("non-eof");
+    assert_eq!(resp2, b"ack-gen2");
+
+    // Verify follow-up traffic continues flowing cleanly on gen 2.
+    tasks
+        .run_to_completion(consumer_ep.write(b"after-late-close".to_vec()))
+        .expect("consumer write after late close");
+    let req3 = tasks
+        .run_to_completion(gen2_console_srv.read(64))
+        .expect("gen2 read follow-up")
+        .expect("non-eof");
+    assert_eq!(req3, b"after-late-close");
+
+    tasks.run_to_completion(sup.shutdown_all());
 }

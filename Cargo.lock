@@ -3161,6 +3161,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "clap",
+ "console",
  "directories",
  "ed25519-dalek",
  "fatfs",
@@ -3173,6 +3174,7 @@ dependencies = [
  "helios-workspace-root",
  "mbrman",
  "object 0.39.1",
+ "png",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -3268,6 +3270,21 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "noto-sans-mono-bitmap",
+ "postcard",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "helios-console-session"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "futures-lite",
+ "helios-api",
+ "helios-compositor-render",
+ "helios-inspector-protocol",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3591,6 +3608,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "lru 0.16.4",
+ "noto-sans-mono-bitmap",
  "nu-ansi-term",
  "objectpool",
  "pin-project-lite",

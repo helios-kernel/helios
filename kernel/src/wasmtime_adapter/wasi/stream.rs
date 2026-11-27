@@ -162,11 +162,12 @@ where
                     state.cpu.clone(),
                     state.runtime_state.clone(),
                     state.serial_writer(),
+                    state.serial_trace_mirror(self.stream),
                 )),
                 crate::ComponentOutputSink::Child(_) => None,
             }
         };
-        if let Some((sink, cpu, runtime, writer)) = local_output {
+        if let Some((sink, cpu, runtime, writer, line_mirror)) = local_output {
             if finish {
                 return Poll::Ready(Ok(StreamResult::Cancelled));
             }
@@ -181,7 +182,8 @@ where
                 if bytes.is_empty() {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let written = sink.write(&cpu, &runtime, writer, bytes);
+                let written =
+                    sink.write_mirrored(&cpu, &runtime, writer, line_mirror.as_ref(), bytes);
                 source.mark_read(written);
                 if source.remaining()?.is_empty() {
                     return Poll::Ready(Ok(StreamResult::Completed));

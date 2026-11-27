@@ -283,12 +283,37 @@ impl Terminal {
         }
     }
 
+    /// Scrolls the viewport to the oldest retained scrollback line.
+    pub fn scroll_to_top(&mut self) {
+        let max = self.scrollback();
+        if self.scroll_offset != max {
+            self.scroll_offset = max;
+            self.dirty_all();
+        }
+    }
+
     /// Returns the viewport to the live bottom (`scroll_offset = 0`).
     pub fn scroll_to_bottom(&mut self) {
         if self.scroll_offset != 0 {
             self.scroll_offset = 0;
             self.dirty_all();
         }
+    }
+
+    /// Clears all lines, scrollback, pending UTF-8 bytes, and escape state.
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.lines.push_back(Line::new());
+        self.column = 0;
+        self.scroll_offset = 0;
+        self.escape = Escape::None;
+        self.csi_len = 0;
+        self.csi_current = 0;
+        self.csi_has_digits = false;
+        self.csi_private = false;
+        self.style = Style::default();
+        self.pending.clear();
+        self.dirty_all();
     }
 
     /// Where the cursor is on screen, as a `(column, row)` cell.
