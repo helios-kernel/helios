@@ -135,6 +135,7 @@ pub(crate) use helios_ops::transport::{RpcReader, RpcWriter};
 pub(crate) struct RpcClient {
     client: helios_wit_rpc::PeerHandle,
     driver: std::sync::Arc<crate::frame_reader::FrameReader>,
+    server_machine_public_key: Option<[u8; 32]>,
 }
 
 impl RpcClient {
@@ -143,6 +144,7 @@ impl RpcClient {
         Ok(Self {
             client,
             driver: std::sync::Arc::new(driver),
+            server_machine_public_key: None,
         })
     }
 
@@ -155,7 +157,7 @@ impl RpcClient {
         identity: &helios_inspector_protocol::auth::ClientIdentity,
         expected_machine_public_key: Option<[u8; 32]>,
     ) -> Result<Self, AuthConnectError> {
-        let _accepted = helios_inspector_protocol::auth::client_handshake(
+        let (hello, _, _) = helios_inspector_protocol::auth::client_handshake(
             &mut read,
             &mut write,
             transport,
@@ -165,7 +167,15 @@ impl RpcClient {
             None,
         )
         .await?;
-        Ok(Self::new(read, write)?)
+        let mut client = Self::new(read, write)?;
+        client.server_machine_public_key = Some(hello.machine_public_key);
+        Ok(client)
+    }
+
+    /// Returns the authenticated guest's `MachineIdentity` Ed25519 public key
+    /// observed in `ServerHello`, if this client completed an authenticated handshake.
+    pub(crate) const fn server_public_key(&self) -> Option<[u8; 32]> {
+        self.server_machine_public_key
     }
 
     /// Cheaply clone the underlying `helios-wit-rpc` peer handle.

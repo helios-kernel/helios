@@ -140,7 +140,7 @@ world input-host {
 /// calls into it are concurrent inside one instance.
 world compositor {
   include wasi:cli/imports@0.3.0;
-  import helios:system/programs@0.1.0;
+  import helios:system/ipc@0.1.0;
   import helios:system/display@0.1.0;
   import helios:system/input@0.1.0;
   import helios:system/inspect@0.1.0;

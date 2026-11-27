@@ -89,7 +89,7 @@ clippy-host:
         --features helios-webgpu/runtime --features helios-btrfs/write \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
-        --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
+        --exclude helios-audio-test --exclude helios-compositor --exclude helios-console-session --exclude helios-cpu \
         --exclude helios-date --exclude helios-display-test \
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
@@ -113,7 +113,7 @@ clippy-programs:
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
-    for package in helios-audio-test helios-compositor helios-cpu helios-date helios-display-test helios-gpu-test \
+    for package in helios-audio-test helios-compositor helios-console-session helios-cpu helios-date helios-display-test helios-gpu-test \
         helios-http-client \
         helios-init helios-input-test helios-inspector-host helios-inspector-tls helios-inspector-worker \
         helios-nu-shell helios-oob-load helios-perf helios-ping helios-pride-flag \

@@ -56,13 +56,17 @@ compile_error!(
     feature = "ipc",
     any(
         feature = "http-handler",
-        feature = "compositor",
         feature = "webgpu",
         feature = "webgpu-provider"
     )
 ))]
 compile_error!(
-    "`ipc` is part of the `init` and `root-supervisor` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+    "`ipc` is part of the `init`, `root-supervisor` and `compositor` worlds; `http-handler`, `webgpu` and `webgpu-provider` do not import it"
+);
+
+#[cfg(all(feature = "programs", feature = "compositor"))]
+compile_error!(
+    "`programs` is not imported by the `compositor` world; route terminal sessions over `ipc`"
 );
 
 #[cfg(all(

@@ -81,6 +81,14 @@ pub(crate) struct ImageBuildArgs {
     #[arg(long, value_name = "PATH", env = "HELIOS_ROOT_SECRET_KEY")]
     pub root_secret_key: Option<PathBuf>,
 
+    /// Pre-encoded postcard `AccountPolicy` staged at `/etc/helios/accounts.postcard`.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ACCOUNTS_POLICY")]
+    pub accounts_policy: Option<PathBuf>,
+
+    /// Stage `/etc/helios/console-shell` so VT2 boots directly into an interactive shell.
+    #[arg(long, default_value_t = false)]
+    pub console_shell: bool,
+
     /// Optional artifact cache directory.
     #[arg(long, value_name = "DIR", env = "HELIOS_ARTIFACT_CACHE")]
     pub cache_dir: Option<PathBuf>,
@@ -153,6 +161,13 @@ pub(crate) fn build_cli_args(args: &ImageBuildArgs) -> Vec<String> {
     if let Some(key) = &args.root_secret_key {
         out.push("--root-secret-key".to_owned());
         out.push(key.display().to_string());
+    }
+    if let Some(accounts) = &args.accounts_policy {
+        out.push("--accounts-policy".to_owned());
+        out.push(accounts.display().to_string());
+    }
+    if args.console_shell {
+        out.push("--console-shell".to_owned());
     }
     if let Some(cache_dir) = &args.cache_dir {
         out.push("--cache-dir".to_owned());
