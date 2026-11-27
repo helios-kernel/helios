@@ -481,7 +481,7 @@ jobs:
     if: needs.changes.outputs.wasi_artifacts == 'true'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 15
     permissions:
       contents: read
@@ -541,7 +541,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug') }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 15
     permissions:
       contents: read
@@ -630,7 +630,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release') }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 35
     permissions:
       contents: read
@@ -648,7 +648,7 @@ jobs:
     if: needs.changes.outputs.checks_no_cli != '[]'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 15
     permissions:
       contents: read
@@ -688,7 +688,7 @@ jobs:
     runs-on: ubuntu-24.04
     # `test-libraries` runs `just test-btrfs-mkfs` which uses `sudo mount -o loop`.
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
       options: --privileged
     timeout-minutes: 15
     permissions:
@@ -768,7 +768,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && needs.changes.outputs.tests != '[]' }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 15
     permissions:
       contents: read
@@ -790,7 +790,9 @@ jobs:
     name: smoke-riscv64
     needs: [changes, build-helios-cli-x64, wasm-release, wasi-artifacts]
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli-x64.result == 'success' && needs.wasm-release.result == 'success' && needs.wasi-artifacts.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64') }}
-    runs-on: ubuntu-24.04
+    # Ubuntu 26.04 ships QEMU 10.2, whose RISC-V `virt` machine implements the
+    # `virtio-iommu-pci` hotplug handler (Ubuntu 24.04's QEMU 8.2 refuses it).
+    runs-on: ubuntu-26.04
     timeout-minutes: 40
     # `actions: read` is what the prebuilt-wasm action lists the run's
     # artifacts and jobs with.
@@ -803,6 +805,8 @@ jobs:
       # inspector starts it, finds and keeps the `cwasm` it precompiles
       # (#1022). It is set for the job because no prebuild is named here.
       HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
+      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
     steps:
       - uses: actions/checkout@v4
         with:
@@ -841,6 +845,31 @@ jobs:
             qemu-system-misc opensbi swtpm
       - name: Record QEMU version
         run: qemu-system-riscv64 --version
+      - name: Stage Limine bootloader share
+        run: |
+          # Limine publishes its prebuilt bootloader as a release asset;
+          # the digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Stage TPM2-enabled RISC-V EDK2 firmware
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/edk2-riscv64"
+          mkdir -p "$dest"
+          cid="$(docker create ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585)"
+          trap 'docker rm -f "$cid" >/dev/null' EXIT
+          docker cp "$cid:/usr/share/helios-edk2-riscv64/RISCV_VIRT_CODE.fd" "$dest/RISCV_VIRT_CODE.fd"
+          docker cp "$cid:/usr/share/helios-edk2-riscv64/RISCV_VIRT_VARS.fd" "$dest/RISCV_VIRT_VARS.fd"
+          test -s "$dest/RISCV_VIRT_CODE.fd"
+          test -s "$dest/RISCV_VIRT_VARS.fd"
+          echo "HELIOS_EDK2_RISCV64_CODE=$dest/RISCV_VIRT_CODE.fd" >> "$GITHUB_ENV"
       - name: Download WASI tooling artifacts
         uses: actions/download-artifact@v4
         with:
@@ -1119,31 +1148,72 @@ jobs:
           python3 tools/wasi-apps/tls-smoke.py --arch riscv64 --accel tcg \
             --runtime-dir "$GITHUB_WORKSPACE/smoke-runtime/curl-https"
       - uses: ./helios/.github/actions/swtpm
-      # OpenSBI / QEMU does not supply a TCG firmware event log on riscv64 yet
-      # (#1292), so `tpm/src/boot.rs` refuses to qualify the TPM (`NoEventLog`)
-      # and hibernate must return `NoAuthenticationKey` cleanly rather than
-      # writing an unauthenticated image.
-      - name: Refuse hibernate on riscv64 without firmware TPM event log
-        timeout-minutes: 15
+      # Under QEMU's RISC-V device-tree boot, Limine measures the kernel and
+      # device tree into PCR 9 (`0x210`), and QEMU's fresh `/chosen/rng-seed`
+      # changes PCR 9 on every boot (#602, #1292), so the second boot against
+      # the same TPM state must detect `state-changed` and derive a distinct
+      # compiler-signing key.
+      - name: Detect changed state across measured device-tree boots
+        timeout-minutes: 20
         shell: bash
         working-directory: helios
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
           set -o pipefail
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/hibernate-refusal"
-          mkdir -p "$runtime"
-          if ./target/release/helios vm --arch riscv64 --release --memory 2G \
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-riscv64-dt"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            mkdir -p "$runtime"
+            ./target/release/helios vm --arch riscv64 --release --memory 2G \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir \
+              --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
+              shell --shell /bin/dash -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot dt-1
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot dt-2
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-2/debug-serial.log" provisioned-and-sealed state-changed)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" != "$second"
+      # Under QEMU's device-tree boot, fresh `/chosen/rng-seed` changes PCR 9
+      # on every boot (#602, #1292), so Boot 1 writes an authenticated
+      # hibernate image and powers off cleanly, and Boot 2 cannot unseal its
+      # hibernate authentication key and must refuse resume.
+      - name: Verify riscv64 device-tree hibernate refusal under #602 sealing policy
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -euo pipefail
+          dt_dir="$GITHUB_WORKSPACE/smoke-runtime-measured/hibernate-riscv64-dt"
+          rm -rf "$dt_dir"
+          mkdir -p "$dt_dir"
+          ./target/release/helios vm --arch riscv64 --release --memory 2G \
             --accel tcg --tpm swtpm --hibernate-disk-size 256M \
-            --runtime-dir "$runtime" --keep-runtime-dir \
+            --runtime-dir "$dt_dir" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
-            hibernate > "$runtime/hibernate.out" 2> "$runtime/inspector.log"; then
-            echo 'expected riscv64 hibernate to fail with NoAuthenticationKey (#1292)'
+            hibernate --power-off-timeout-seconds 180 \
+            2>&1 | tee "$dt_dir/inspector.hibernate.log"
+          if ./target/release/helios vm --resume "$dt_dir" \
+            shell --shell /bin/dash -c 'echo should-not-resume' \
+            > "$dt_dir/resume.out" 2> "$dt_dir/inspector.resume.log"; then
+            echo 'expected riscv64 device-tree --resume to fail under #602 PCR 9 sealing policy'
             exit 1
           fi
-          cat "$runtime/inspector.log"
-          grep -F 'NoAuthenticationKey' "$runtime/inspector.log"
+          cat "$dt_dir/inspector.resume.log"
+          grep -aF 'hibernate image refused' "$dt_dir/debug-serial.log"
+          if grep -aF 'resumed from hibernate image' "$dt_dir/debug-serial.log"; then
+            echo 'unexpected resume on riscv64 device-tree boot'
+            exit 1
+          fi
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1156,6 +1226,7 @@ jobs:
           # also holds are deliberately not collected.
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`
@@ -1170,8 +1241,9 @@ jobs:
         working-directory: helios
         run: ./target/release/helios vm --arch riscv64 --release build
       # Stage the prebuilt kernel (`helios-kernel-riscv64-release`) and full
-      # bootable image (`helios-image-riscv64-release`) with typed manifests
-      # (#1218). Neither carries any root secret key.
+      # bootable image (`helios-image-riscv64-release`, including `kernel.uefi.img`
+      # and `compiler_plugin.wasm`) with typed manifests (#1218). Neither
+      # carries any root secret key.
       - name: Stage prebuilt kernel and image artifacts
         id: stage-prebuilt
         if: always() && steps.guest-image.outcome == 'success'
@@ -1190,7 +1262,8 @@ jobs:
             --root-public-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-root-public.key \
             --bootfs target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
             --compiler-plugin target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/compiler_plugin.wasm \
-            --inspector-client-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-inspector-client-secret.key
+            --inspector-client-key target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-inspector-client-secret.key \
+            --build-uefi-image
       - name: Upload the prebuilt kernel
         if: always() && steps.stage-prebuilt.outcome == 'success'
         uses: actions/upload-artifact@v4
@@ -4342,7 +4415,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-x64.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 15
     permissions:
       contents: read
@@ -4579,7 +4652,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli-arm64.result == 'success' }}
     runs-on: ubuntu-24.04-arm
     container:
-      image: ghcr.io/helios-kernel/helios-ci:38a8eb115b6780e8c1615466bfc90cdb3f6c5b7d86f9e2985406a8341573cc62
+      image: ghcr.io/helios-kernel/helios-ci:b2def4a62c879ab7cc3a7073beaa11e4f288e27b4b1e79ecf373c078099b1585
     timeout-minutes: 15
     permissions:
       contents: read
