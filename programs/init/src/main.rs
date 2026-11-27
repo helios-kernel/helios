@@ -531,7 +531,11 @@ impl SupervisorRuntime for HeliosRuntime {
                     grants.push(programs::ipc_grant(name, endpoint));
                 }
                 let child = root_supervisor::spawn(ManagedSpawnRequest {
-                    name: args.node.instance_name.to_string(),
+                    // `ManagedSpawnRequest::name` becomes `argv[0]`; pass the
+                    // executable path so multicall POSIX/WASIX binaries (such
+                    // as `coreutils` at `/bin/cat` and `/bin/ls`) dispatch on
+                    // their applet basename rather than the component name.
+                    name: exec.program.to_string(),
                     args: exec.args.iter().map(|s| s.to_string()).collect(),
                     env: exec
                         .env
