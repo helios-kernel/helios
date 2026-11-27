@@ -91,7 +91,7 @@ const ERR_SEC_AUTH_FAILED: i32 = -25293;
 // `errSecInvalidOwnerEdit = -25244` from `Security.framework/Headers/SecBase.h`.
 const ERR_SEC_INVALID_OWNER_EDIT: i32 = -25244;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 // `errSecItemNotFound = -25300` from `Security.framework/Headers/SecBase.h`.
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
