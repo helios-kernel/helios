@@ -11,14 +11,15 @@ use helios_hal::cpu::{BspSnapshotContext, Cpu, ResumeHandoff, SnapshotPoint};
 use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::pmm::{PhysFrame, PhysFrameRange};
 use helios_hal::watchdog::Watchdog;
+use lz4_flex::block::{
+    CompressError, CompressTable, compress_into_with_table, get_maximum_output_size,
+};
 use sha2::{Digest, Sha256};
-use zrip::{CompressContext, CompressError};
 
 use super::HibernateError;
 use super::format::{
-    CHUNK_DESCRIPTOR_BYTES, ChunkDescriptor, DEFAULT_CHUNK_FRAMES,
-    DEFAULT_HIBERNATE_COMPRESSION_LEVEL, FORMAT_VERSION, HEADER_BYTES, HibernateHeader,
-    HibernateIdentity,
+    CHUNK_DESCRIPTOR_BYTES, ChunkDescriptor, DEFAULT_CHUNK_FRAMES, FORMAT_VERSION, HEADER_BYTES,
+    HibernateHeader, HibernateIdentity,
 };
 use crate::memory::{BalloonHandle, HibernateReservation, UserMemoryPool};
 use crate::{FrozenMachine, HibernateAuthKey, Kernel, kernel_heap_regions};
@@ -353,16 +354,91 @@ pub fn normalize_physical_runs(included: &[Range<u64>], excluded: &[Range<u64>])
     out
 }
 
-/// Pre-freeze scratch arena size (8 MiB) reserved from `user_pool` and excluded
-/// from the snapshot so [`encode_snapshot`] and `zrip` allocate strictly
-/// outside the main kernel heap while live RAM is being read.
-pub const HIBERNATE_ENCODE_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Counts the exact number of compressed chunks required to encode `frame_runs`
+/// at `chunk_frames` frames per chunk.
+pub fn count_snapshot_chunks(frame_runs: &[FrameRun], chunk_frames: u32) -> usize {
+    if chunk_frames == 0 {
+        return 0;
+    }
+    let chunk_frames = u64::from(chunk_frames);
+    frame_runs
+        .iter()
+        .filter(|run| run.frame_count > 0)
+        .map(|run| run.frame_count.div_ceil(chunk_frames) as usize)
+        .sum()
+}
 
-/// Parameters controlling snapshot compression and chunking.
+/// Pre-allocated working buffers and LZ4 hash table for zero-allocation
+/// hibernate snapshot encoding after [`Cpu::capture_bsp_state`].
+pub struct SnapshotEncodeScratch {
+    raw_buf: Vec<u8>,
+    comp_buf: Vec<u8>,
+    table: Box<CompressTable>,
+    descriptors: Vec<ChunkDescriptor>,
+    chunk_frames: u32,
+}
+
+impl SnapshotEncodeScratch {
+    /// Pre-allocates all working memory needed to encode `frame_runs` at
+    /// `chunk_frames` frames per chunk so [`encode_snapshot_with_scratch`]
+    /// performs zero heap allocations, reallocations, or deallocations.
+    pub fn for_runs(frame_runs: &[FrameRun], chunk_frames: u32) -> Result<Self, HibernateError> {
+        if chunk_frames == 0 {
+            return Err(HibernateError::InvalidHeaderField {
+                reason: "chunk_frames must be non-zero",
+            });
+        }
+        let max_chunk_bytes = (chunk_frames as usize).checked_mul(PhysFrame::SIZE).ok_or(
+            HibernateError::InvalidHeaderField {
+                reason: "chunk_frames overflows chunk byte size",
+            },
+        )?;
+        let chunk_count = count_snapshot_chunks(frame_runs, chunk_frames);
+        Ok(Self {
+            raw_buf: vec![0_u8; max_chunk_bytes],
+            comp_buf: vec![0_u8; get_maximum_output_size(max_chunk_bytes)],
+            table: Box::new(CompressTable::large()),
+            descriptors: Vec::with_capacity(chunk_count),
+            chunk_frames,
+        })
+    }
+
+    /// Ensures `descriptors` has enough capacity for `frame_runs` without
+    /// reallocating during [`encode_snapshot_with_scratch`].
+    pub fn reserve_for_runs(&mut self, frame_runs: &[FrameRun]) {
+        let needed = count_snapshot_chunks(frame_runs, self.chunk_frames);
+        if self.descriptors.capacity() < needed {
+            self.descriptors.clear();
+            self.descriptors.reserve_exact(needed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_ptrs_and_caps(
+        &self,
+    ) -> (
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const ChunkDescriptor,
+        usize,
+    ) {
+        (
+            self.raw_buf.as_ptr(),
+            self.raw_buf.capacity(),
+            self.comp_buf.as_ptr(),
+            self.comp_buf.capacity(),
+            self.descriptors.as_ptr(),
+            self.descriptors.capacity(),
+        )
+    }
+}
+
+/// Parameters controlling snapshot chunking and image identity.
 #[derive(Clone, Copy, Debug)]
 pub struct SnapshotConfig {
     pub chunk_frames: u32,
-    pub compression_level: i32,
     pub image_id: [u8; 16],
 }
 
@@ -370,13 +446,12 @@ impl SnapshotConfig {
     pub const fn new(image_id: [u8; 16]) -> Self {
         Self {
             chunk_frames: DEFAULT_CHUNK_FRAMES,
-            compression_level: DEFAULT_HIBERNATE_COMPRESSION_LEVEL,
             image_id,
         }
     }
 }
 
-/// Inputs to [`encode_snapshot`].
+/// Inputs to [`encode_snapshot`] and [`encode_snapshot_with_scratch`].
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeParams<'a> {
     pub auth_key: Option<&'a HibernateAuthKey>,
@@ -386,15 +461,17 @@ pub struct EncodeParams<'a> {
     pub config: SnapshotConfig,
 }
 
-/// Encodes a verified, compressed hibernate image from `frame_runs` into
-/// `sink`, reading frame contents through `read_frame`.
+/// Encodes a verified, LZ4-compressed hibernate image from `frame_runs` into
+/// `sink` using caller-supplied pre-allocated `scratch`, performing strictly
+/// zero heap allocations, reallocations, or deallocations.
 ///
 /// Refuses immediately with [`HibernateError::NoAuthenticationKey`] when
 /// `params.auth_key` is `None`. Calls `pet_watchdog` once per compressed
 /// chunk so large snapshots never trip the hardware watchdog while frozen.
-pub fn encode_snapshot<Sink, ReadFrame, PetWatchdog>(
+pub fn encode_snapshot_with_scratch<Sink, ReadFrame, PetWatchdog>(
     params: EncodeParams<'_>,
     frame_runs: &[FrameRun],
+    scratch: &mut SnapshotEncodeScratch,
     sink: &mut Sink,
     mut read_frame: ReadFrame,
     mut pet_watchdog: PetWatchdog,
@@ -417,20 +494,25 @@ where
             reason: "chunk_frames must be non-zero",
         });
     }
-
-    let max_chunk_bytes = (config.chunk_frames as usize) * PhysFrame::SIZE;
-    let mut raw_buf = vec![0_u8; max_chunk_bytes];
-    let mut comp_buf = vec![0_u8; zrip::compress_bound(max_chunk_bytes)];
-    let mut compressor = CompressContext::new(config.compression_level).map_err(|_| {
-        HibernateError::CompressFailed {
-            chunk_index: 0,
-            detail: "invalid zstd compression level",
-        }
-    })?;
+    let max_chunk_bytes = (config.chunk_frames as usize)
+        .checked_mul(PhysFrame::SIZE)
+        .ok_or(HibernateError::InvalidHeaderField {
+            reason: "chunk_frames overflows chunk byte size",
+        })?;
+    let needed_chunks = count_snapshot_chunks(frame_runs, config.chunk_frames);
+    if scratch.chunk_frames != config.chunk_frames
+        || scratch.raw_buf.len() < max_chunk_bytes
+        || scratch.comp_buf.len() < get_maximum_output_size(max_chunk_bytes)
+        || scratch.descriptors.capacity() < needed_chunks
+    {
+        return Err(HibernateError::InvalidHeaderField {
+            reason: "pre-allocated snapshot encode scratch does not cover frame runs",
+        });
+    }
 
     sink.reserve_header()?;
 
-    let mut descriptors = Vec::new();
+    scratch.descriptors.clear();
     let mut total_frames = 0_u64;
     let mut payload_bytes = 0_u64;
 
@@ -459,30 +541,34 @@ where
             let uncompressed_len = (chunk_frames as usize) * PhysFrame::SIZE;
 
             for i in 0..chunk_frames as usize {
-                let dst: &mut [u8; PhysFrame::SIZE] = (&mut raw_buf
+                let dst: &mut [u8; PhysFrame::SIZE] = (&mut scratch.raw_buf
                     [i * PhysFrame::SIZE..(i + 1) * PhysFrame::SIZE])
                     .try_into()
                     .unwrap();
                 read_frame(start_frame + i as u64, dst);
             }
 
-            let chunk_index = descriptors.len() as u32;
-            let compressed_len = compressor
-                .compress_into(&raw_buf[..uncompressed_len], &mut comp_buf)
-                .map_err(|err| HibernateError::CompressFailed {
-                    chunk_index,
-                    detail: match err {
-                        CompressError::OutputTooSmall => "compression bound exceeded",
-                        _ => "zstd encoder error",
-                    },
-                })?;
+            let chunk_index = scratch.descriptors.len() as u32;
+            let compressed_len = compress_into_with_table(
+                &scratch.raw_buf[..uncompressed_len],
+                &mut scratch.comp_buf,
+                &mut scratch.table,
+            )
+            .map_err(|err| HibernateError::CompressFailed {
+                chunk_index,
+                detail: match err {
+                    CompressError::OutputTooSmall => "compression bound exceeded",
+                    _ => "lz4 encoder error",
+                },
+            })?;
 
-            let compressed_slice = &comp_buf[..compressed_len];
+            let compressed_slice = &scratch.comp_buf[..compressed_len];
             let chunk_sha256: [u8; 32] = Sha256::digest(compressed_slice).into();
             let data_offset = sink.written_bytes() as u64;
             sink.append(compressed_slice)?;
 
-            descriptors.push(ChunkDescriptor {
+            debug_assert!(scratch.descriptors.len() < scratch.descriptors.capacity());
+            scratch.descriptors.push(ChunkDescriptor {
                 start_phys_frame: start_frame,
                 frame_count: chunk_frames,
                 compressed_len: compressed_len as u32,
@@ -501,13 +587,13 @@ where
     // Stream chunk descriptor table after compressed payloads and hash it.
     let chunk_table_offset = sink.written_bytes() as u64;
     let mut table_hasher = Sha256::new();
-    for desc in &descriptors {
+    for desc in &scratch.descriptors {
         let encoded = desc.encode();
         table_hasher.update(encoded);
         sink.append(&encoded)?;
     }
     let chunk_table_sha256: [u8; 32] = table_hasher.finalize().into();
-    let chunk_table_len = (descriptors.len() as u64) * (CHUNK_DESCRIPTOR_BYTES as u64);
+    let chunk_table_len = (scratch.descriptors.len() as u64) * (CHUNK_DESCRIPTOR_BYTES as u64);
     let total_image_bytes = sink.written_bytes() as u64;
 
     let identity_sha256 = identity.digest();
@@ -521,7 +607,7 @@ where
         chunk_frames: config.chunk_frames,
         total_frames,
         machine_max_frames,
-        chunk_count: descriptors.len() as u32,
+        chunk_count: scratch.descriptors.len() as u32,
         chunk_table_offset,
         chunk_table_len,
         chunk_table_sha256,
@@ -533,6 +619,32 @@ where
     let signed_header = header.encode_signed(auth_key);
     sink.write_header(&signed_header)?;
     Ok(header)
+}
+
+/// Encodes a verified, LZ4-compressed hibernate image from `frame_runs` into
+/// `sink`, allocating a temporary [`SnapshotEncodeScratch`] internally.
+pub fn encode_snapshot<Sink, ReadFrame, PetWatchdog>(
+    params: EncodeParams<'_>,
+    frame_runs: &[FrameRun],
+    sink: &mut Sink,
+    read_frame: ReadFrame,
+    pet_watchdog: PetWatchdog,
+) -> Result<HibernateHeader, HibernateError>
+where
+    Sink: SnapshotSink,
+    ReadFrame: FnMut(u64, &mut [u8; PhysFrame::SIZE]),
+    PetWatchdog: FnMut(),
+{
+    let _ = params.auth_key.ok_or(HibernateError::NoAuthenticationKey)?;
+    let mut scratch = SnapshotEncodeScratch::for_runs(frame_runs, params.config.chunk_frames)?;
+    encode_snapshot_with_scratch(
+        params,
+        frame_runs,
+        &mut scratch,
+        sink,
+        read_frame,
+        pet_watchdog,
+    )
 }
 
 /// Collects every physical frame run that must be saved in an atomic
@@ -621,6 +733,29 @@ pub fn collect_snapshot_physical_runs(
     normalize_physical_runs(&included_phys, &excluded_phys)
 }
 
+/// Collects snapshot physical frame runs together with a pre-allocated
+/// [`SnapshotEncodeScratch`], re-enumerating once if pre-allocation caused the
+/// kernel heap to claim an additional growth block from `user_pool`.
+pub(crate) fn collect_snapshot_runs_and_scratch(
+    user_pool: &UserMemoryPool,
+    boot_memory: &BootMemoryMetadata,
+    balloon: Option<&BalloonHandle>,
+    reservation_ranges: &[PhysFrameRange],
+    chunk_frames: u32,
+) -> Result<(Vec<FrameRun>, SnapshotEncodeScratch), HibernateError> {
+    let mut regions_before = kernel_heap_regions();
+    let mut frame_runs =
+        collect_snapshot_physical_runs(user_pool, boot_memory, balloon, reservation_ranges);
+    let mut scratch = SnapshotEncodeScratch::for_runs(&frame_runs, chunk_frames)?;
+    while kernel_heap_regions() != regions_before {
+        regions_before = kernel_heap_regions();
+        frame_runs =
+            collect_snapshot_physical_runs(user_pool, boot_memory, balloon, reservation_ranges);
+        scratch.reserve_for_runs(&frame_runs);
+    }
+    Ok((frame_runs, scratch))
+}
+
 /// Completed atomic hibernate snapshot still holding the frozen machine
 /// and its reserved compressed image bytes.
 ///
@@ -664,13 +799,15 @@ pub struct AtomicSnapshotParams<'a> {
 /// 2. Reserves `params.reservation_bytes` of free frames from `user_pool`
 ///    **before** freezing the machine.
 /// 3. Freezes every online processor via [`Kernel::freeze`].
-/// 4. Captures the BSP double-return state via [`Cpu::capture_bsp_state`].
-///    On resume, drops the reservation and thaws cleanly, returning
-///    [`SnapshotOutcome::Resumed`].
-/// 5. Collects all reachable physical frames, compresses them with `zrip`
-///    into the reserved frames while petting the watchdog, and signs the
-///    header with `auth_key`.
-/// 6. If compression exceeds the reserved frames (or any error occurs),
+/// 4. Collects all reachable physical frames and pre-allocates the
+///    [`SnapshotEncodeScratch`] before the snapshot point.
+/// 5. Captures the BSP double-return state via [`Cpu::capture_bsp_state`].
+///    On resume, drops the reservation and scratch and thaws cleanly,
+///    returning [`SnapshotOutcome::Resumed`].
+/// 6. Compresses every live physical frame with `lz4_flex` into the reserved
+///    frames with strictly zero kernel-heap allocations while petting the
+///    watchdog, and signs the header with `auth_key`.
+/// 7. If compression exceeds the reserved frames (or any error occurs),
 ///    `frozen` is dropped (thawing all processors) and `reservation` is
 ///    dropped (returning every reserved frame) before returning the error.
 pub async fn capture_atomic_snapshot<'pool, CpuImpl, WatchdogImpl, MeasuredBootImpl>(
@@ -699,32 +836,29 @@ where
         .ok_or(HibernateError::MissingBootMemoryMetadata)?;
 
     // Reserve free user frames BEFORE freezing so snapshot encoding never
-    // needs to grow memory while the machine is stopped, plus an isolated
-    // scratch arena so `encode_snapshot` never mutates the main kernel heap.
+    // needs to grow memory while the machine is stopped.
     let reservation = user_pool
         .reserve_hibernate_frames(reservation_bytes)
         .map_err(|oom| HibernateError::ReservationUnavailable {
             requested_bytes: oom.requested_bytes,
             available_bytes: oom.available_bytes,
         })?;
-    let scratch_reservation = user_pool
-        .reserve_hibernate_frames(HIBERNATE_ENCODE_SCRATCH_BYTES)
-        .map_err(|oom| HibernateError::ReservationUnavailable {
-            requested_bytes: oom.requested_bytes,
-            available_bytes: oom.available_bytes,
-        })?;
-    let mut excluded_ranges = reservation.frame_ranges();
-    excluded_ranges.extend(scratch_reservation.frame_ranges());
+    let excluded_ranges = reservation.frame_ranges();
     let mut writer = ReservationWriter::new(reservation);
 
     // Freeze all other processors at a scheduler boundary.
     let frozen = kernel.freeze(arrival_deadline, interrupt_guests).await?;
 
-    // Drain frame slabs and enumerate live physical runs BEFORE the BSP
-    // snapshot point so neither `user_pool` nor the main kernel heap changes
-    // after `capture_bsp_state`.
-    let frame_runs =
-        collect_snapshot_physical_runs(user_pool, boot_memory, balloon, &excluded_ranges);
+    // Drain frame slabs, enumerate live physical runs, and pre-allocate all
+    // LZ4 encoding scratch BEFORE `capture_bsp_state` so neither `user_pool`
+    // nor the kernel heap mutates after the snapshot point.
+    let (frame_runs, mut encode_scratch) = collect_snapshot_runs_and_scratch(
+        user_pool,
+        boot_memory,
+        balloon,
+        &excluded_ranges,
+        config.chunk_frames,
+    )?;
     let max_phys = boot_memory.max_physical_address();
     let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
     let direct_offset = boot_memory.physical_memory_offset;
@@ -733,49 +867,48 @@ where
     let mut bsp_context = BspSnapshotContext::empty();
     match cpu.capture_bsp_state(&mut bsp_context)? {
         SnapshotPoint::Resumed(handoff) => {
-            crate::exit_hibernate_scratch_allocator();
             // Returning here drops `frozen` (thawing all processors),
-            // `writer`, and `scratch_reservation` (returning all reserved
-            // frames to the user pool).
+            // `encode_scratch`, and `writer` (returning all reserved frames to
+            // the user pool).
             return Ok(SnapshotOutcome::Resumed(handoff));
         }
         SnapshotPoint::Captured => {}
     }
 
-    let header = {
-        // SAFETY: the machine is single-core frozen on the BSP,
-        // `scratch_reservation` owns exclusively reserved frames excluded from
-        // `frame_runs`, and every allocation made inside `encode_snapshot` is
-        // dropped before `_scratch` leaves scope.
-        let _scratch =
-            unsafe { crate::enter_hibernate_scratch_allocator(scratch_reservation.blocks()) };
-        encode_snapshot(
-            EncodeParams {
-                auth_key: Some(auth_key),
-                identity,
-                machine_max_frames,
-                bsp_context,
-                config,
-            },
-            &frame_runs,
-            &mut writer,
-            |phys_frame, dst| {
-                let direct_addr = (phys_frame as usize) * PhysFrame::SIZE + direct_offset;
-                // SAFETY: `phys_frame` came from `collect_snapshot_physical_runs`
-                // while the machine is frozen (`FrozenMachine`), and every live
-                // RAM frame is mapped readable at `phys + physical_memory_offset`.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        core::ptr::with_exposed_provenance::<u8>(direct_addr),
-                        dst.as_mut_ptr(),
-                        PhysFrame::SIZE,
-                    );
-                }
-            },
-            || frozen.pet_watchdog(),
-        )
-    }?;
-    drop(scratch_reservation);
+    let heap_before = crate::heap_stats();
+    let header_result = encode_snapshot_with_scratch(
+        EncodeParams {
+            auth_key: Some(auth_key),
+            identity,
+            machine_max_frames,
+            bsp_context,
+            config,
+        },
+        &frame_runs,
+        &mut encode_scratch,
+        &mut writer,
+        |phys_frame, dst| {
+            let direct_addr = (phys_frame as usize) * PhysFrame::SIZE + direct_offset;
+            // SAFETY: `phys_frame` came from `collect_snapshot_physical_runs`
+            // while the machine is frozen (`FrozenMachine`), and every live
+            // RAM frame is mapped readable at `phys + physical_memory_offset`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::with_exposed_provenance::<u8>(direct_addr),
+                    dst.as_mut_ptr(),
+                    PhysFrame::SIZE,
+                );
+            }
+        },
+        || frozen.pet_watchdog(),
+    );
+    debug_assert_eq!(
+        crate::heap_stats(),
+        heap_before,
+        "hibernate snapshot encoding must perform zero kernel-heap allocations or deallocations"
+    );
+    drop(encode_scratch);
+    let header = header_result?;
 
     Ok(SnapshotOutcome::Captured(Box::new(CapturedSnapshot {
         header,

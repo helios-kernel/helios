@@ -31,7 +31,6 @@ use helios_hal::cpu::DisplacedFrameCopy;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::{DeviceInventory, DmaModel};
 use sha2::{Digest, Sha256};
-use zrip::DecompressContext;
 
 use super::HibernateError;
 use super::format::{
@@ -921,7 +920,12 @@ where
         trampoline_table_pages,
     )?;
 
-    let mut decoder = DecompressContext::new();
+    let max_chunk_bytes = chunks
+        .iter()
+        .map(|desc| desc.uncompressed_len as usize)
+        .max()
+        .unwrap_or(0);
+    let mut decomp_buf = vec![0_u8; max_chunk_bytes];
     let mut read_buf: Vec<u8> = Vec::new();
     let sector_size = storage.sector_size() as u64;
 
@@ -937,9 +941,8 @@ where
         storage.read_sectors(start_sector, &mut read_buf[..read_bytes])?;
         let compressed = &read_buf[head_pad..head_pad + comp_len];
 
-        let decompressed =
-            verify_and_decompress_chunk(&mut decoder, desc, chunk_index, compressed)?;
-        let (frames, remainder) = decompressed.as_chunks::<{ PhysFrame::SIZE }>();
+        let actual = verify_and_decompress_chunk(desc, chunk_index, compressed, &mut decomp_buf)?;
+        let (frames, remainder) = decomp_buf[..actual].as_chunks::<{ PhysFrame::SIZE }>();
         debug_assert!(remainder.is_empty());
         debug_assert_eq!(frames.len(), placement.staging_phys.len());
         for (frame_bytes, &dst_phys) in frames.iter().zip(placement.staging_phys.iter()) {

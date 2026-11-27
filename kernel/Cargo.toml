@@ -90,6 +90,10 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "once
 wasmparser = { version = "0.263.0", default-features = false, features = ["component-model"] }
 talc = { version = "=5.1.0", default-features = false, features = ["counters"] }
 frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats"] }
+# Reuses the exact `lz4_flex` revision already in the lockfile for `erofs-rs`,
+# with `alloc` disabled so hibernate snapshot encoding and decoding cannot
+# allocate on the heap.
+lz4_flex = { git = "https://github.com/Dreamacro/lz4_flex", branch = "feat/block-compress-prefix", default-features = false, features = ["checked-decode", "safe-decode", "safe-encode"] }
 zrip = { version = "0.8.17", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
