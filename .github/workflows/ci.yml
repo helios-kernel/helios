@@ -842,7 +842,7 @@ jobs:
         with:
           packages: >-
             libudev-dev just cmake ninja-build erofs-utils btrfs-progs
-            qemu-system-misc opensbi swtpm
+            qemu-system-riscv opensbi swtpm
       - name: Record QEMU version
         run: qemu-system-riscv64 --version
       - name: Stage Limine bootloader share
