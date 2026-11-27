@@ -17,7 +17,8 @@ mod tests {
         DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology,
     };
     use helios_inspector_protocol::auth::{
-        AuthError, AuthPolicy, ClientIdentity, DirectoryRightsMask, DirectoryRule,
+        AuthError, AuthPolicy, AuthProof, AuthPublicKey, CONSOLE_AUTH_REPLY_PATH, ClientIdentity,
+        ConsoleLoginAuthReply, ConsoleLoginProof, DirectoryRightsMask, DirectoryRule,
         INSPECTOR_POLICY_PATH, ScopeRule, SessionGrants, TransportKind, client_handshake,
     };
     use helios_wit_rpc::Endpoint;
@@ -26,6 +27,7 @@ mod tests {
         mounts::{self as rpc_mounts, MountErrorKind, MountRequest, MountSharing, MountSource},
         programs::{self as rpc_programs, ExecErrorKind, ExecRequest},
     };
+    use helios_wit_rpc::inspector::wasi::filesystem::types::ErrorCode as RpcFsErrorCode;
     use helios_wit_rpc::inspector_fs::{self, FsRpcError};
     use helios_workspace_root::root_key::INSPECTOR_CLIENT_SECRET_FILE;
 
@@ -288,6 +290,7 @@ mod tests {
         let observed_components_inspect = Arc::new(AtomicBool::new(false));
         let observed_auth_rejected = Arc::new(AtomicBool::new(false));
         let observed_attenuated_rpc = Arc::new(AtomicBool::new(false));
+        let observed_atomic_reply_roundtrip = Arc::new(AtomicBool::new(false));
         let observed_boot_preamble = Arc::new(Mutex::new(String::new()));
 
         let stop_timer = kernel.timer();
@@ -299,6 +302,7 @@ mod tests {
         let stop_observed_components_inspect = observed_components_inspect.clone();
         let stop_observed_auth_rejected = observed_auth_rejected.clone();
         let stop_observed_attenuated_rpc = observed_attenuated_rpc.clone();
+        let stop_observed_atomic_reply_roundtrip = observed_atomic_reply_roundtrip.clone();
         let stop_observed_boot_preamble = observed_boot_preamble.clone();
 
         // Once the root supervisor completes init, spawns `/bin/inspector-host`,
@@ -543,14 +547,137 @@ mod tests {
 
             stop_observed_attenuated_rpc.store(true, Ordering::Release);
 
+            // End the read-only worker so `inspector-host::run_serial_loop`
+            // accepts a second full-authority session over the same debug port.
+            drop(peer);
+            let residency = helios_kernel::UserResidency::default();
+            {
+                let now = stop_state.uptime_nanos(stop_cpu.now().ticks());
+                for inst in stop_state.instance_registry().snapshot(now) {
+                    if inst.name.starts_with("inspector-worker-") {
+                        let _ = stop_state.instance_registry().request_kill(
+                            inst.id,
+                            helios_kernel::KillReason::Operator,
+                            now,
+                            &residency,
+                        );
+                        stop_service.interrupt_instance(inst.id);
+                    }
+                }
+            }
+            CAPTURED_SERIAL_IN.lock().unwrap().push_back(0);
+            TEST_DEBUG_CONSOLE.receive_signal().notify_all();
+            for _ in 0..400 {
+                let now = stop_state.uptime_nanos(stop_cpu.now().ticks());
+                let still_running = stop_state
+                    .instance_registry()
+                    .snapshot(now)
+                    .iter()
+                    .any(|inst| inst.name.starts_with("inspector-worker-"));
+                if !still_running {
+                    break;
+                }
+                stop_timer.sleep_for(Duration::from_millis(5)).await;
+            }
+            CAPTURED_SERIAL_IN.lock().unwrap().clear();
+
+            // Step 4: Full-authority session verifying live `inspector_fs`
+            // atomic stage-and-rename delivery of `ConsoleLoginAuthReply` on
+            // `/run` tmpfs through real `inspector-worker` + `helios-kernel`.
+            let full_cursor = CAPTURED_SERIAL_OUT.lock().unwrap().len();
+            let mut full_serial_read = CapturedSerialReader {
+                cursor: full_cursor,
+                closed: Arc::clone(&closed),
+            };
+            let mut full_serial_write = CapturedSerialWriter;
+            let (_full_hello, _full_granted, _full_session_id) = client_handshake(
+                &mut full_serial_read,
+                &mut full_serial_write,
+                TransportKind::Serial,
+                &client_identity,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("full-authority serial handshake must succeed");
+
+            let full_endpoint = Endpoint::new(full_serial_read, full_serial_write, ());
+            let full_peer = full_endpoint.handle();
+            let reply_roundtrip = async {
+                let expected_reply = ConsoleLoginAuthReply::Approved(ConsoleLoginProof {
+                    request_id: 1,
+                    username: "lexo".to_owned(),
+                    public_key: AuthPublicKey::Ed25519([0x21; 32]),
+                    proof: AuthProof::Ed25519([0x42; 64]),
+                });
+                let encoded = expected_reply
+                    .encode_postcard()
+                    .expect("encode ConsoleLoginAuthReply");
+                let staging_path = "/run/console-auth/.reply-1.tmp";
+
+                inspector_fs::mkdir(&full_peer, "/run/console-auth")
+                    .await
+                    .expect("mkdir /run/console-auth on /run tmpfs");
+                inspector_fs::write_file(&full_peer, staging_path, &encoded, false)
+                    .await
+                    .expect("stage ConsoleLoginAuthReply bytes via write_via_stream");
+
+                // Final reply path must not exist while only the staging file was written.
+                let pre_rename = inspector_fs::stat(&full_peer, CONSOLE_AUTH_REPLY_PATH).await;
+                assert!(
+                    matches!(
+                        pre_rename,
+                        Err(FsRpcError::Fs {
+                            code: RpcFsErrorCode::NoEntry,
+                            ..
+                        })
+                    ),
+                    "final reply path must not exist before atomic rename, got: {pre_rename:?}"
+                );
+
+                inspector_fs::rename(&full_peer, staging_path, CONSOLE_AUTH_REPLY_PATH)
+                    .await
+                    .expect("atomic rename of staged reply into reply.postcard");
+
+                let read_back = inspector_fs::read_file(&full_peer, CONSOLE_AUTH_REPLY_PATH)
+                    .await
+                    .expect("read published reply.postcard");
+                assert_eq!(
+                    read_back, encoded,
+                    "write_via_stream + rename must preserve every byte without truncation"
+                );
+                let decoded = ConsoleLoginAuthReply::decode_postcard(&read_back)
+                    .expect("published reply.postcard must decode cleanly");
+                assert_eq!(decoded, expected_reply);
+
+                let post_rename_stage = inspector_fs::stat(&full_peer, staging_path).await;
+                assert!(
+                    matches!(
+                        post_rename_stage,
+                        Err(FsRpcError::Fs {
+                            code: RpcFsErrorCode::NoEntry,
+                            ..
+                        })
+                    ),
+                    "staging file must be gone after rename, got: {post_rename_stage:?}"
+                );
+            };
+            let full_drive_fut = async {
+                let res = full_endpoint.drive().await;
+                panic!("full-authority RPC endpoint terminated before checks finished: {res:?}");
+            };
+            futures_lite::future::or(reply_roundtrip, full_drive_fut).await;
+
+            stop_observed_atomic_reply_roundtrip.store(true, Ordering::Release);
+
             // Cleanly tear down worker + inspector-host so `run_root_component_once` exits.
             closed.store(true, Ordering::Release);
             if let Some(waker) = CAPTURED_SERIAL_OUT_WAKER.lock().unwrap().take() {
                 waker.wake();
             }
-            drop(peer);
+            drop(full_peer);
             let now = stop_state.uptime_nanos(stop_cpu.now().ticks());
-            let residency = helios_kernel::UserResidency::default();
             for inst in stop_state.instance_registry().snapshot(now) {
                 if inst.id == host_inst_id || inst.name.starts_with("inspector-worker-") {
                     let _ = stop_state.instance_registry().request_kill(
@@ -595,6 +722,10 @@ mod tests {
         assert!(
             observed_attenuated_rpc.load(Ordering::Acquire),
             "attenuated inspector-worker session must enforce kernel ProcessAuthority end to end"
+        );
+        assert!(
+            observed_atomic_reply_roundtrip.load(Ordering::Acquire),
+            "full-authority inspector-worker session must write and atomically rename ConsoleLoginAuthReply on /run tmpfs"
         );
 
         let output = observed_boot_preamble.lock().unwrap().clone();
