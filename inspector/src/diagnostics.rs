@@ -15,7 +15,7 @@ use crate::ops_cli::OpsCliError;
 use crate::programs::ProgramError;
 use crate::remote::RemoteError;
 use crate::system::SystemError;
-use crate::vm::VmConfigError;
+use crate::vm::{BuildStepError, VmConfigError};
 use crate::workload_bench::WorkloadBenchError;
 use crate::{InspectorError, SessionError};
 
@@ -477,6 +477,25 @@ fn find_hint(err: &InspectorError) -> Option<String> {
                     );
                 }
                 _ => {}
+            }
+        }
+
+        if let Some(build_step) = node.downcast_ref::<BuildStepError>()
+            && let BuildStepError::Exited { label, .. } = build_step
+        {
+            if label == "prebuilding kernel bootfs" {
+                return Some(
+                    "if external WASI/WASIX boot artifacts under `artifacts/` are missing, run \
+                     `./tools/wasi-apps/build.sh` first"
+                        .to_owned(),
+                );
+            }
+            if label.contains("Limine") || label.contains("limine") {
+                return Some(
+                    "install `limine` on `PATH` (with UEFI bootloaders under `../share/limine`) \
+                     or set `HELIOS_LIMINE_BIN` and `HELIOS_LIMINE_SHARE`"
+                        .to_owned(),
+                );
             }
         }
 
