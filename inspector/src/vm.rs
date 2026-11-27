@@ -65,9 +65,10 @@ use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
 use kernel_image_cache::{KernelImageBuild, KernelImageCache};
 use kill::KillAfterLines;
+pub(crate) use network::VmNetworkSetupError;
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
-    VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
+    VmNetworkError, VmNetworkFile, VmNetworkProfile,
 };
 use numa::{NumaError, NumaMachine};
 use prebuilt::{
@@ -694,7 +695,10 @@ pub(crate) enum AotBenchError {
         #[source]
         source: helios_wit_rpc::RpcError,
     },
-    #[error("remote AOT iteration {iteration} failed: {kind:?}: {detail}")]
+    #[error(
+        "remote AOT iteration {iteration} failed: {}: {detail}",
+        crate::programs::exec_error_kind_label(*kind)
+    )]
     Refused {
         iteration: u16,
         kind: system_programs::ExecErrorKind,
@@ -4446,10 +4450,15 @@ async fn wait_for_child_exit(child: &mut Child) -> Result<(), VmSessionError> {
 }
 
 fn run_gui_session(client: RpcClient, runtime: &mut VmRuntime) -> Result<(), VmSessionError> {
-    println!(
-        "{} guest ready; close the QEMU window or press Ctrl-C to stop",
-        style("gui").green()
+    let theme = crate::diagnostics::CliTheme::stderr();
+    eprintln!("{} guest display ready", theme.bold_green("gui"));
+    eprintln!(
+        "  {} / {}  VT2 terminal login",
+        theme.bold("Enter"),
+        theme.bold("Alt+F2"),
     );
+    eprintln!("  {}          VT1 system log", theme.bold("Alt+F1"));
+    eprintln!("  {} / close window to stop", theme.bold("Ctrl+C"));
     crate::run_interruptible(async move {
         let mut last_handled_request_id = 0_u64;
         loop {

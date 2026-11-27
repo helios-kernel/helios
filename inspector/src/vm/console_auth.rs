@@ -12,7 +12,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use console::style;
 use helios_inspector_protocol::auth::{
     AuthProof, CONSOLE_AUTH_REPLY_PATH, ConsoleLoginAuthReply, ConsoleLoginChallenge,
     ConsoleLoginProof, console_login_signing_message,
@@ -24,6 +23,7 @@ use helios_ops::account::{Fido2Provider, TouchIdProvider};
 use helios_wit_rpc::inspector::helios::system::inspect as proto_inspect;
 use helios_wit_rpc::inspector_fs;
 
+use crate::diagnostics::CliTheme;
 use crate::serial::RpcClient;
 
 /// Poll interval for both QEMU window exit and guest VT2 login challenges.
@@ -171,11 +171,12 @@ pub(super) async fn poll_and_broker_once(client: &RpcClient, last_handled_reques
     };
     *last_handled_request_id = challenge.request_id;
     let expected_machine_key = client.server_public_key();
-    println!(
-        "{} authenticating VT2 login for '{}' (request #{})...",
-        style("auth").cyan(),
-        challenge.username,
-        challenge.request_id
+    let theme = CliTheme::stderr();
+    eprintln!(
+        "{} VT2 login challenge for {} {} — confirm Touch ID or FIDO2 key if prompted...",
+        theme.bold_cyan("auth"),
+        theme.bold(&challenge.username),
+        theme.dim(format!("(request #{})", challenge.request_id)),
     );
 
     let (reply_tx, reply_rx) = async_channel::bounded(1);
@@ -198,7 +199,7 @@ pub(super) async fn poll_and_broker_once(client: &RpcClient, last_handled_reques
         Err(err) => {
             eprintln!(
                 "{} failed to encode console auth reply: {err}",
-                style("auth").red()
+                theme.bold_red("auth")
             );
             return;
         }
@@ -215,8 +216,28 @@ pub(super) async fn poll_and_broker_once(client: &RpcClient, last_handled_reques
     {
         eprintln!(
             "{} failed to deliver console auth reply to `{CONSOLE_AUTH_REPLY_PATH}`: {err}",
-            style("auth").red()
+            theme.bold_red("auth")
         );
+        return;
+    }
+
+    match &reply {
+        ConsoleLoginAuthReply::Approved(_) => {
+            eprintln!(
+                "{} authenticated VT2 login for {} {}",
+                theme.check(),
+                theme.bold(&challenge.username),
+                theme.dim(format!("(request #{})", challenge.request_id)),
+            );
+        }
+        ConsoleLoginAuthReply::Rejected { reason, .. } => {
+            eprintln!(
+                "{} VT2 login rejected for {} {}: {reason}",
+                theme.bold_red("auth"),
+                theme.bold(&challenge.username),
+                theme.dim(format!("(request #{})", challenge.request_id)),
+            );
+        }
     }
 }
 

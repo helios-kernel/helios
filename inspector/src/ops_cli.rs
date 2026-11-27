@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::diagnostics::{CliTheme, format_duration_ms, format_unix_timestamp};
+use crate::stats_tui::{format_bytes, format_duration_nanos};
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use helios_inspector_protocol::auth::{
     CapabilityCert as ProtocolCapabilityCert, ClientIdentity, DEFAULT_FIDO2_APPLICATION, random_32,
@@ -179,6 +181,9 @@ pub(crate) enum AccountCommand {
         /// Custom FIDO2 application string (defaults to `ssh:helios`).
         #[arg(long = "application", default_value = DEFAULT_FIDO2_APPLICATION)]
         application: String,
+        /// Replace an existing operator account with the same username.
+        #[arg(long = "replace")]
+        replace: bool,
     },
     /// List enrolled operator accounts.
     Ls,
@@ -861,11 +866,13 @@ pub(crate) async fn run_login(cmd: &LoginCommand) -> Result<(), OpsCliError> {
         account: None,
     };
     let saved_path = profile.save().map_err(OpsError::from)?;
+    let theme = CliTheme::stdout();
     println!(
-        "saved identity `{}` (principal `{}`, public key `{}`) to {}",
-        profile.name,
-        principal,
-        public_key_hex,
+        "{} saved identity {} (principal {}, public key {}) to {}",
+        theme.check(),
+        theme.bold(&profile.name),
+        theme.cyan(&principal),
+        theme.dim(&public_key_hex),
         saved_path.display()
     );
     Ok(())
@@ -980,16 +987,23 @@ pub(crate) fn run_whoami(flags: &GlobalOpsFlags) -> Result<(), OpsCliError> {
             println!("{}", serde_json::to_string_pretty(&doc)?);
         }
         CliOutputFormat::Table => {
-            println!("principal : {principal}");
+            let theme = CliTheme::stdout();
+            println!("{} {}", theme.dim("principal :"), theme.bold(&principal));
             println!(
-                "target    : {}",
-                target.unwrap_or_else(|| "<none>".to_owned())
+                "{} {}",
+                theme.dim("target    :"),
+                target.map_or_else(|| theme.dim("<none>"), |t| theme.cyan(t))
             );
-            println!("scope     : {}", options.attenuation.effective_scope());
             println!(
-                "only      : {}",
+                "{} {}",
+                theme.dim("scope     :"),
+                options.attenuation.effective_scope()
+            );
+            println!(
+                "{} {}",
+                theme.dim("only      :"),
                 if caps.is_empty() {
-                    "all".to_owned()
+                    theme.dim("all")
                 } else {
                     caps.join(", ")
                 }
@@ -1013,6 +1027,20 @@ fn run_account_command_in(
     cmd: &AccountCommand,
     flags: &GlobalOpsFlags,
 ) -> Result<(), OpsCliError> {
+    run_account_command_with(store, cmd, flags, |store, req| store.create(req))
+}
+
+fn run_account_command_with<F>(
+    store: &AccountStore,
+    cmd: &AccountCommand,
+    flags: &GlobalOpsFlags,
+    create_fn: F,
+) -> Result<(), OpsCliError>
+where
+    F: FnOnce(&AccountStore, CreateAccountRequest) -> Result<OperatorAccount, AccountError>,
+{
+    let theme = CliTheme::stdout();
+    let err_theme = CliTheme::stderr();
     match cmd {
         AccountCommand::Create {
             username,
@@ -1022,6 +1050,7 @@ fn run_account_command_in(
             ed25519,
             require_uv,
             application,
+            replace,
         } => {
             let authenticator = if *touch_id {
                 AccountAuthenticatorChoice::TouchId
@@ -1049,15 +1078,42 @@ fn run_account_command_in(
                 only,
             })?;
 
-            eprintln!(
-                "enrolling operator account `{username}` with authenticator `{}`...",
-                authenticator.label()
-            );
+            // Fail fast on invalid usernames or duplicate accounts BEFORE printing
+            // enrollment prompts or invoking Touch ID / FIDO2 hardware.
+            store.check_creatable(username, *replace)?;
+
+            match authenticator {
+                AccountAuthenticatorChoice::TouchId => {
+                    eprintln!(
+                        "{} confirm macOS Touch ID to enroll operator account {}...",
+                        err_theme.bold_cyan("touch-id"),
+                        err_theme.bold(username),
+                    );
+                }
+                AccountAuthenticatorChoice::Fido2 => {
+                    eprintln!(
+                        "{} touch your FIDO2 security key to enroll operator account {}...",
+                        err_theme.bold_cyan("fido2"),
+                        err_theme.bold(username),
+                    );
+                }
+                AccountAuthenticatorChoice::SoftwareP256
+                | AccountAuthenticatorChoice::SoftwareEd25519 => {
+                    eprintln!(
+                        "{} enrolling operator account {} ({})...",
+                        err_theme.dim("account"),
+                        err_theme.bold(username),
+                        authenticator.label(),
+                    );
+                }
+            }
+
             let mut req = CreateAccountRequest::new(username.clone(), authenticator);
             req.require_uv = *require_uv;
             req.application = application.clone();
             req.grants = grants;
-            let account = store.create(req)?;
+            req.replace = *replace;
+            let account = create_fn(store, req)?;
             let summary = account_summary_json(&account)?;
             match flags.output {
                 CliOutputFormat::Json | CliOutputFormat::Nuon => {
@@ -1068,12 +1124,14 @@ fn run_account_command_in(
                 }
                 CliOutputFormat::Table => {
                     let pub_key = account.public_key()?;
+                    let verb = if *replace { "replaced" } else { "created" };
                     println!(
-                        "created account `{}` ({}, {}, fingerprint {}) at {}",
-                        account.username,
-                        account.authenticator.kind_label(),
+                        "{} {verb} account {} ({}, {}, fingerprint {}) at {}",
+                        theme.check(),
+                        theme.bold(&account.username),
+                        theme.cyan(account.authenticator.kind_label()),
                         pub_key.algorithm_name(),
-                        account_encode_hex(&pub_key.fingerprint_sha256()),
+                        theme.dim(account_encode_hex(&pub_key.fingerprint_sha256())),
                         store.path_for(&account.username).display()
                     );
                 }
@@ -1096,17 +1154,30 @@ fn run_account_command_in(
                 }
                 CliOutputFormat::Table => {
                     if accounts.is_empty() {
-                        println!("no accounts configured ({})", store.dir().display());
+                        println!(
+                            "{}",
+                            theme.dim(format!(
+                                "no accounts configured ({})",
+                                store.dir().display()
+                            ))
+                        );
                     } else {
+                        println!(
+                            "{}",
+                            theme.dim(format!(
+                                "{:<20} {:<10} {:<15} {}",
+                                "USERNAME", "AUTH", "ALGORITHM", "FINGERPRINT"
+                            ))
+                        );
                         for acct in &accounts {
                             let pub_key = acct.public_key()?;
                             let fp = account_encode_hex(&pub_key.fingerprint_sha256());
                             println!(
-                                "{:<20} {:<10} {:<15} {}",
-                                acct.username,
-                                acct.authenticator.kind_label(),
+                                "{} {} {:<15} {}",
+                                theme.bold(format!("{:<20}", acct.username)),
+                                theme.cyan(format!("{:<10}", acct.authenticator.kind_label())),
                                 pub_key.algorithm_name(),
-                                &fp[..16],
+                                theme.dim(&fp[..16]),
                             );
                         }
                     }
@@ -1125,25 +1196,46 @@ fn run_account_command_in(
                     println!("{}", serde_json::to_string(&summary)?);
                 }
                 CliOutputFormat::Table => {
-                    println!("username      : {}", account.username);
-                    println!("authenticator : {}", account.authenticator.kind_label());
-                    println!("algorithm     : {}", pub_key.algorithm_name());
                     println!(
-                        "public_key    : {}",
+                        "{} {}",
+                        theme.dim("username      :"),
+                        theme.bold(&account.username)
+                    );
+                    println!(
+                        "{} {}",
+                        theme.dim("authenticator :"),
+                        theme.cyan(account.authenticator.kind_label())
+                    );
+                    println!(
+                        "{} {}",
+                        theme.dim("algorithm     :"),
+                        pub_key.algorithm_name()
+                    );
+                    println!(
+                        "{} {}",
+                        theme.dim("public_key    :"),
                         account_encode_hex(pub_key.raw_key_bytes())
                     );
                     println!(
-                        "fingerprint   : {}",
+                        "{} {}",
+                        theme.dim("fingerprint   :"),
                         account_encode_hex(&pub_key.fingerprint_sha256())
                     );
-                    println!("created_at    : {}", account.created_at_unix);
+                    println!(
+                        "{} {}",
+                        theme.dim("created_at    :"),
+                        format_unix_timestamp(account.created_at_unix)
+                    );
                     match &account.authenticator {
                         AuthenticatorSpec::TouchId {
                             keychain_service,
                             keychain_account,
                             ..
                         } => {
-                            println!("keychain      : {keychain_service} / {keychain_account}");
+                            println!(
+                                "{} {keychain_service} / {keychain_account}",
+                                theme.dim("keychain      :")
+                            );
                         }
                         AuthenticatorSpec::Fido2 {
                             application,
@@ -1151,15 +1243,20 @@ fn run_account_command_in(
                             key_handle_path,
                             ..
                         } => {
-                            println!("application   : {application}");
-                            println!("require_uv    : {require_uv}");
-                            println!("key_handle    : {}", key_handle_path.display());
+                            println!("{} {application}", theme.dim("application   :"));
+                            println!("{} {require_uv}", theme.dim("require_uv    :"));
+                            println!(
+                                "{} {}",
+                                theme.dim("key_handle    :"),
+                                key_handle_path.display()
+                            );
                         }
                         AuthenticatorSpec::SoftwareP256 { .. }
                         | AuthenticatorSpec::SoftwareEd25519 { .. } => {}
                     }
                     println!(
-                        "path          : {}",
+                        "{} {}",
+                        theme.dim("path          :"),
                         store.path_for(&account.username).display()
                     );
                 }
@@ -1190,10 +1287,11 @@ fn run_account_command_in(
                 }
                 CliOutputFormat::Table => {
                     println!(
-                        "verified account `{}` ({}, fingerprint {})",
-                        verified.username,
+                        "{} verified account {} ({}, fingerprint {})",
+                        theme.check(),
+                        theme.bold(&verified.username),
                         verified.public_key.algorithm_name(),
-                        fp
+                        theme.dim(&fp)
                     );
                 }
             }
@@ -1201,9 +1299,10 @@ fn run_account_command_in(
         AccountCommand::Rm { username } => {
             let removed = store.remove(username)?;
             println!(
-                "removed account `{}` ({})",
-                removed.username,
-                removed.authenticator.kind_label()
+                "{} removed account {} ({})",
+                theme.check(),
+                theme.bold(&removed.username),
+                theme.cyan(removed.authenticator.kind_label())
             );
         }
     }
@@ -1251,6 +1350,7 @@ pub(crate) fn run_target_command(
     cmd: &TargetCommand,
     output: CliOutputFormat,
 ) -> Result<(), OpsCliError> {
+    let theme = CliTheme::stdout();
     let mut store = TargetStore::load_default()?;
     match cmd {
         TargetCommand::Add {
@@ -1268,7 +1368,12 @@ pub(crate) fn run_target_command(
             target.default_scope = scope.clone();
             store.upsert(target);
             store.save()?;
-            println!("added target `{name}` -> {uri}");
+            println!(
+                "{} added target {} -> {}",
+                theme.check(),
+                theme.bold(name),
+                theme.cyan(uri)
+            );
         }
         TargetCommand::Ls => {
             let default_name = store.default_target_name().map(ToOwned::to_owned);
@@ -1283,16 +1388,33 @@ pub(crate) fn run_target_command(
                 }
                 CliOutputFormat::Table => {
                     if store.list().is_empty() {
-                        println!("no targets configured ({})", store.path().display());
+                        println!(
+                            "{}",
+                            theme.dim(format!(
+                                "no targets configured ({})",
+                                store.path().display()
+                            ))
+                        );
                     } else {
+                        println!(
+                            "{}",
+                            theme.dim(format!("  {:<20} {:<36} {}", "NAME", "URI", "LABELS"))
+                        );
                         for t in store.list() {
-                            let mark = if default_name.as_deref() == Some(t.name.as_str()) {
-                                "*"
+                            let is_default = default_name.as_deref() == Some(t.name.as_str());
+                            let mark = if is_default {
+                                theme.bold_green("*")
                             } else {
-                                " "
+                                " ".to_owned()
+                            };
+                            let padded_name = format!("{:<20}", t.name);
+                            let styled_name = if is_default {
+                                theme.bold(&padded_name)
+                            } else {
+                                padded_name
                             };
                             let labels = helios_inspector_shell::env::format_labels(&t.labels);
-                            println!("{mark} {:<20} {:<36} {labels}", t.name, t.uri);
+                            println!("{mark} {styled_name} {:<36} {}", t.uri, theme.dim(labels));
                         }
                     }
                 }
@@ -1301,12 +1423,16 @@ pub(crate) fn run_target_command(
         TargetCommand::Use { name } => {
             store.set_default(name)?;
             store.save()?;
-            println!("default target set to `{name}`");
+            println!(
+                "{} default target set to {}",
+                theme.check(),
+                theme.bold(name)
+            );
         }
         TargetCommand::Rm { name } => {
             store.remove(name)?;
             store.save()?;
-            println!("removed target `{name}`");
+            println!("{} removed target {}", theme.check(), theme.bold(name));
         }
     }
     Ok(())
@@ -1318,6 +1444,7 @@ pub(crate) async fn run_inspect(
     cmd: &InspectCommand,
     output: CliOutputFormat,
 ) -> Result<(), OpsCliError> {
+    let theme = CliTheme::stdout();
     let prefixes: Vec<&str> = cmd.prefixes.iter().map(String::as_str).collect();
     let mut previous: Option<BTreeMap<String, String>> = None;
 
@@ -1334,14 +1461,16 @@ pub(crate) async fn run_inspect(
         {
             for (path, val) in &current {
                 match prev.get(path) {
-                    None => println!("+ {path} = {val}"),
-                    Some(old) if old != val => println!("~ {path}: {old} -> {val}"),
+                    None => println!("{}", theme.green(format!("+ {path} = {val}"))),
+                    Some(old) if old != val => {
+                        println!("{}", theme.yellow(format!("~ {path}: {old} -> {val}")))
+                    }
                     _ => {}
                 }
             }
             for (path, old) in prev {
                 if !current.contains_key(path) {
-                    println!("- {path} = {old}");
+                    println!("{}", theme.red(format!("- {path} = {old}")));
                 }
             }
         } else {
@@ -1387,8 +1516,17 @@ fn render_inspect_entries(
             }
         }
         CliOutputFormat::Table => {
-            for e in entries {
-                println!("{:<56} {}", e.path, render_inspect_value(&e.value));
+            let theme = CliTheme::stdout();
+            if entries.is_empty() {
+                println!("{}", theme.dim("no inspect entries matched"));
+            } else {
+                for e in entries {
+                    println!(
+                        "{} {}",
+                        theme.cyan(format!("{:<56}", e.path)),
+                        render_inspect_value(&e.value)
+                    );
+                }
             }
         }
     }
@@ -1431,8 +1569,11 @@ pub(crate) async fn run_ps(
             }
         }
         CliOutputFormat::Table => {
-            if cmd.tree {
-                println!("/ (helios)");
+            let theme = CliTheme::stdout();
+            if instances.is_empty() {
+                println!("{}", theme.dim("no running instances"));
+            } else if cmd.tree {
+                println!("{}", theme.bold("/ (helios)"));
                 for (idx, inst) in instances.iter().enumerate() {
                     let branch = if idx + 1 == instances.len() {
                         "└─"
@@ -1440,34 +1581,55 @@ pub(crate) async fn run_ps(
                         "├─"
                     };
                     println!(
-                        "{branch} [{}] {} ({} KiB, {:.1}% cpu)",
+                        "{} {} {} {}",
+                        theme.dim(branch),
+                        theme.dim(format!("[{}]", inst.id)),
+                        theme.bold(&inst.name),
+                        theme.dim(format!(
+                            "({}, {:.1}% cpu)",
+                            format_bytes(inst.memory_bytes),
+                            f64::from(inst.cpu_busy) / 10.0,
+                        )),
+                    );
+                }
+            } else if cmd.long {
+                println!(
+                    "{}",
+                    theme.dim(format!(
+                        "{:>6}  {:<28} {:>11}  {:>12}  {:>9}",
+                        "ID", "NAME", "UPTIME", "MEMORY", "CPU"
+                    ))
+                );
+                for inst in &instances {
+                    println!(
+                        "{:>6}  {} up {:>8} ms  {:>10} B  {:>5.1}% cpu",
                         inst.id,
-                        inst.name,
-                        inst.memory_bytes / 1024,
+                        theme.bold(format!("{:<28}", inst.name)),
+                        inst.uptime / 1_000_000,
+                        inst.memory_bytes,
                         f64::from(inst.cpu_busy) / 10.0,
                     );
                 }
             } else {
+                println!(
+                    "{}",
+                    theme.dim(format!(
+                        "{:>6}  {:<24} {:>10}  {:>10}  {:>8}",
+                        "ID", "NAME", "UPTIME", "MEMORY", "CPU"
+                    ))
+                );
                 for inst in &instances {
-                    if cmd.long {
-                        println!(
-                            "{:>6}  {:<28} up {:>8} ms  {:>10} B  {:>5.1}% cpu",
-                            inst.id,
-                            inst.name,
-                            inst.uptime / 1_000_000,
-                            inst.memory_bytes,
-                            f64::from(inst.cpu_busy) / 10.0,
-                        );
-                    } else {
-                        println!(
-                            "{:>6}  {:<24} up {:>8} ms  {:>9} KiB  {:>4}‰ cpu",
-                            inst.id,
-                            inst.name,
-                            inst.uptime / 1_000_000,
-                            inst.memory_bytes / 1024,
-                            inst.cpu_busy,
-                        );
-                    }
+                    let uptime = format_duration_ms(inst.uptime / 1_000_000);
+                    let mem = format_bytes(inst.memory_bytes);
+                    let cpu = format!("{:.1}%", f64::from(inst.cpu_busy) / 10.0);
+                    println!(
+                        "{:>6}  {} {:>10}  {:>10}  {:>8}",
+                        inst.id,
+                        theme.bold(format!("{:<24}", inst.name)),
+                        uptime,
+                        mem,
+                        cpu,
+                    );
                 }
             }
         }
@@ -1477,16 +1639,21 @@ pub(crate) async fn run_ps(
 
 /// Run `helios kill`.
 pub(crate) async fn run_kill(session: &Session, cmd: &KillCommand) -> Result<(), OpsCliError> {
+    let theme = CliTheme::stdout();
     let _ = cmd.force;
     if !cmd.name
         && let Ok(id) = cmd.target.parse::<u64>()
     {
         session.kill(id).await?;
-        println!("killed instance {id}");
+        println!("{} killed instance {id}", theme.check());
         return Ok(());
     }
     let id = session.kill_by_name(&cmd.target).await?;
-    println!("killed instance {id} (`{}`)", cmd.target);
+    println!(
+        "{} killed instance {id} ({})",
+        theme.check(),
+        theme.bold(&cmd.target)
+    );
     Ok(())
 }
 
@@ -1642,8 +1809,13 @@ pub(crate) async fn run_profile(
                     }
                 }
                 CliOutputFormat::Table => {
-                    for s in samples {
-                        println!("{} {}", s.stack, s.weight);
+                    let theme = CliTheme::stdout();
+                    if samples.is_empty() {
+                        println!("{}", theme.dim("no folded stack samples recorded"));
+                    } else {
+                        for s in samples {
+                            println!("{} {}", s.stack, s.weight);
+                        }
                     }
                 }
             }
@@ -1686,19 +1858,42 @@ pub(crate) async fn run_profile(
                     }
                 }
                 CliOutputFormat::Table => {
-                    for m in metrics {
+                    let theme = CliTheme::stdout();
+                    if metrics.is_empty() {
+                        println!("{}", theme.dim("no profiling metrics recorded"));
+                    } else {
                         println!(
-                            "{:<40} count={:<8} total_ns={:<12} min_ns={:<10} max_ns={}",
-                            m.name, m.count, m.total_nanos, m.min_nanos, m.max_nanos
+                            "{}",
+                            theme.dim(format!(
+                                "{:<40} {:>10}  {:>12}  {:>10}  {:>10}",
+                                "METRIC", "COUNT", "TOTAL", "MIN", "MAX"
+                            ))
                         );
+                        for m in metrics {
+                            println!(
+                                "{} {:>10}  {:>12}  {:>10}  {:>10}",
+                                theme.bold(format!("{:<40}", m.name)),
+                                m.count,
+                                format_duration_nanos(m.total_nanos),
+                                format_duration_nanos(m.min_nanos),
+                                format_duration_nanos(m.max_nanos),
+                            );
+                        }
                     }
                 }
             }
         }
         ProfileOpsCommand::LlvmRaw { out } => {
+            let theme = CliTheme::stdout();
             let bytes = session.profile_raw_collect().await?;
             tokio::fs::write(out, &bytes).await?;
-            println!("wrote {} bytes to {}", bytes.len(), out.display());
+            println!(
+                "{} wrote {} ({} bytes) to {}",
+                theme.check(),
+                format_bytes(bytes.len() as u64),
+                bytes.len(),
+                out.display()
+            );
         }
     }
     Ok(())
@@ -1741,6 +1936,8 @@ pub(crate) async fn run_exec(
         && capability_grants.is_empty()
         && stdin.is_empty()
     {
+        let theme = CliTheme::stdout();
+        let err_theme = CliTheme::stderr();
         let outcomes = fleet.exec(cmd.path.clone(), cmd.args.clone()).await;
         for outcome in outcomes {
             match outcome.result {
@@ -1755,13 +1952,24 @@ pub(crate) async fn run_exec(
                         println!("{}", serde_json::to_string(&row)?);
                     }
                     CliOutputFormat::Table => {
-                        println!("[{}] exit={}", outcome.target.name, res.exit_code);
+                        let exit_label = if res.exit_code == 0 {
+                            theme.green(format!("exit={}", res.exit_code))
+                        } else {
+                            theme.bold_red(format!("exit={}", res.exit_code))
+                        };
+                        println!(
+                            "{} {exit_label}",
+                            theme.bold_cyan(format!("[{}]", outcome.target.name)),
+                        );
                         std::io::stdout().write_all(&res.output.stdout)?;
                         std::io::stderr().write_all(&res.output.stderr)?;
                     }
                 },
                 Err(err) => {
-                    eprintln!("[{}] error: {err}", outcome.target.name);
+                    eprintln!(
+                        "{} {err}",
+                        err_theme.bold_red(format!("[{}] error:", outcome.target.name)),
+                    );
                 }
             }
         }
@@ -1791,6 +1999,19 @@ pub(crate) async fn run_exec(
     Ok(())
 }
 
+fn print_fleet_header(target_name: &str) {
+    let theme = CliTheme::stdout();
+    println!("{}", theme.bold_cyan(format!("[{target_name}]")));
+}
+
+fn print_fleet_error(target_name: &str, err: &impl std::fmt::Display) {
+    let err_theme = CliTheme::stderr();
+    eprintln!(
+        "{} {err}",
+        err_theme.bold_red(format!("[{target_name}] error:")),
+    );
+}
+
 /// Run `helios component {ls, status, start, stop, restart}`.
 pub(crate) async fn run_component(
     session: &Session,
@@ -1798,6 +2019,7 @@ pub(crate) async fn run_component(
     cmd: &ComponentCommand,
     output: CliOutputFormat,
 ) -> Result<(), OpsCliError> {
+    let theme = CliTheme::stdout();
     if let Some(fleet) = fleet {
         let fc = fleet.components();
         match cmd {
@@ -1805,10 +2027,10 @@ pub(crate) async fn run_component(
                 for outcome in fc.list().await {
                     match outcome.result {
                         Ok(list) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             render_components(&list, output)?;
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -1816,10 +2038,10 @@ pub(crate) async fn run_component(
                 for outcome in fc.status(moniker.clone()).await {
                     match outcome.result {
                         Ok(st) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             render_components(&[st], output)?;
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -1827,18 +2049,23 @@ pub(crate) async fn run_component(
                 for outcome in fc.start(moniker.clone()).await {
                     match outcome.result {
                         Ok(st) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             render_components(&[st], output)?;
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
             ComponentCommand::Stop { moniker } => {
                 for outcome in fc.stop(moniker.clone()).await {
                     match outcome.result {
-                        Ok(()) => println!("[{}] stopped {moniker}", outcome.target.name),
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Ok(()) => println!(
+                            "{} {} stopped {}",
+                            theme.bold_cyan(format!("[{}]", outcome.target.name)),
+                            theme.check(),
+                            theme.bold(moniker),
+                        ),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -1846,10 +2073,10 @@ pub(crate) async fn run_component(
                 for outcome in fc.restart(moniker.clone()).await {
                     match outcome.result {
                         Ok(st) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             render_components(&[st], output)?;
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -1866,16 +2093,26 @@ pub(crate) async fn run_component(
                 )?;
                 for outcome in fc.mount_dynamic(parent_moniker.clone(), source).await {
                     match outcome.result {
-                        Ok(mounted) => println!("[{}] mounted {mounted}", outcome.target.name),
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Ok(mounted) => println!(
+                            "{} {} mounted {}",
+                            theme.bold_cyan(format!("[{}]", outcome.target.name)),
+                            theme.check(),
+                            theme.bold(&mounted),
+                        ),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
             ComponentCommand::UnmountDynamic { moniker } => {
                 for outcome in fc.unmount_dynamic(moniker.clone()).await {
                     match outcome.result {
-                        Ok(()) => println!("[{}] unmounted {moniker}", outcome.target.name),
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Ok(()) => println!(
+                            "{} {} unmounted {}",
+                            theme.bold_cyan(format!("[{}]", outcome.target.name)),
+                            theme.check(),
+                            theme.bold(moniker),
+                        ),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -1899,7 +2136,11 @@ pub(crate) async fn run_component(
         }
         ComponentCommand::Stop { moniker } => {
             components.stop(moniker).await?;
-            println!("stopped component `{moniker}`");
+            println!(
+                "{} stopped component {}",
+                theme.check(),
+                theme.bold(moniker)
+            );
         }
         ComponentCommand::Restart { moniker } => {
             let st = components.restart(moniker).await?;
@@ -1921,12 +2162,20 @@ pub(crate) async fn run_component(
                 CliOutputFormat::Json | CliOutputFormat::Nuon | CliOutputFormat::Jsonl => {
                     println!("{}", serde_json::json!({ "moniker": mounted }));
                 }
-                CliOutputFormat::Table => println!("mounted dynamic subtree `{mounted}`"),
+                CliOutputFormat::Table => println!(
+                    "{} mounted dynamic subtree {}",
+                    theme.check(),
+                    theme.bold(&mounted)
+                ),
             }
         }
         ComponentCommand::UnmountDynamic { moniker } => {
             components.unmount_dynamic(moniker).await?;
-            println!("unmounted dynamic subtree `{moniker}`");
+            println!(
+                "{} unmounted dynamic subtree {}",
+                theme.check(),
+                theme.bold(moniker)
+            );
         }
     }
     Ok(())
@@ -2029,14 +2278,35 @@ fn render_components(
             }
         }
         CliOutputFormat::Table => {
-            for c in components {
-                let id = c
-                    .instance_id
-                    .map_or_else(|| "-".to_owned(), |id| id.to_string());
+            let theme = CliTheme::stdout();
+            if components.is_empty() {
+                println!("{}", theme.dim("no components found"));
+            } else {
                 println!(
-                    "{:<28} {:<12} id={:<8} restarts={:<4} {}",
-                    c.moniker, c.state, id, c.restarts, c.program
+                    "{}",
+                    theme.dim(format!(
+                        "{:<28} {:<12} {:<8} {:<8} {}",
+                        "MONIKER", "STATE", "ID", "RESTARTS", "PROGRAM"
+                    ))
                 );
+                for c in components {
+                    let id = c
+                        .instance_id
+                        .map_or_else(|| "-".to_owned(), |id| id.to_string());
+                    let state_col = theme.state(&c.state, &format!("{:<12}", c.state));
+                    let restarts_padded = format!("{:<8}", c.restarts);
+                    let restarts_col = if c.restarts > 0 {
+                        theme.yellow(&restarts_padded)
+                    } else {
+                        theme.dim(&restarts_padded)
+                    };
+                    println!(
+                        "{} {state_col} {:<8} {restarts_col} {}",
+                        theme.bold(format!("{:<28}", c.moniker)),
+                        id,
+                        theme.dim(&c.program)
+                    );
+                }
             }
         }
     }
@@ -2082,10 +2352,10 @@ pub(crate) async fn run_oci(
                 {
                     match outcome.result {
                         Ok(img) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             render_oci_images(&[img], output)?;
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -2093,10 +2363,10 @@ pub(crate) async fn run_oci(
                 for outcome in oci_for(store_root).list().await {
                     match outcome.result {
                         Ok(imgs) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             render_oci_images(&imgs, output)?;
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -2107,10 +2377,10 @@ pub(crate) async fn run_oci(
                 for outcome in oci_for(store_root).inspect(reference.clone()).await {
                     match outcome.result {
                         Ok(img) => {
-                            println!("=== {} ===", outcome.target.name);
+                            print_fleet_header(&outcome.target.name);
                             println!("{}", serde_json::to_string_pretty(&img)?);
                         }
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -2118,10 +2388,16 @@ pub(crate) async fn run_oci(
                 reference,
                 store_root,
             } => {
+                let theme = CliTheme::stdout();
                 for outcome in oci_for(store_root).remove(reference.clone()).await {
                     match outcome.result {
-                        Ok(img) => println!("[{}] removed {}", outcome.target.name, img.reference),
-                        Err(err) => eprintln!("[{}] error: {err}", outcome.target.name),
+                        Ok(img) => println!(
+                            "{} {} removed {}",
+                            theme.bold_cyan(format!("[{}]", outcome.target.name)),
+                            theme.check(),
+                            theme.bold(img.reference.to_string()),
+                        ),
+                        Err(err) => print_fleet_error(&outcome.target.name, &err),
                     }
                 }
             }
@@ -2169,8 +2445,13 @@ pub(crate) async fn run_oci(
             reference,
             store_root,
         } => {
+            let theme = CliTheme::stdout();
             let removed = make_client(store_root)?.remove(reference).await?;
-            println!("removed image `{}`", removed.reference);
+            println!(
+                "{} removed image {}",
+                theme.check(),
+                theme.bold(removed.reference.to_string())
+            );
         }
     }
     Ok(())
@@ -2187,15 +2468,27 @@ fn render_oci_images(images: &[PulledImage], output: CliOutputFormat) -> Result<
             }
         }
         CliOutputFormat::Table => {
-            for img in images {
+            let theme = CliTheme::stdout();
+            if images.is_empty() {
+                println!("{}", theme.dim("no OCI images pulled"));
+            } else {
                 println!(
-                    "{:<36} {:<8} layers={:<3} btrfs={:<5} {}",
-                    img.reference.to_string(),
-                    img.arch.oci_arch(),
-                    img.layer_chain_ids.len(),
-                    img.btrfs_backed,
-                    img.rootfs_path.display()
+                    "{}",
+                    theme.dim(format!(
+                        "{:<36} {:<8} {:>6}  {:<5} {}",
+                        "REFERENCE", "ARCH", "LAYERS", "BTRFS", "ROOTFS"
+                    ))
                 );
+                for img in images {
+                    println!(
+                        "{} {} {:>6}  {:<5} {}",
+                        theme.bold(format!("{:<36}", img.reference)),
+                        theme.cyan(format!("{:<8}", img.arch.oci_arch())),
+                        img.layer_chain_ids.len(),
+                        img.btrfs_backed,
+                        theme.dim(img.rootfs_path.display())
+                    );
+                }
             }
         }
     }
@@ -2235,16 +2528,28 @@ pub(crate) async fn run_container(
                     }
                 }
                 CliOutputFormat::Table => {
-                    for c in &snap.containers {
+                    let theme = CliTheme::stdout();
+                    if snap.containers.is_empty() {
+                        println!("{}", theme.dim("no live containers"));
+                    } else {
                         println!(
-                            "{:>6}  {:<20} procs={:<4} threads={:<4} overlay_pages={:<6} mounts={}",
-                            c.id,
-                            c.hostname,
-                            c.live_processes,
-                            c.live_threads,
-                            c.overlay_pages,
-                            c.mounts.len()
+                            "{}",
+                            theme.dim(format!(
+                                "{:>6}  {:<20} {:>5}  {:>7}  {:>7}  {:>6}",
+                                "ID", "HOSTNAME", "PROCS", "THREADS", "OVERLAY", "MOUNTS"
+                            ))
                         );
+                        for c in &snap.containers {
+                            println!(
+                                "{:>6}  {} {:>5}  {:>7}  {:>7}  {:>6}",
+                                c.id,
+                                theme.bold(format!("{:<20}", c.hostname)),
+                                c.live_processes,
+                                c.live_threads,
+                                c.overlay_pages,
+                                c.mounts.len()
+                            );
+                        }
                     }
                 }
             }
@@ -2278,10 +2583,12 @@ pub(crate) async fn run_container(
                         println!("{}", serde_json::to_string_pretty(&info)?);
                     }
                     CliOutputFormat::Table => {
+                        let theme = CliTheme::stdout();
                         println!(
-                            "created container `{}` (root={})",
-                            container.config().hostname,
-                            container.config().root.source_path
+                            "{} created container {} {}",
+                            theme.check(),
+                            theme.bold(&container.config().hostname),
+                            theme.dim(format!("(root={})", container.config().root.source_path)),
                         );
                     }
                 }
@@ -2330,7 +2637,11 @@ pub(crate) async fn run_container(
                     killed += 1;
                 }
             }
-            println!("removed container {id} (stopped {killed} instance(s))");
+            let theme = CliTheme::stdout();
+            println!(
+                "{} removed container {id} (stopped {killed} instance(s))",
+                theme.check()
+            );
         }
     }
     Ok(())
@@ -2526,13 +2837,15 @@ async fn stream_child_to_stdio(child: helios_ops::Child) -> Result<(), OpsCliErr
 
 /// Run `helios bundle`.
 pub(crate) async fn run_bundle(session: &Session, cmd: &BundleCommand) -> Result<(), OpsCliError> {
+    let theme = CliTheme::stdout();
     let bundle = DiagnosticBundle::collect(session).await?;
     let written = bundle
         .write_tar_zst(&cmd.output)
         .await
         .map_err(OpsError::from)?;
     println!(
-        "wrote diagnostic bundle ({} entries) to {}",
+        "{} wrote diagnostic bundle ({} entries) to {}",
+        theme.check(),
         bundle.entries.len() + 1,
         written.display()
     );
@@ -2544,6 +2857,7 @@ pub(crate) async fn run_bridge(session: &Session, cmd: &BridgeCommand) -> Result
     if cmd.prometheus_listen.is_none() && cmd.otlp_endpoint.is_none() {
         return Err(OpsCliError::BridgeNeedsSink);
     }
+    let theme = CliTheme::stdout();
 
     let prom_task = if let Some(addr) = &cmd.prometheus_listen {
         let listener =
@@ -2553,7 +2867,11 @@ pub(crate) async fn run_bridge(session: &Session, cmd: &BridgeCommand) -> Result
                     addr: addr.clone(),
                     source,
                 })?;
-        println!("Prometheus metrics endpoint listening on http://{addr}/metrics");
+        println!(
+            "{} Prometheus metrics endpoint listening on {}",
+            theme.check(),
+            theme.cyan(format!("http://{addr}/metrics"))
+        );
         let prom_session = session.clone();
         Some(tokio::spawn(async move {
             loop {
@@ -2609,8 +2927,10 @@ pub(crate) async fn run_bridge(session: &Session, cmd: &BridgeCommand) -> Result
 
     let otlp_task = if let Some(endpoint) = &cmd.otlp_endpoint {
         println!(
-            "OTLP/HTTP exporter pushing every {}s to {endpoint} via zenwave",
-            cmd.interval_secs
+            "{} OTLP/HTTP exporter pushing every {}s to {} via zenwave",
+            theme.check(),
+            cmd.interval_secs,
+            theme.cyan(endpoint)
         );
         let otlp_session = session.clone();
         let url = endpoint.clone();
@@ -2899,6 +3219,7 @@ mod tests {
                 ed25519: false,
                 require_uv: false,
                 application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+                replace: false,
             },
             &flags,
         )
@@ -2929,6 +3250,66 @@ mod tests {
         )
         .expect("rm account");
         assert!(store.list().expect("list after rm").is_empty());
+    }
+
+    #[test]
+    fn run_account_create_prechecks_duplicate_before_provider_and_allows_replace() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = AccountStore::new(dir.path().join("accounts"));
+        let flags = GlobalOpsFlags {
+            output: CliOutputFormat::Table,
+            ..GlobalOpsFlags::default()
+        };
+
+        let first_cmd = AccountCommand::Create {
+            username: "lexo".to_owned(),
+            touch_id: false,
+            fido2: false,
+            p256: true,
+            ed25519: false,
+            require_uv: false,
+            application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+            replace: false,
+        };
+        run_account_command_in(&store, &first_cmd, &flags).expect("initial create must succeed");
+        let original = store.load("lexo").expect("load initial account");
+
+        // Duplicate without `--replace` must fail during pre-check BEFORE `create_fn` is called.
+        let mut create_invoked = false;
+        let dup_err = run_account_command_with(&store, &first_cmd, &flags, |_s, _req| {
+            create_invoked = true;
+            unreachable!("provider must not be invoked when pre-check rejects duplicate")
+        })
+        .expect_err("duplicate create without --replace must fail");
+        assert!(
+            !create_invoked,
+            "pre-check must short-circuit before provider"
+        );
+        assert!(matches!(
+            dup_err,
+            OpsCliError::Account(AccountError::AlreadyExists { ref username, .. })
+                if username == "lexo"
+        ));
+
+        // Passing `--replace` succeeds and rotates the stored key.
+        let replace_cmd = AccountCommand::Create {
+            username: "lexo".to_owned(),
+            touch_id: false,
+            fido2: false,
+            p256: false,
+            ed25519: true,
+            require_uv: false,
+            application: DEFAULT_FIDO2_APPLICATION.to_owned(),
+            replace: true,
+        };
+        run_account_command_in(&store, &replace_cmd, &flags)
+            .expect("create with --replace must succeed");
+        let replaced = store.load("lexo").expect("load replaced account");
+        assert_eq!(replaced.authenticator.kind_label(), "ed25519");
+        assert_ne!(
+            replaced.public_key().expect("replaced key"),
+            original.public_key().expect("original key")
+        );
     }
 
     fn decode_hex_for_test(raw: &str) -> Vec<u8> {

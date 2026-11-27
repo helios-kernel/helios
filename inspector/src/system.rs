@@ -170,25 +170,41 @@ pub async fn run_instances(
         (None, Some(name)) => Some(named_instance(&live, name)?),
         (None, None) => None,
     };
+    let theme = crate::diagnostics::CliTheme::stdout();
     let mut out = std::io::stdout();
-    for instance in &live {
+    if live.is_empty() {
+        writeln!(out, "{}", theme.dim("no running instances"))
+            .map_err(|source| SystemError::Write { source })?;
+    } else {
         writeln!(
             out,
-            "{:>6}  {:<24} up {:>8} ms  {:>9} KiB mem  {:>9} KiB storage  {:>4}‰ cpu",
-            instance.id,
-            instance.name,
-            instance.uptime / 1_000_000,
-            instance.memory_bytes / 1024,
-            instance.storage_bytes / 1024,
-            instance.cpu_busy,
+            "{}",
+            theme.dim(format!(
+                "{:>6}  {:<24} {:>11}  {:>14}  {:>18}  {:>8}",
+                "ID", "NAME", "UPTIME", "MEMORY", "STORAGE", "CPU"
+            ))
         )
         .map_err(|source| SystemError::Write { source })?;
+        for instance in &live {
+            writeln!(
+                out,
+                "{:>6}  {} up {:>8} ms  {:>9} KiB mem  {:>9} KiB storage  {:>4}‰ cpu",
+                instance.id,
+                theme.bold(format!("{:<24}", instance.name)),
+                instance.uptime / 1_000_000,
+                instance.memory_bytes / 1024,
+                instance.storage_bytes / 1024,
+                instance.cpu_busy,
+            )
+            .map_err(|source| SystemError::Write { source })?;
+        }
     }
     let Some(id) = target else {
         return Ok(());
     };
     kill(client, id).await?;
-    writeln!(out, "killed instance {id}").map_err(|source| SystemError::Write { source })?;
+    writeln!(out, "{} killed instance {id}", theme.check())
+        .map_err(|source| SystemError::Write { source })?;
     Ok(())
 }
 
@@ -410,6 +426,16 @@ pub enum TracingPalette {
 }
 
 impl TracingPalette {
+    /// Selects ANSI styling only when stdout is a color-capable TTY and `NO_COLOR` is unset.
+    #[must_use]
+    pub fn for_stdout() -> Self {
+        if crate::diagnostics::stdout_colors_enabled() {
+            Self::Terminal
+        } else {
+            Self::Plain
+        }
+    }
+
     fn apply(self, style: AnsiStyle) -> AnsiStyle {
         match self {
             Self::Terminal => style,
@@ -419,7 +445,7 @@ impl TracingPalette {
 }
 
 pub fn render_tracing_event(event: &tracing::Event) -> Result<String, SystemError> {
-    render_tracing_event_with(event, TracingPalette::Terminal)
+    render_tracing_event_with(event, TracingPalette::for_stdout())
 }
 
 pub fn render_tracing_event_with(
@@ -549,10 +575,10 @@ fn level_style(level: tracing::Level) -> AnsiStyle {
 
     match level {
         Level::Error => AnsiStyle::new().fg(Color::Red).bold(),
-        Level::Warn => AnsiStyle::new().fg(Color::Yellow).bold(),
-        Level::Info => AnsiStyle::new().fg(Color::Green).bold(),
-        Level::Debug => AnsiStyle::new().fg(Color::Blue).bold(),
-        Level::Trace => AnsiStyle::new().fg(Color::Purple).bold(),
+        Level::Warn => AnsiStyle::new().fg(Color::Yellow),
+        Level::Info => AnsiStyle::new().fg(Color::Green),
+        Level::Debug => AnsiStyle::new().fg(Color::Blue),
+        Level::Trace => AnsiStyle::new().dimmed(),
     }
 }
 
