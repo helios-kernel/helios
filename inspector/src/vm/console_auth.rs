@@ -36,6 +36,85 @@ const CONSOLE_AUTH_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum inspect entries scanned when looking for pending console login challenges.
 const CONSOLE_AUTH_INSPECT_LIMIT: u32 = 256;
 
+/// Builds a sibling staging path in the same `/run` mount directory as
+/// `reply_path` so the reply can be written in full before being atomically
+/// renamed into place.
+fn console_auth_reply_staging_path(reply_path: &str, request_id: u64) -> String {
+    let parent = Path::new(reply_path)
+        .parent()
+        .and_then(Path::to_str)
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or("/");
+    let trimmed = parent.trim_end_matches('/');
+    if trimmed.is_empty() {
+        format!("/.reply-{request_id}.tmp")
+    } else {
+        format!("{trimmed}/.reply-{request_id}.tmp")
+    }
+}
+
+#[derive(Debug)]
+enum ReplyDeliveryError {
+    WriteTimedOut,
+    WriteFailed(inspector_fs::FsRpcError),
+    RenameTimedOut,
+    RenameFailed(inspector_fs::FsRpcError),
+}
+
+/// Atomically publishes `encoded` at `reply_path` over `inspector_fs` by
+/// writing to a sibling staging file in the same `/run` mount and renaming it
+/// into place.
+///
+/// Writing directly to `reply_path` creates a 0-byte file on `open_at` before
+/// `write_via_stream` delivers the bytes, racing with `/console-session`'s
+/// 100 ms reader loop and causing `Hit the end of buffer` decode failures.
+async fn deliver_console_auth_reply(
+    peer: &helios_wit_rpc::PeerHandle,
+    reply_path: &str,
+    request_id: u64,
+    encoded: &[u8],
+    rpc_timeout: Duration,
+) -> Result<(), ReplyDeliveryError> {
+    if let Some(parent) = Path::new(reply_path).parent()
+        && let Some(parent_str) = parent.to_str()
+        && !parent_str.is_empty()
+        && parent_str != "/"
+    {
+        let _ = crate::runtime::timeout(rpc_timeout, inspector_fs::mkdir(peer, parent_str)).await;
+    }
+
+    let staging_path = console_auth_reply_staging_path(reply_path, request_id);
+    match crate::runtime::timeout(
+        rpc_timeout,
+        inspector_fs::write_file(peer, &staging_path, encoded, false),
+    )
+    .await
+    {
+        Some(Ok(())) => {}
+        Some(Err(err)) => {
+            let _ = crate::runtime::timeout(rpc_timeout, inspector_fs::remove(peer, &staging_path))
+                .await;
+            return Err(ReplyDeliveryError::WriteFailed(err));
+        }
+        None => return Err(ReplyDeliveryError::WriteTimedOut),
+    }
+
+    match crate::runtime::timeout(
+        rpc_timeout,
+        inspector_fs::rename(peer, &staging_path, reply_path),
+    )
+    .await
+    {
+        Some(Ok(())) => Ok(()),
+        Some(Err(err)) => {
+            let _ = crate::runtime::timeout(rpc_timeout, inspector_fs::remove(peer, &staging_path))
+                .await;
+            Err(ReplyDeliveryError::RenameFailed(err))
+        }
+        None => Err(ReplyDeliveryError::RenameTimedOut),
+    }
+}
+
 /// Extracts the first pending [`ConsoleLoginChallenge`] published by
 /// `/console-session` whose `request_id` is newer than `last_handled_request_id`.
 pub(super) fn extract_pending_console_challenge(
@@ -272,29 +351,41 @@ impl ConsoleAuthBroker {
             }
         };
 
-        if let Some(parent) = Path::new(CONSOLE_AUTH_REPLY_PATH).parent()
-            && let Some(parent_str) = parent.to_str()
-        {
-            let _ =
-                crate::runtime::timeout(rpc_timeout, inspector_fs::mkdir(peer, parent_str)).await;
-        }
-        match crate::runtime::timeout(
+        match deliver_console_auth_reply(
+            peer,
+            CONSOLE_AUTH_REPLY_PATH,
+            challenge.request_id,
+            &encoded,
             rpc_timeout,
-            inspector_fs::write_file(peer, CONSOLE_AUTH_REPLY_PATH, &encoded, false),
         )
         .await
         {
-            Some(Ok(())) => {}
-            Some(Err(err)) => {
+            Ok(()) => {}
+            Err(ReplyDeliveryError::WriteFailed(err)) => {
                 eprintln!(
-                    "{} failed to deliver console auth reply to `{CONSOLE_AUTH_REPLY_PATH}`: {err}",
+                    "{} failed to stage console auth reply for `{CONSOLE_AUTH_REPLY_PATH}`: {err}",
                     theme.bold_red("auth")
                 );
                 return;
             }
-            None => {
+            Err(ReplyDeliveryError::WriteTimedOut) => {
                 eprintln!(
-                    "{} timed out delivering console auth reply to `{CONSOLE_AUTH_REPLY_PATH}` after {:.1}s",
+                    "{} timed out staging console auth reply for `{CONSOLE_AUTH_REPLY_PATH}` after {:.1}s",
+                    theme.bold_red("auth"),
+                    rpc_timeout.as_secs_f64(),
+                );
+                return;
+            }
+            Err(ReplyDeliveryError::RenameFailed(err)) => {
+                eprintln!(
+                    "{} failed to publish console auth reply to `{CONSOLE_AUTH_REPLY_PATH}`: {err}",
+                    theme.bold_red("auth")
+                );
+                return;
+            }
+            Err(ReplyDeliveryError::RenameTimedOut) => {
+                eprintln!(
+                    "{} timed out publishing console auth reply to `{CONSOLE_AUTH_REPLY_PATH}` after {:.1}s",
                     theme.bold_red("auth"),
                     rpc_timeout.as_secs_f64(),
                 );
@@ -560,7 +651,7 @@ mod tests {
         use std::time::Instant;
 
         let (host_sock, guest_sock) = UnixStream::pair().expect("socket pair");
-        let (peer, _driver) = crate::frame_reader::FrameReader::start(
+        let (peer, driver) = crate::frame_reader::FrameReader::start(
             Async::new(host_sock.try_clone().expect("clone host read")).expect("async read"),
             Async::new(host_sock).expect("async write"),
         )
@@ -593,6 +684,227 @@ mod tests {
         );
         assert!(broker.transport_degraded_logged);
         drop(peer);
+        drop(driver);
         let _ = server.join();
+    }
+
+    #[test]
+    fn staging_path_stays_in_same_directory_as_reply_path() {
+        let staged = console_auth_reply_staging_path(CONSOLE_AUTH_REPLY_PATH, 7);
+        assert_eq!(staged, "/run/console-auth/.reply-7.tmp");
+        assert_ne!(staged, CONSOLE_AUTH_REPLY_PATH);
+        assert_eq!(
+            Path::new(&staged).parent(),
+            Path::new(CONSOLE_AUTH_REPLY_PATH).parent()
+        );
+        assert_eq!(
+            console_auth_reply_staging_path("/reply.postcard", 2),
+            "/.reply-2.tmp"
+        );
+    }
+
+    #[test]
+    fn deliver_console_auth_reply_stages_then_atomically_renames() {
+        use async_io::Async;
+        use helios_wit_rpc::inspector::wasi::filesystem::types as rpc_fs;
+        use helios_wit_rpc::{
+            Dispatcher, Endpoint, ResourceEntry, ServerInvocation, StreamReader, WireError,
+            future as rpc_future,
+        };
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct MockEntry;
+
+        impl ResourceEntry for MockEntry {
+            fn kind_name(&self) -> &'static str {
+                "wasi:filesystem/types.descriptor"
+            }
+        }
+
+        #[derive(Default)]
+        struct MockFsState {
+            ops: Vec<String>,
+            handle_paths: BTreeMap<u32, String>,
+            files: BTreeMap<String, Vec<u8>>,
+        }
+
+        struct MockFsDispatcher {
+            state: Arc<Mutex<MockFsState>>,
+        }
+
+        impl Dispatcher for MockFsDispatcher {
+            type Resource = MockEntry;
+
+            fn supports(&self, instance: &str, func: &str) -> bool {
+                (instance.contains("wasi:filesystem/preopens") && func == "get-directories")
+                    || (instance.contains("wasi:filesystem/types")
+                        && matches!(
+                            func,
+                            "[method]descriptor.create-directory-at"
+                                | "[method]descriptor.open-at"
+                                | "[method]descriptor.write-via-stream"
+                                | "[method]descriptor.rename-at"
+                        ))
+            }
+
+            async fn dispatch<'a>(
+                &'a self,
+                ctx: ServerInvocation<'a, Self::Resource>,
+                instance: &'a str,
+                func: &'a str,
+            ) -> Result<(), WireError> {
+                if instance.contains("wasi:filesystem/preopens") && func == "get-directories" {
+                    let () = ctx.decode_request().await?;
+                    let handle = ctx.resources().lock().await.insert(MockEntry)?;
+                    return ctx.encode_response(vec![(handle, "/".to_owned())]).await;
+                }
+                match func {
+                    "[method]descriptor.create-directory-at" => {
+                        let (_base, rel): (u32, String) = ctx.decode_request().await?;
+                        self.state.lock().unwrap().ops.push(format!("mkdir:{rel}"));
+                        ctx.encode_response(Ok::<(), rpc_fs::ErrorCode>(())).await
+                    }
+                    "[method]descriptor.open-at" => {
+                        let (_base, _pf, rel, _of, _df): (
+                            u32,
+                            rpc_fs::PathFlags,
+                            String,
+                            rpc_fs::OpenFlags,
+                            rpc_fs::DescriptorFlags,
+                        ) = ctx.decode_request().await?;
+                        let handle = ctx.resources().lock().await.insert(MockEntry)?;
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            st.ops.push(format!("open:{rel}"));
+                            st.handle_paths.insert(handle, rel.clone());
+                            st.files.insert(rel, Vec::new());
+                        }
+                        ctx.encode_response(Ok::<u32, rpc_fs::ErrorCode>(handle))
+                            .await
+                    }
+                    "[method]descriptor.write-via-stream" => {
+                        let (file_handle, mut data, _offset): (u32, StreamReader<u8>, u64) =
+                            ctx.decode_request().await?;
+                        let path = self
+                            .state
+                            .lock()
+                            .unwrap()
+                            .handle_paths
+                            .get(&file_handle)
+                            .cloned()
+                            .ok_or(WireError::InvalidResourceHandle {
+                                handle: file_handle,
+                            })?;
+                        let state = Arc::clone(&self.state);
+                        let (fut_tx, fut_rx) = rpc_future::<Result<(), rpc_fs::ErrorCode>>();
+                        std::thread::spawn(move || {
+                            crate::runtime::block_on(async move {
+                                let mut all = Vec::new();
+                                while let Ok(Some(chunk)) = data.next_batch().await {
+                                    all.extend_from_slice(&chunk);
+                                }
+                                {
+                                    let mut st = state.lock().unwrap();
+                                    st.ops.push(format!("write:{path}:{}", all.len()));
+                                    st.files.insert(path, all);
+                                }
+                                let _ = fut_tx.resolve(Ok(())).await;
+                            });
+                        });
+                        ctx.encode_response(fut_rx).await
+                    }
+                    "[method]descriptor.rename-at" => {
+                        let (_src_base, old_path, _dst_base, new_path): (u32, String, u32, String) =
+                            ctx.decode_request().await?;
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            st.ops.push(format!("rename:{old_path}->{new_path}"));
+                            let bytes = st
+                                .files
+                                .remove(&old_path)
+                                .expect("staging file must exist before rename");
+                            st.files.insert(new_path, bytes);
+                        }
+                        ctx.encode_response(Ok::<(), rpc_fs::ErrorCode>(())).await
+                    }
+                    _ => Err(WireError::MalformedPayload {
+                        context: "MockFsDispatcher".to_owned(),
+                        detail: format!("unexpected call {instance}.{func}"),
+                    }),
+                }
+            }
+        }
+
+        let (host_sock, guest_sock) = UnixStream::pair().expect("socket pair");
+        let (peer, driver) = crate::frame_reader::FrameReader::start(
+            Async::new(host_sock.try_clone().expect("clone host read")).expect("async read"),
+            Async::new(host_sock).expect("async write"),
+        )
+        .expect("start frame reader");
+
+        let state = Arc::new(Mutex::new(MockFsState::default()));
+        let server_state = Arc::clone(&state);
+        let server = std::thread::spawn(move || {
+            crate::runtime::block_on(async move {
+                let r = Async::new(guest_sock.try_clone().expect("clone guest read"))
+                    .expect("guest read");
+                let w = Async::new(guest_sock).expect("guest write");
+                let endpoint = Endpoint::new(
+                    r,
+                    w,
+                    MockFsDispatcher {
+                        state: server_state,
+                    },
+                );
+                let _ = endpoint.drive().await;
+            });
+        });
+
+        let reply = ConsoleLoginAuthReply::Approved(ConsoleLoginProof {
+            request_id: 9,
+            username: "lexo".to_owned(),
+            public_key: helios_inspector_protocol::auth::AuthPublicKey::Ed25519([0x33; 32]),
+            proof: AuthProof::Ed25519([0x44; 64]),
+        });
+        let encoded = reply.encode_postcard().expect("encode reply");
+
+        crate::runtime::block_on(deliver_console_auth_reply(
+            &peer,
+            CONSOLE_AUTH_REPLY_PATH,
+            9,
+            &encoded,
+            Duration::from_secs(5),
+        ))
+        .expect("atomic reply delivery must succeed");
+
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.ops,
+            vec![
+                "mkdir:run/console-auth".to_owned(),
+                "open:run/console-auth/.reply-9.tmp".to_owned(),
+                format!("write:run/console-auth/.reply-9.tmp:{}", encoded.len()),
+                "rename:run/console-auth/.reply-9.tmp->run/console-auth/reply.postcard".to_owned(),
+            ]
+        );
+        assert!(
+            !st.files.contains_key("run/console-auth/.reply-9.tmp"),
+            "staging file must be moved away by rename"
+        );
+        let published = st
+            .files
+            .get("run/console-auth/reply.postcard")
+            .expect("final reply file must exist after rename");
+        assert_eq!(published, &encoded);
+        assert_eq!(
+            ConsoleLoginAuthReply::decode_postcard(published).expect("decode published reply"),
+            reply
+        );
+        drop(st);
+        drop(peer);
+        drop(driver);
+        server.join().expect("server thread");
     }
 }
