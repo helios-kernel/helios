@@ -7,12 +7,12 @@
 //! 4. Individual verification of every [`HibernateIdentity`] field.
 //! 5. Chunk table SHA-256 verification against the authenticated header.
 //! 6. Per-chunk descriptor validation and compressed payload SHA-256
-//!    verification **before** bounded `zrip` decompression.
+//!    verification **before** bounded `lz4_flex` decompression.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};
-use zrip::DecompressContext;
 
 use super::HibernateError;
 use super::format::{
@@ -273,31 +273,33 @@ pub(crate) fn verify_and_parse_chunk_table(
     Ok(chunks)
 }
 
-/// Verifies a compressed chunk's SHA-256 **before** bounded `zrip`
-/// decompression and checks that the decompressed length equals
-/// `desc.uncompressed_len`.
-pub(crate) fn verify_and_decompress_chunk<'a>(
-    decoder: &'a mut DecompressContext,
+/// Verifies a compressed chunk's SHA-256 **before** bounded `lz4_flex`
+/// decompression into `out` and checks that the decompressed length equals
+/// `desc.uncompressed_len`. Performs zero heap allocations.
+pub(crate) fn verify_and_decompress_chunk(
     desc: &ChunkDescriptor,
     chunk_index: u32,
-    compressed: &'a [u8],
-) -> Result<alloc::borrow::Cow<'a, [u8]>, HibernateError> {
+    compressed: &[u8],
+    out: &mut [u8],
+) -> Result<usize, HibernateError> {
     let digest: [u8; 32] = Sha256::digest(compressed).into();
     if !constant_time_eq_32(&digest, &desc.sha256) {
         return Err(HibernateError::ChunkChecksumMismatch { chunk_index });
     }
     let expected_len = desc.uncompressed_len as usize;
-    let decompressed = decoder
-        .decompress_with_limit(compressed, expected_len)
+    if out.len() < expected_len {
+        return Err(HibernateError::DecompressFailed { chunk_index });
+    }
+    let actual = lz4_flex::block::decompress_into(compressed, &mut out[..expected_len])
         .map_err(|_| HibernateError::DecompressFailed { chunk_index })?;
-    if decompressed.len() != expected_len {
+    if actual != expected_len {
         return Err(HibernateError::DecompressedLengthMismatch {
             chunk_index,
-            actual: decompressed.len(),
+            actual,
             expected: expected_len,
         });
     }
-    Ok(decompressed)
+    Ok(actual)
 }
 
 /// Verifies the hibernate header MAC, bounds, machine identity, and chunk
@@ -335,8 +337,8 @@ pub fn verify_image_header_and_table(
 /// Verifies the hibernate image end-to-end and streams each decompressed
 /// chunk's bytes to `write_chunk(start_phys_frame, decompressed_bytes)`.
 ///
-/// Every chunk's SHA-256 is verified **before** calling `zrip` decompression
-/// with the exact `uncompressed_len` limit.
+/// Every chunk's SHA-256 is verified **before** calling `lz4_flex`
+/// decompression into a buffer bounded by the exact `uncompressed_len`.
 pub fn decode_image_into<F>(
     image: &[u8],
     auth_key: &HibernateAuthKey,
@@ -349,7 +351,13 @@ where
 {
     let verified =
         verify_image_header_and_table(image, auth_key, expected_identity, machine_max_frames)?;
-    let mut decoder = DecompressContext::new();
+    let max_chunk_bytes = verified
+        .chunks
+        .iter()
+        .map(|desc| desc.uncompressed_len as usize)
+        .max()
+        .unwrap_or(0);
+    let mut decomp_buf = vec![0_u8; max_chunk_bytes];
 
     for (idx, desc) in verified.chunks.iter().enumerate() {
         let chunk_index = idx as u32;
@@ -362,9 +370,8 @@ where
         let end = start + desc.compressed_len as usize;
         let compressed = &image[start..end];
 
-        let decompressed =
-            verify_and_decompress_chunk(&mut decoder, desc, chunk_index, compressed)?;
-        write_chunk(desc.start_phys_frame, &decompressed)?;
+        let actual = verify_and_decompress_chunk(desc, chunk_index, compressed, &mut decomp_buf)?;
+        write_chunk(desc.start_phys_frame, &decomp_buf[..actual])?;
     }
 
     Ok(verified.header)

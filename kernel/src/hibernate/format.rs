@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! [ 0 .. 4096 )                                 HibernateHeader (4064B body + 32B HMAC-SHA256)
-//! [ 4096 .. chunk_table_offset )                Compressed chunk payloads (zstd via `zrip`)
+//! [ 4096 .. chunk_table_offset )                Compressed chunk payloads (LZ4 block via `lz4_flex`)
 //! [ chunk_table_offset .. total_image_bytes )   ChunkDescriptor[chunk_count] (64B each)
 //! ```
 
@@ -45,9 +45,6 @@ pub const CHUNK_DESCRIPTOR_BYTES: usize = 64;
 /// Default maximum contiguous physical frames grouped into one compressed
 /// chunk (`64 * 4 KiB = 256 KiB`).
 pub const DEFAULT_CHUNK_FRAMES: u32 = 64;
-
-/// Default zstd compression level for hibernate snapshots.
-pub const DEFAULT_HIBERNATE_COMPRESSION_LEVEL: i32 = 1;
 
 /// Hard upper bound on chunk descriptors in an image header (covers up to
 /// 1 TiB at 256 KiB chunks).
@@ -412,11 +409,11 @@ pub struct ChunkDescriptor {
     pub start_phys_frame: u64,
     /// Number of contiguous physical frames in this chunk (`1..=chunk_frames`).
     pub frame_count: u32,
-    /// Byte length of the compressed zstd payload in the image.
+    /// Byte length of the compressed LZ4 block payload in the image.
     pub compressed_len: u32,
     /// Exact byte length after decompression (`frame_count * frame_size`).
     pub uncompressed_len: u32,
-    /// Chunk encoding flags (`0` = zstd via `zrip`).
+    /// Chunk encoding flags (`0` = LZ4 block via `lz4_flex`).
     pub flags: u32,
     /// Byte offset of the compressed payload from the start of the image.
     pub data_offset: u64,

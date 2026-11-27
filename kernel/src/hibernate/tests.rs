@@ -22,8 +22,8 @@ use super::format::{
     hash_negotiated_features,
 };
 use super::snapshot::{
-    BoundedVecSink, EncodeParams, FrameRun, ReservationWriter, SnapshotConfig, encode_snapshot,
-    normalize_physical_runs,
+    BoundedVecSink, EncodeParams, FrameRun, ReservationWriter, SnapshotConfig,
+    SnapshotEncodeScratch, encode_snapshot, encode_snapshot_with_scratch, normalize_physical_runs,
 };
 use super::verify::{decode_image_into, verify_image_header_and_table};
 use crate::machine::MachineGeneration;
@@ -731,51 +731,63 @@ fn normalize_physical_runs_merges_and_subtracts_exclusions() {
 }
 
 #[test]
-fn kernel_allocator_scratch_mode_isolates_main_heap() {
-    use core::alloc::GlobalAlloc;
+fn encode_snapshot_with_scratch_preserves_preallocated_buffers() {
+    let key = auth_key(0x73);
+    let identity = sample_identity();
+    let runs = [FrameRun::new(8, 130), FrameRun::new(300, 5)];
+    let machine_max_frames = 512;
+    let config = SnapshotConfig::new([0x5c; 16]);
+    let mut scratch = SnapshotEncodeScratch::for_runs(&runs, config.chunk_frames)
+        .expect("pre-allocated encode scratch");
+    let before = scratch.buffer_ptrs_and_caps();
 
-    let main_backing = AlignedPoolBacking::new(256 * 1024);
-    let scratch_backing = AlignedPoolBacking::new(256 * 1024);
-    let allocator = KernelAllocator::empty();
-    let (ms, me) = main_backing.range();
-    let (ss, se) = scratch_backing.range();
-    // SAFETY: `main_backing` stays live for the duration of this test.
-    unsafe { allocator.add_to_heap(ms, me) };
-
-    let layout = Layout::from_size_align(128, 16).unwrap();
-    // SAFETY: `allocator` has a claimed main heap and non-zero `layout`.
-    let main_ptr = unsafe { allocator.alloc(layout) };
-    assert!(!main_ptr.is_null());
-    assert!((ms..me).contains(&(main_ptr as usize)));
-
-    let before_stats = allocator.stats();
-    // SAFETY: single-threaded test; `scratch_backing` stays live until exit.
-    unsafe { allocator.enter_snapshot_scratch(&[(scratch_backing.ptr, se - ss)]) };
-
-    // SAFETY: scratch mode is active with 256 KiB claimed.
-    let s1 = unsafe { allocator.alloc(layout) };
-    assert!(!s1.is_null());
-    assert!((ss..se).contains(&(s1 as usize)));
-    // SAFETY: `s1` came from scratch mode with `layout`.
-    let s2 = unsafe { allocator.realloc(s1, layout, 512) };
-    assert!(!s2.is_null());
-    assert!((ss..se).contains(&(s2 as usize)));
-    // SAFETY: `s2` came from scratch mode with 512-byte layout.
-    unsafe { allocator.dealloc(s2, Layout::from_size_align(512, 16).unwrap()) };
+    let mut sink = BoundedVecSink::new(16 * 1024 * 1024);
+    let header = encode_snapshot_with_scratch(
+        EncodeParams {
+            auth_key: Some(&key),
+            identity,
+            machine_max_frames,
+            bsp_context: BspSnapshotContext::hosted(11),
+            config,
+        },
+        &runs,
+        &mut scratch,
+        &mut sink,
+        |frame, dst| {
+            *dst = synthetic_frame(frame);
+        },
+        || {},
+    )
+    .expect("zero-alloc LZ4 snapshot encode succeeds");
 
     assert_eq!(
-        allocator.stats(),
-        before_stats,
-        "scratch-mode alloc/realloc/dealloc must not mutate main heap metadata or counters"
+        scratch.buffer_ptrs_and_caps(),
+        before,
+        "encode_snapshot_with_scratch must not reallocate any pre-allocated scratch buffer"
     );
+    assert_eq!(header.chunk_count, 4);
+    assert_eq!(header.total_frames, 135);
 
-    allocator.exit_snapshot_scratch();
-    // SAFETY: `main_ptr` came from main heap before scratch mode.
-    unsafe { allocator.dealloc(main_ptr, layout) };
-    assert_eq!(
-        allocator.stats().deallocation_count,
-        before_stats.deallocation_count + 1
-    );
+    let image = sink.into_inner();
+    let mut restored_frames = 0_u64;
+    let decoded = decode_image_into(
+        &image,
+        &key,
+        &identity,
+        machine_max_frames,
+        |start_frame, bytes| {
+            let (chunks, remainder) = bytes.as_chunks::<{ PhysFrame::SIZE }>();
+            assert!(remainder.is_empty());
+            for (idx, frame_bytes) in chunks.iter().enumerate() {
+                assert_eq!(*frame_bytes, synthetic_frame(start_frame + idx as u64));
+                restored_frames += 1;
+            }
+            Ok(())
+        },
+    )
+    .expect("LZ4 snapshot decodes and verifies");
+    assert_eq!(decoded, header);
+    assert_eq!(restored_frames, 135);
 }
 
 #[test]
@@ -859,10 +871,9 @@ fn atomic_snapshot_reservation_exhaustion_thaws_and_releases_frames() {
         }
     }
 
-    // Prime a 32 MiB synthetic machine so `prime_bootstrap_allocator`,
-    // `HIBERNATE_ENCODE_SCRATCH_BYTES`, and `Kernel::freeze` run against real
-    // allocator + pool structures.
-    let backing = AlignedPoolBacking::new(32 * 1024 * 1024);
+    // Prime a 16 MiB synthetic machine so `prime_bootstrap_allocator` and
+    // `Kernel::freeze` run against real allocator + pool structures.
+    let backing = AlignedPoolBacking::new(16 * 1024 * 1024);
     let (start, end) = backing.range();
     let span = NonNull::slice_from_raw_parts(backing.ptr, end - start);
     // SAFETY: `backing` stays alive for the rest of this test process.
