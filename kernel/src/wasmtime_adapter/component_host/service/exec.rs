@@ -420,6 +420,11 @@ where
     // run ends — on any exit — but only when the caller marked the
     // handle `for_task`.
     let task_trace = timeline.task_guard(exec_context.cpu.clone());
+    // Box each execution branch so `run_program_executable`'s future (which
+    // `spawn_loaded_with_output_mode` constructs on the caller's fiber stack
+    // before handing to `try_spawn_local_detached`) stays well within
+    // `FIBER_STACK_HOST_RESERVE` instead of embedding the largest ~33 KiB
+    // runtime state machine inline.
     let outcome = match executable {
         // A component has no descriptor table of its own: the table a
         // WASIX parent hands down becomes its stdio, and is dropped here
@@ -433,7 +438,7 @@ where
             };
             match stdio {
                 Ok(output_mode) => {
-                    run_program_component(
+                    Box::pin(run_program_component(
                         exec_context,
                         argv,
                         env,
@@ -451,7 +456,7 @@ where
                         launched_instance,
                         output_mode,
                         &timeline,
-                    )
+                    ))
                     .await
                 }
                 Err(refusal) => Err(ProgramExecError {
@@ -461,7 +466,7 @@ where
             }
         }
         ProgramExecutable::CoreModule(compiled) => {
-            run_program_core_module(
+            Box::pin(run_program_core_module(
                 exec_context,
                 argv,
                 env,
@@ -483,7 +488,7 @@ where
                 launched_instance,
                 output_mode,
                 &timeline,
-            )
+            ))
             .await
         }
         // A Linux process holds the descriptor table it is handed as its
@@ -510,7 +515,7 @@ where
                     core_module_instance_pre_cache,
                 }),
             };
-            run_linux_process(
+            Box::pin(run_linux_process(
                 exec_runtime,
                 argv,
                 env,
@@ -525,11 +530,11 @@ where
                 output_mode,
                 executable,
                 &timeline,
-            )
+            ))
             .await
         }
         ProgramExecutable::ForkedCoreModule { compiled, restore } => {
-            run_program_core_module_with_restore(
+            Box::pin(run_program_core_module_with_restore(
                 exec_context,
                 argv,
                 env,
@@ -549,7 +554,7 @@ where
                 launched_instance,
                 output_mode,
                 &timeline,
-            )
+            ))
             .await
         }
     };

@@ -51,11 +51,10 @@ pub(crate) fn discover(fdt: &Fdt<'_>) -> Option<GoldfishRtc> {
         .reg()
         .and_then(|mut regions| regions.next())
         .unwrap_or_else(|| panic!("RISC-V goldfish RTC node has no usable reg property"));
-    assert!(
-        region.size.is_some_and(|size| size != 0),
-        "RISC-V goldfish RTC reg property has zero size"
-    );
-    Some(GoldfishRtc {
-        base: region.starting_address as usize,
-    })
+    let size = region
+        .size
+        .filter(|&size| size != 0)
+        .unwrap_or_else(|| panic!("RISC-V goldfish RTC reg property has zero size"));
+    let base = crate::vmm::map_mmio_range(region.starting_address as usize, size);
+    Some(GoldfishRtc { base })
 }

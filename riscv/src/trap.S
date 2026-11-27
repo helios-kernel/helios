@@ -22,7 +22,7 @@
 //
 // It saves the floating-point file as well as the integer file.
 // `riscv64gc-unknown-none-elf` is `+f,+d` with the `lp64d` ABI and
-// `riscv-rt` leaves `sstatus.FS` enabled, so compiled kernel code holds
+// `_start` leaves `sstatus.FS` enabled, so compiled kernel code holds
 // live values in `f0`-`f31` and passes doubles in them. The handler this
 // entry calls is ordinary Rust and clobbers every one of them; an entry
 // that restored only the integer file would hand the interrupted code

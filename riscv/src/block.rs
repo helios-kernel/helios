@@ -187,7 +187,8 @@ fn discover_block_devices(
             }
             BlockCandidate::Mmio(candidate) => {
                 let base = candidate.base;
-                let header = core::ptr::NonNull::new(base as *mut u8)
+                let virt_base = crate::vmm::map_mmio_range(base, candidate.size);
+                let header = core::ptr::NonNull::new(virt_base as *mut u8)
                     .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
                 let line = candidate
                     .interrupt

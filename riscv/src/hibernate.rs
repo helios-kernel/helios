@@ -18,13 +18,14 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::global_asm;
+use core::arch::{global_asm, naked_asm};
 use core::mem::{offset_of, size_of};
 use core::ops::Range;
 use core::time::Duration;
 
+use helios_hal::boot::BootMemoryMetadata;
 use helios_hal::cpu::{
-    Cpu, DisplacedFrameCopy, ResumeHandoff, ResumeHandoffWire, Riscv64SnapshotContext,
+    Cpu, DisplacedFrameCopy, ProcessorId, ResumeHandoff, ResumeHandoffWire, Riscv64SnapshotContext,
 };
 use helios_hal::fs::BlockDevice as _;
 use helios_hal::pmm::PhysFrame;
@@ -42,6 +43,7 @@ use helios_kernel::{
     ProviderReceiver, ResetDevice, RootEntropy, UserMemoryPool,
 };
 use helios_virtio::DeviceType;
+use limine::mp::MpInfo;
 
 use crate::RiscvCpu;
 use crate::balloon::RiscvVirtioBalloonDevice;
@@ -60,6 +62,9 @@ global_asm!(include_str!("restore.S"));
 
 unsafe extern "C" {
     fn __helios_riscv_restore_trampoline(params: *const RiscvRestoreParams) -> !;
+    static __helios_riscv_restore_trampoline_enter_end: u8;
+    fn __helios_riscv_restore_finish() -> !;
+    static __helios_riscv_restore_finish_end: u8;
 }
 
 /// Polled I/O deadline for early-boot hibernate disk discovery, verification,
@@ -71,16 +76,17 @@ const POLLED_TIMEOUT: Duration = Duration::from_secs(30);
 const HIBERNATE_IO_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parameter block written at offset `0x000` of the safe 4 KiB trampoline page
-/// (`trampoline_phys`, identity-mapped on RISC-V) before entering
+/// (mapped in Boot 2's HHDM) before entering
 /// [`__helios_riscv_restore_trampoline`].
 #[repr(C)]
 struct RiscvRestoreParams {
     trampoline_satp: u64,
-    copy_table_phys: u64,
+    copy_table_virt: u64,
     copy_count: u64,
-    stack_top_phys: u64,
+    direct_map_offset: u64,
+    stack_top_virt: u64,
     handoff_phys: u64,
-    ctx_phys: u64,
+    ctx_virt: u64,
 }
 
 const HANDOFF_PAGE_OFFSET: usize = 0x80;
@@ -89,11 +95,12 @@ const STACK_TOP_PAGE_OFFSET: usize = 0xff0;
 
 const _: () = {
     assert!(offset_of!(RiscvRestoreParams, trampoline_satp) == 0x00);
-    assert!(offset_of!(RiscvRestoreParams, copy_table_phys) == 0x08);
+    assert!(offset_of!(RiscvRestoreParams, copy_table_virt) == 0x08);
     assert!(offset_of!(RiscvRestoreParams, copy_count) == 0x10);
-    assert!(offset_of!(RiscvRestoreParams, stack_top_phys) == 0x18);
-    assert!(offset_of!(RiscvRestoreParams, handoff_phys) == 0x20);
-    assert!(offset_of!(RiscvRestoreParams, ctx_phys) == 0x28);
+    assert!(offset_of!(RiscvRestoreParams, direct_map_offset) == 0x18);
+    assert!(offset_of!(RiscvRestoreParams, stack_top_virt) == 0x20);
+    assert!(offset_of!(RiscvRestoreParams, handoff_phys) == 0x28);
+    assert!(offset_of!(RiscvRestoreParams, ctx_virt) == 0x30);
     assert!(size_of::<RiscvRestoreParams>() <= HANDOFF_PAGE_OFFSET);
     assert!(HANDOFF_PAGE_OFFSET + size_of::<ResumeHandoffWire>() <= CTX_PAGE_OFFSET);
     assert!(CTX_PAGE_OFFSET + size_of::<Riscv64SnapshotContext>() <= 0x280);
@@ -452,7 +459,7 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
 
     let feature_records = devices.feature_records();
     // SAFETY: `boot_memory.kernel_sections.text` and `rodata` describe the
-    // immutable identity-mapped `.text` and `.rodata` sections of this kernel.
+    // immutable higher-half `.text` and `.rodata` sections of this kernel.
     let expected_identity = match unsafe {
         build_machine_identity(
             boot_memory,
@@ -474,8 +481,10 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
     let usable_frames = usable_physical_frame_runs(boot_memory);
     let dram_frames = dram_physical_frame_runs(boot_memory);
     let protected_ranges = collect_boot_protected_ranges(boot_memory, pool, extra_protected);
-    // 1 frame: Sv48 root table whose entry 0 is a 512 GiB RWX identity leaf.
-    let table_pages = 1_usize;
+    let physical_memory_offset = crate::vmm::physical_memory_offset();
+    // Up to 8 frames: L3 root + L2 HHDM table + L2/L1/L0 tables for `V_enter`
+    // and `V_finish` (6 tables worst case if both span distinct L2/L1/L0s).
+    let table_pages = 8_usize;
 
     let cpu_for_storage = cpu.clone();
     let deadline = cpu
@@ -497,24 +506,30 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         &protected_ranges,
         table_pages,
         |src_phys, frame_bytes| {
-            // SAFETY: RISC-V identity-maps all physical RAM; `src_phys` lies
-            // in Boot 2's immutable kernel image or boot payload region.
+            let src_virt = (src_phys as usize)
+                .checked_add(physical_memory_offset)
+                .expect("hibernate source physical frame overflows HHDM");
+            // SAFETY: `src_phys` lies in Boot 2's immutable kernel image or
+            // boot payload region, mapped readable through HHDM.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    core::ptr::with_exposed_provenance::<u8>(src_phys as usize),
+                    core::ptr::with_exposed_provenance::<u8>(src_virt),
                     frame_bytes.as_mut_ptr(),
                     PhysFrame::SIZE,
                 );
             }
         },
         |dst_phys, frame_bytes| {
-            // SAFETY: RISC-V identity-maps all physical RAM; `dst_phys` is
-            // either a non-colliding final target frame or a safe displaced
-            // frame outside every boot-kernel protected range.
+            let dst_virt = (dst_phys as usize)
+                .checked_add(physical_memory_offset)
+                .expect("hibernate destination physical frame overflows HHDM");
+            // SAFETY: `dst_phys` is either a non-colliding final target frame
+            // or a safe displaced frame outside every boot-kernel protected
+            // range, mapped writable through HHDM.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     frame_bytes.as_ptr(),
-                    core::ptr::with_exposed_provenance_mut::<u8>(dst_phys as usize),
+                    core::ptr::with_exposed_provenance_mut::<u8>(dst_virt),
                     PhysFrame::SIZE,
                 );
             }
@@ -527,11 +542,13 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         ResumeProbe::Ready(loaded) => loaded,
     };
 
-    assert_eq!(
-        loaded.header.identity.kernel_text_phys_start,
-        boot_memory.kernel_sections.text.physical_start,
-        "identity-mapped RISC-V kernel .text physical start must match across resume"
-    );
+    // Limine starts secondary harts and parks them in its bootloader-reclaimable
+    // spin loop. Stop every secondary via SBI HSM `hart_stop` before overwriting
+    // memory so none executes overwritten Limine pages and post-resume
+    // `restart_processor` sees every secondary cleanly `STOPPED`.
+    if cpu.processor_count() > 1 {
+        stop_limine_secondaries(cpu);
+    }
 
     // Collect fresh per-boot handoff state BEFORE quiescing devices.
     let mut fresh_entropy = [0_u8; 32];
@@ -565,7 +582,7 @@ pub(crate) fn probe_and_resume_if_present<WatchdogImpl, MeasuredBootImpl>(
         "entering RISC-V hibernate restore trampoline"
     );
 
-    enter_restore_trampoline(&loaded, handoff)
+    enter_restore_trampoline(&loaded, handoff, boot_memory, physical_memory_offset)
 }
 
 /// BSP-pinned detached task serving guest `helios:system/snapshot.hibernate`
@@ -676,7 +693,65 @@ fn find_hibernate_block_device(
     None
 }
 
-fn enter_restore_trampoline(loaded: &LoadedHibernateImage, handoff: ResumeHandoff) -> ! {
+/// Sends every Limine-parked secondary hart into SBI HSM `hart_stop` and waits
+/// until firmware reports each secondary `STOPPED`.
+fn stop_limine_secondaries(cpu: &RiscvCpu) {
+    let bsp = cpu.bootstrap_processor();
+    for id in 0..cpu.processor_count() {
+        let hart = ProcessorId::new(id as u16);
+        if hart == bsp {
+            continue;
+        }
+        let mp_info = crate::mp_info_for_hart(hart);
+        mp_info.bootstrap(limine_secondary_stop_entry, 0);
+    }
+    for id in 0..cpu.processor_count() {
+        let hart = ProcessorId::new(id as u16);
+        if hart == bsp {
+            continue;
+        }
+        while crate::hart_status(hart) != sbi_spec::hsm::hart_state::STOPPED {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn limine_secondary_stop_entry(_mp_info: &MpInfo) -> ! {
+    naked_asm!(
+        "csrci sstatus, 0x2",
+        "csrw sie, zero",
+        ".option push",
+        ".option norelax",
+        "la gp, __global_pointer$",
+        ".option pop",
+        ".option push",
+        ".option arch, +f",
+        "li t0, 0x4000",
+        "csrc sstatus, t0",
+        "li t0, 0x2000",
+        "csrs sstatus, t0",
+        "fscsr x0",
+        ".option pop",
+        "tail {stop_main}",
+        stop_main = sym limine_secondary_stop_main,
+    )
+}
+
+extern "C" fn limine_secondary_stop_main() -> ! {
+    let ret = sbi_rt::hart_stop();
+    panic!(
+        "SBI HSM refused to stop Limine secondary hart before hibernate restore: error={} value={}",
+        ret.error, ret.value
+    );
+}
+
+fn enter_restore_trampoline(
+    loaded: &LoadedHibernateImage,
+    handoff: ResumeHandoff,
+    boot_memory: &BootMemoryMetadata,
+    physical_memory_offset: usize,
+) -> ! {
     let ctx = loaded
         .header
         .bsp_context
@@ -685,89 +760,170 @@ fn enter_restore_trampoline(loaded: &LoadedHibernateImage, handoff: ResumeHandof
     let plan = &loaded.plan;
 
     // 1. Copy the `DisplacedFrameCopy` array into its contiguous safe pages.
-    let copy_table_phys = if plan.displaced_copies.is_empty() {
+    let copy_table_virt = if plan.displaced_copies.is_empty() {
         0_u64
     } else {
+        let virt = (plan.copy_table_phys as usize)
+            .checked_add(physical_memory_offset)
+            .expect("copy table address overflows HHDM");
         // SAFETY: `plan.copy_table_phys` holds `plan.copy_table_pages` contiguous
         // safe frames outside both boot-kernel memory and image targets.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 plan.displaced_copies.as_ptr(),
-                core::ptr::with_exposed_provenance_mut::<DisplacedFrameCopy>(
-                    plan.copy_table_phys as usize,
-                ),
+                core::ptr::with_exposed_provenance_mut::<DisplacedFrameCopy>(virt),
                 plan.displaced_copies.len(),
             );
         }
-        plan.copy_table_phys
+        virt as u64
     };
 
-    // 2. Build a 1-page Sv48 root table mapping 0..512 GiB as an identity leaf.
-    let trampoline_satp = build_trampoline_satp(plan.trampoline_table_frames[0]);
+    // 2. Stage a safe copy of `V_enter` into `plan.trampoline_enter_copy_phys`
+    //    and build the self-contained Sv48 trampoline table mapping HHDM,
+    //    `V_enter -> enter_copy_phys`, and `V_finish -> image_finish_phys`.
+    let enter_virt = __helios_riscv_restore_trampoline as *const () as usize;
+    let enter_end = &raw const __helios_riscv_restore_trampoline_enter_end as usize;
+    let finish_virt = __helios_riscv_restore_finish as *const () as usize;
+    let finish_end = &raw const __helios_riscv_restore_finish_end as usize;
+    assert!(
+        enter_virt.is_multiple_of(PhysFrame::SIZE),
+        "RISC-V restore trampoline entry is not page-aligned"
+    );
+    assert!(
+        finish_virt.is_multiple_of(PhysFrame::SIZE),
+        "RISC-V restore trampoline finish is not page-aligned"
+    );
+    assert!(
+        enter_end > enter_virt && enter_end - enter_virt <= PhysFrame::SIZE,
+        "RISC-V restore trampoline entry exceeds one 4 KiB page"
+    );
+    assert!(
+        finish_end > finish_virt && finish_end - finish_virt <= PhysFrame::SIZE,
+        "RISC-V restore trampoline finish exceeds one 4 KiB page"
+    );
+    assert_ne!(
+        enter_virt, finish_virt,
+        "RISC-V restore trampoline entry and finish must occupy distinct pages"
+    );
+
+    let enter_copy_virt = (plan.trampoline_enter_copy_phys as usize)
+        .checked_add(physical_memory_offset)
+        .expect("trampoline entry copy address overflows HHDM");
+    // SAFETY: `enter_virt` is a mapped readable 4 KiB `.text` page of the
+    // running kernel and `enter_copy_virt` is an exclusively owned safe 4 KiB
+    // frame mapped writable in HHDM.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::with_exposed_provenance::<u8>(enter_virt),
+            core::ptr::with_exposed_provenance_mut::<u8>(enter_copy_virt),
+            PhysFrame::SIZE,
+        );
+    }
+
+    let offset_in_text = (finish_virt as u64)
+        .checked_sub(loaded.header.identity.kernel_text_virt_start)
+        .expect("RISC-V restore finish lies outside kernel .text");
+    let image_finish_phys = loaded.header.identity.kernel_text_phys_start + offset_in_text;
+    assert!(
+        image_finish_phys.is_multiple_of(PhysFrame::SIZE as u64),
+        "image restore finish physical address is not page-aligned"
+    );
+
+    let trampoline_satp = build_trampoline_satp(
+        &plan.trampoline_table_frames,
+        boot_memory,
+        physical_memory_offset,
+        enter_virt,
+        plan.trampoline_enter_copy_phys,
+        finish_virt,
+        image_finish_phys,
+    );
 
     // 3. Populate the safe trampoline page with `RiscvRestoreParams`,
     //    `ResumeHandoffWire`, and `Riscv64SnapshotContext`.
-    let tramp_phys = plan.trampoline_phys as usize;
-    // SAFETY: `plan.trampoline_phys` is a dedicated safe 4 KiB identity-mapped frame.
+    let tramp_virt = (plan.trampoline_phys as usize)
+        .checked_add(physical_memory_offset)
+        .expect("trampoline page address overflows HHDM");
+    // SAFETY: `plan.trampoline_phys` is a dedicated safe 4 KiB frame mapped in HHDM.
     unsafe {
         core::ptr::write_bytes(
-            core::ptr::with_exposed_provenance_mut::<u8>(tramp_phys),
+            core::ptr::with_exposed_provenance_mut::<u8>(tramp_virt),
             0,
             PhysFrame::SIZE,
         );
     }
 
     let handoff_phys = plan.trampoline_phys + HANDOFF_PAGE_OFFSET as u64;
-    let ctx_phys = plan.trampoline_phys + CTX_PAGE_OFFSET as u64;
-    let stack_top_phys = plan.trampoline_phys + STACK_TOP_PAGE_OFFSET as u64;
+    let handoff_virt = tramp_virt + HANDOFF_PAGE_OFFSET;
+    let ctx_virt = tramp_virt + CTX_PAGE_OFFSET;
+    let stack_top_virt = tramp_virt + STACK_TOP_PAGE_OFFSET;
 
     let params = RiscvRestoreParams {
         trampoline_satp,
-        copy_table_phys,
+        copy_table_virt,
         copy_count: plan.displaced_copies.len() as u64,
-        stack_top_phys,
+        direct_map_offset: physical_memory_offset as u64,
+        stack_top_virt: stack_top_virt as u64,
         handoff_phys,
-        ctx_phys,
+        ctx_virt: ctx_virt as u64,
     };
     let wire = handoff.to_wire();
 
-    // SAFETY: `tramp_phys` is 4 KiB aligned and exclusively owned on the safe
+    // SAFETY: `tramp_virt` is 4 KiB aligned and exclusively owned on the safe
     // trampoline page; offsets are checked by compile-time assertions above.
     unsafe {
         core::ptr::write(
-            core::ptr::with_exposed_provenance_mut::<RiscvRestoreParams>(tramp_phys),
+            core::ptr::with_exposed_provenance_mut::<RiscvRestoreParams>(tramp_virt),
             params,
         );
     }
-    // SAFETY: `handoff_phys` lies at `HANDOFF_PAGE_OFFSET` on the safe trampoline page.
+    // SAFETY: `handoff_virt` lies at `HANDOFF_PAGE_OFFSET` on the safe trampoline page.
     unsafe {
         core::ptr::write(
-            core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(handoff_phys as usize),
+            core::ptr::with_exposed_provenance_mut::<ResumeHandoffWire>(handoff_virt),
             wire,
         );
     }
-    // SAFETY: `ctx_phys` lies at `CTX_PAGE_OFFSET` on the safe trampoline page.
+    // SAFETY: `ctx_virt` lies at `CTX_PAGE_OFFSET` on the safe trampoline page.
     unsafe {
         core::ptr::write(
-            core::ptr::with_exposed_provenance_mut::<Riscv64SnapshotContext>(ctx_phys as usize),
+            core::ptr::with_exposed_provenance_mut::<Riscv64SnapshotContext>(ctx_virt),
             ctx,
         );
     }
 
+    // Order all writes to `trampoline_enter_copy_phys` and page tables before
+    // entering the trampoline.
+    // SAFETY: `fence rw, rw; fence.i` orders memory stores and instruction fetch.
+    unsafe {
+        core::arch::asm!("fence rw, rw", "fence.i", options(nostack, preserves_flags));
+    }
+
     // SAFETY: all displaced frames are staged in disjoint safe frames, the
-    // trampoline Sv48 root table lives in a safe frame, `params` sits on the
-    // safe trampoline page, and interrupts are disabled.
+    // trampoline Sv48 page tables live in safe frames, `params` sits on the
+    // safe trampoline page, all Limine secondaries are stopped, and interrupts
+    // are disabled.
     unsafe {
         __helios_riscv_restore_trampoline(core::ptr::with_exposed_provenance::<RiscvRestoreParams>(
-            tramp_phys,
+            tramp_virt,
         ))
     }
 }
 
-/// Builds a 1-page Sv48 root page table in `root_phys` with entry 0 mapping
-/// `0..512 GiB` as a RWX identity leaf (matching `riscv/src/vmm.rs`), and
-/// returns the `satp` value selecting it.
-fn build_trampoline_satp(root_phys: u64) -> u64 {
+/// Builds a self-contained Sv48 page table in `table_frames` (up to 8 frames)
+/// mapping:
+/// - `0..max_phys` at `physical_memory_offset + phys` using 1 GiB leaves (RW),
+/// - `enter_virt` (`V_enter`) -> `enter_copy_phys` (RX), and
+/// - `finish_virt` (`V_finish`) -> `image_finish_phys` (RX, matching Boot 1).
+fn build_trampoline_satp(
+    table_frames: &[u64],
+    boot_memory: &BootMemoryMetadata,
+    physical_memory_offset: usize,
+    enter_virt: usize,
+    enter_copy_phys: u64,
+    finish_virt: usize,
+    image_finish_phys: u64,
+) -> u64 {
     const SATP_MODE_SV48: u64 = 9 << 60;
     const PTE_VALID: u64 = 1 << 0;
     const PTE_READ: u64 = 1 << 1;
@@ -775,17 +931,94 @@ fn build_trampoline_satp(root_phys: u64) -> u64 {
     const PTE_EXECUTE: u64 = 1 << 3;
     const PTE_ACCESSED: u64 = 1 << 6;
     const PTE_DIRTY: u64 = 1 << 7;
+    const PTE_PPN_SHIFT: u32 = 10;
+    const GIB: u64 = 1 << 30;
 
-    let ptr = core::ptr::with_exposed_provenance_mut::<u64>(root_phys as usize);
-    // SAFETY: `root_phys` is an exclusively owned safe 4 KiB frame.
-    unsafe {
-        core::ptr::write_bytes(ptr.cast::<u8>(), 0, PhysFrame::SIZE);
+    let mut next_frame = 0_usize;
+    let mut alloc_table = || -> u64 {
+        let phys = table_frames[next_frame];
+        next_frame += 1;
+        let virt = (phys as usize)
+            .checked_add(physical_memory_offset)
+            .expect("trampoline table frame overflows HHDM");
+        // SAFETY: `phys` is an exclusively owned safe 4 KiB frame mapped in HHDM.
+        unsafe {
+            core::ptr::write_bytes(
+                core::ptr::with_exposed_provenance_mut::<u8>(virt),
+                0,
+                PhysFrame::SIZE,
+            );
+        }
+        phys
+    };
+    let table_at = |phys: u64| -> &mut [u64; 512] {
+        let virt = (phys as usize)
+            .checked_add(physical_memory_offset)
+            .expect("trampoline table frame overflows HHDM");
+        // SAFETY: `phys` is one of the disjoint, page-aligned 4 KiB frames in
+        // `table_frames`, zero-initialized and exclusively owned by this builder.
+        unsafe { &mut *core::ptr::with_exposed_provenance_mut::<[u64; 512]>(virt) }
+    };
+
+    let l3_phys = alloc_table();
+
+    // 1. Map all physical RAM at HHDM with 1 GiB RW leaves.
+    let max_phys = boot_memory.max_physical_address().max(GIB);
+    let gib_count = max_phys.div_ceil(GIB).min(512) as usize;
+    let hhdm_l2_phys = alloc_table();
+    let hhdm_l3_idx = (physical_memory_offset >> 39) & 0x1ff;
+    table_at(l3_phys)[hhdm_l3_idx] = ((hhdm_l2_phys >> 12) << PTE_PPN_SHIFT) | PTE_VALID;
+    let hhdm_l2_base = (physical_memory_offset >> 30) & 0x1ff;
+    let hhdm_l2 = table_at(hhdm_l2_phys);
+    for g in 0..gib_count {
+        let l2_idx = hhdm_l2_base + g;
+        assert!(l2_idx < 512, "HHDM exceeds one L2 table during restore");
+        let phys = (g as u64) * GIB;
+        hhdm_l2[l2_idx] = ((phys >> 12) << PTE_PPN_SHIFT)
+            | PTE_VALID
+            | PTE_READ
+            | PTE_WRITE
+            | PTE_ACCESSED
+            | PTE_DIRTY;
     }
-    // Entry 0: PPN = 0, V | R | W | X | A | D (512 GiB identity superpage).
-    let leaf = PTE_VALID | PTE_READ | PTE_WRITE | PTE_EXECUTE | PTE_ACCESSED | PTE_DIRTY;
-    // SAFETY: index 0 is within the 512-entry Sv48 root table.
-    unsafe {
-        ptr.write(leaf);
+
+    // 2. Map `V_enter -> enter_copy_phys` and `V_finish -> image_finish_phys` (RX).
+    for (virt, phys) in [
+        (enter_virt, enter_copy_phys),
+        (finish_virt, image_finish_phys),
+    ] {
+        let i3 = (virt >> 39) & 0x1ff;
+        let i2 = (virt >> 30) & 0x1ff;
+        let i1 = (virt >> 21) & 0x1ff;
+        let i0 = (virt >> 12) & 0x1ff;
+
+        let l3_entry = table_at(l3_phys)[i3];
+        let l2_phys = if l3_entry & PTE_VALID != 0 {
+            (l3_entry >> PTE_PPN_SHIFT) << 12
+        } else {
+            let fresh = alloc_table();
+            table_at(l3_phys)[i3] = ((fresh >> 12) << PTE_PPN_SHIFT) | PTE_VALID;
+            fresh
+        };
+        let l2_entry = table_at(l2_phys)[i2];
+        let l1_phys = if l2_entry & PTE_VALID != 0 {
+            (l2_entry >> PTE_PPN_SHIFT) << 12
+        } else {
+            let fresh = alloc_table();
+            table_at(l2_phys)[i2] = ((fresh >> 12) << PTE_PPN_SHIFT) | PTE_VALID;
+            fresh
+        };
+        let l1_entry = table_at(l1_phys)[i1];
+        let l0_phys = if l1_entry & PTE_VALID != 0 {
+            (l1_entry >> PTE_PPN_SHIFT) << 12
+        } else {
+            let fresh = alloc_table();
+            table_at(l1_phys)[i1] = ((fresh >> 12) << PTE_PPN_SHIFT) | PTE_VALID;
+            fresh
+        };
+        table_at(l0_phys)[i0] =
+            ((phys >> 12) << PTE_PPN_SHIFT) | PTE_VALID | PTE_READ | PTE_EXECUTE | PTE_ACCESSED;
     }
-    SATP_MODE_SV48 | (root_phys >> 12)
+
+    SATP_MODE_SV48 | (l3_phys >> 12)
 }

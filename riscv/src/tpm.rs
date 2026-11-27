@@ -3,8 +3,9 @@
 //!
 //! Adapter code only: this module locates a `tcg,tpm-tis-mmio` node in the
 //! flattened device tree (directly under `/` or one bus below with `ranges`
-//! translation), opens its identity-mapped locality-0 MMIO window, and calls
-//! `helios_tpm::discover` to run the measured-boot qualification checks.
+//! translation), maps its locality-0 MMIO window in the higher-half direct
+//! map, and calls `helios_tpm::discover` with Limine's TPM event log to run
+//! the measured-boot qualification checks.
 //!
 //! Concurrency contract: discovery runs once, on the bootstrap hart, before the
 //! kernel is initialised and before any secondary hart starts.
@@ -13,9 +14,12 @@ use core::ptr::NonNull;
 
 use fdt::Fdt;
 use fdt::node::FdtNode;
-use helios_tpm::{Discovered, Discovery, InterfaceDescription, LOCALITY_BYTES, MmioWindow};
+use helios_hal::boot::MeasurementLog;
+use helios_tpm::{
+    Discovered, Discovery, InterfaceDescription, LOCALITY_BYTES, LoaderLog, MmioWindow,
+};
 
-use crate::RiscvCpu;
+use crate::{LimineBootHandoff, RiscvCpu};
 
 /// `compatible` string of a TPM's FIFO interface over MMIO (QEMU
 /// `tpm-tis-device`, `hw/core/sysbus-fdt.c`).
@@ -26,28 +30,44 @@ const TPM_TIS_MMIO: &str = "tcg,tpm-tis-mmio";
 ///
 /// A TPM that fails a check is reported and not handed over; one that fails
 /// while it is checked stops the boot.
-pub(crate) fn discover(fdt: &Fdt<'_>, cpu: RiscvCpu) -> Discovered<MmioWindow, RiscvCpu> {
+pub(crate) fn discover(
+    fdt: &Fdt<'_>,
+    handoff: &LimineBootHandoff,
+    cpu: RiscvCpu,
+) -> Discovered<MmioWindow, RiscvCpu> {
     let Some(base) = find_tpm_base(fdt) else {
         return (None, Discovery::NotDescribed);
     };
     let physical_base = usize::try_from(base)
         .unwrap_or_else(|_| panic!("the TPM at {base:#x} is outside the physical address space"));
-    // SAFETY: RISC-V identity-maps the 512 GiB physical window including MMIO
-    // devices below 1 GiB, `base` came from the device tree's `tcg,tpm-tis-mmio`
-    // node, and nothing else in this kernel touches the TPM's registers.
+    let virtual_base = crate::vmm::map_mmio_range(physical_base, LOCALITY_BYTES);
+    // SAFETY: `map_mmio_range` mapped locality 0's register window in the
+    // higher-half direct map and never unmaps it, `base` came from the device
+    // tree's `tcg,tpm-tis-mmio` node, and nothing else in this kernel touches
+    // the TPM's registers.
     let window = unsafe {
         MmioWindow::new(
-            NonNull::new(physical_base as *mut u8)
+            NonNull::new(virtual_base as *mut u8)
                 .unwrap_or_else(|| panic!("the TPM's register page mapped to a null address")),
             LOCALITY_BYTES,
         )
     };
+    let log = handoff
+        .tables
+        .measurement_log
+        .as_ref()
+        .map(|log: &MeasurementLog| {
+            // SAFETY: Limine's event log lives in bootloader-reclaimable
+            // memory, which this backend never hands to the allocator, in the
+            // direct map the response points into.
+            unsafe { LoaderLog::mapped(log) }
+        });
     helios_kernel::complete_device_future_at_bring_up(helios_tpm::discover(
         InterfaceDescription::DeviceTreeFifo,
         window,
         base,
         cpu,
-        None,
+        log,
     ))
     .unwrap_or_else(|error| {
         panic!("the TPM 2.0 at {base:#x} failed while measured boot was checked: {error}")

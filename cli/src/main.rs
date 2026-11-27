@@ -1103,6 +1103,7 @@ struct ProfileFetchCommand {
 pub(crate) enum LimineEfiArch {
     X86_64,
     Aarch64,
+    Riscv64,
 }
 
 impl LimineEfiArch {
@@ -1113,6 +1114,7 @@ impl LimineEfiArch {
         match self {
             Self::X86_64 => "BOOTX64.EFI",
             Self::Aarch64 => "BOOTAA64.EFI",
+            Self::Riscv64 => "BOOTRISCV64.EFI",
         }
     }
 }

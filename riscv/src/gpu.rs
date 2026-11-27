@@ -116,7 +116,8 @@ fn discover_display_device(
     let candidate = helios_virtio::mmio_candidates(fdt)
         .find(|candidate| crate::matches_virtio_mmio_device(candidate.base, DeviceType::Gpu))?;
     let base = candidate.base;
-    let header = core::ptr::NonNull::new(base as *mut u8)
+    let virt_base = crate::vmm::map_mmio_range(base, candidate.size);
+    let header = core::ptr::NonNull::new(virt_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
     let line = candidate
         .interrupt

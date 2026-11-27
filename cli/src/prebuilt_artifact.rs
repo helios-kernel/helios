@@ -480,6 +480,7 @@ pub(crate) fn run_stage(
                 let efi_arch = match command.arch.as_str() {
                     "x86-64" => LimineEfiArch::X86_64,
                     "aarch64" => LimineEfiArch::Aarch64,
+                    "riscv64" => LimineEfiArch::Riscv64,
                     other => {
                         return Err(ArtifactStageError::UefiUnsupportedArch {
                             arch: other.to_owned(),
