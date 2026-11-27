@@ -27,6 +27,13 @@ if [[ -n "${HELIOS_PREBUILT_WASM:-}" ]]; then
 else
   init_args=(--components tools/fs-smoke/components)
 fi
+shell_program="nu"
+shell_path="/bin/nu"
+if [[ "$arch" == "riscv64" ]]; then
+  # `nu` requires Wasm SIMD128 (`bytecount 0.6.9`), unavailable on `riscv64gc`.
+  shell_program="dash"
+  shell_path="/bin/dash"
+fi
 ./target/release/helios vm --arch "$arch" --release --memory 2G \
   --accel "$accel" \
   --runtime-dir "$runtime" --keep-runtime-dir \
@@ -34,10 +41,10 @@ fi
   "${init_args[@]}" \
   --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
   --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
-  --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+  --boot-program "$shell_program" --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
   --boot-program ls --boot-program cat --boot-program python3 \
   --no-compiler-plugin \
-  shell --shell /bin/nu -c 'true' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+  shell --shell "$shell_path" -c 'true' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
 sed '/^\[KDBG run:begin\]$/q' "$runtime/debug-serial.log" | tr -d '\r' > "$runtime/guest.out"
 cat "$runtime/guest.out"
 grep -Fqx 'helios init: online root=/' "$runtime/guest.out"
