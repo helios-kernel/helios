@@ -61,8 +61,27 @@ pub(crate) enum ProgramError {
         #[source]
         source: inspector_fs::FsRpcError,
     },
-    #[error("{kind:?}: {detail}")]
+    #[error("{}: {detail}", exec_error_kind_label(*kind))]
     Refused { kind: ExecErrorKind, detail: String },
+}
+
+/// Renders a WIT `exec-error-kind` variant as clean human-readable text.
+#[must_use]
+pub(crate) const fn exec_error_kind_label(kind: ExecErrorKind) -> &'static str {
+    match kind {
+        ExecErrorKind::InvalidBinary => "invalid binary",
+        ExecErrorKind::MissingEntry => "missing entry point",
+        ExecErrorKind::UnsupportedImport => "unsupported import",
+        ExecErrorKind::InvalidSignature => "invalid signature",
+        ExecErrorKind::InvalidPath => "invalid path",
+        ExecErrorKind::PermissionDenied => "permission denied",
+        ExecErrorKind::InvalidHint => "invalid hint",
+        ExecErrorKind::OutOfMemory => "out of memory",
+        ExecErrorKind::Unavailable => "unavailable",
+        ExecErrorKind::Internal => "internal error",
+        ExecErrorKind::NotFound => "not found",
+        ExecErrorKind::Io => "i/o error",
+    }
 }
 
 impl ProgramError {
