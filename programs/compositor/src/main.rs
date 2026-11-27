@@ -162,9 +162,14 @@ enum Event {
         retired: SignalSource,
         reply: Sender<Result<(), Error>>,
     },
-    /// An input device reported an event, with absolute axes already in
-    /// scanout pixels.
-    Input(InputEvent),
+    /// An input device reported an event. Absolute axes are scaled against the
+    /// live desktop mode in the event loop so resizes take effect immediately.
+    Input {
+        event: InputEvent,
+        axes: AbsoluteAxes,
+    },
+    /// The display service reported a topology or preferred-mode change.
+    DisplayChanged,
     /// A framed message received over `console-tty` from `/console-session`.
     Tty(TtyServerMsg),
     /// The `console-tty` IPC stream closed.
@@ -326,7 +331,8 @@ async fn run_desktop(events: &Sender<Event>, queue: &Receiver<Event>) -> Result<
         origin.0, origin.1
     );
 
-    start_input(events, mode)?;
+    start_display_watcher(&display, events);
+    start_input(events)?;
     let tty_out = start_tty_bridge(events, columns, rows);
     start_trace_feed(events);
     start_component_poller(events);
@@ -506,8 +512,25 @@ fn start_splash_ticker(events: &Sender<Event>, done: Arc<AtomicBool>) {
     });
 }
 
+/// Follows runtime display mode / topology changes from the display service.
+fn start_display_watcher(display: &Display, events: &Sender<Event>) {
+    let mut changes = display.changed();
+    let events = events.clone();
+    spawn(async move {
+        loop {
+            let (result, batch) = changes.read(Vec::with_capacity(4)).await;
+            if !batch.is_empty() && events.send(Event::DisplayChanged).await.is_err() {
+                return;
+            }
+            if helios_api::stream_closed(result) {
+                return;
+            }
+        }
+    });
+}
+
 /// Claim every input device and read it into the desktop's queue.
-fn start_input(events: &Sender<Event>, mode: Mode) -> Result<(), DesktopError> {
+fn start_input(events: &Sender<Event>) -> Result<(), DesktopError> {
     let mut claimed = 0;
     for capabilities in available() {
         match Device::claim(&capabilities.name) {
@@ -517,7 +540,7 @@ fn start_input(events: &Sender<Event>, mode: Mode) -> Result<(), DesktopError> {
                 claimed += 1;
                 let events = events.clone();
                 spawn(async move {
-                    read_device(device, axes, mode, events).await;
+                    read_device(device, axes, events).await;
                 });
             }
             Err(error) => {
@@ -575,18 +598,12 @@ impl AbsoluteAxes {
 }
 
 /// Read one device for as long as its stream lasts.
-async fn read_device(device: Device, axes: AbsoluteAxes, mode: Mode, events: Sender<Event>) {
+async fn read_device(device: Device, axes: AbsoluteAxes, events: Sender<Event>) {
     let mut stream = device.events();
     loop {
         let (result, burst) = stream.read(Vec::with_capacity(64)).await;
-        for mut event in burst {
-            if event.kind == codes::EV_ABS {
-                let Some(pixels) = axes.to_pixels(event.code, event.value, mode) else {
-                    continue;
-                };
-                event.value = pixels;
-            }
-            if events.send(Event::Input(event)).await.is_err() {
+        for event in burst {
+            if events.send(Event::Input { event, axes }).await.is_err() {
                 return;
             }
         }
@@ -835,6 +852,88 @@ impl<'a> LoopState<'a> {
             self.frames, pointer.x, pointer.y
         );
     }
+
+    /// Re-queries the scanout's preferred mode and resizes the scanout surface,
+    /// VT1/VT2 grids, cursor plane, and splash state when the dimensions changed.
+    /// Returns `true` when an active boot splash should repaint immediately.
+    async fn apply_display_change(&mut self) -> Result<bool, DesktopError> {
+        let next_mode = match self.presentation.display().preferred_mode(SCANOUT).await {
+            Ok(mode) => mode,
+            Err(DisplayError::NoSuchScanout | DisplayError::Unavailable) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if next_mode.width == 0 || next_mode.height == 0 {
+            println!(
+                "compositor:resize-ignored scanout={SCANOUT} width={} height={}",
+                next_mode.width, next_mode.height
+            );
+            return Ok(false);
+        }
+        let current = self.desktop.mode();
+        if next_mode.width == current.width && next_mode.height == current.height {
+            return Ok(false);
+        }
+
+        let surface = self
+            .presentation
+            .display()
+            .create(SCANOUT, next_mode, PixelFormat::Bgrx8888)
+            .await?;
+        self.desktop.resize(surface, next_mode);
+        self.log_console.resize(next_mode);
+
+        // The hardware cursor framebuffer is owned per SurfaceHandle and
+        // destroyed when the replaced surface drops, so re-establish it here.
+        self.desktop.set_cursor().await?;
+        self.desktop.present_cursor().await?;
+
+        let client_active = self.presentation.reactivate_if_active().await?;
+
+        let columns = self.desktop.terminal().columns() as u16;
+        let rows = self.desktop.terminal().rows() as u16;
+        let origin = self.desktop.terminal_origin();
+        println!(
+            "compositor:resize scanout={SCANOUT} width={} height={} columns={columns} rows={rows} origin={},{}",
+            next_mode.width, next_mode.height, origin.0, origin.1
+        );
+        if let Some(tx) = self.tty_out {
+            let _ = tx.send(TtyClientMsg::Resize { columns, rows }).await;
+        }
+
+        let mut repaint_splash = false;
+        match &mut self.screen {
+            ScreenState::Splash {
+                renderer, pixels, ..
+            } => {
+                let pixel_count = (next_mode.width as usize) * (next_mode.height as usize);
+                *renderer = SplashRenderer::new(next_mode.width, next_mode.height);
+                *pixels = vec![0_u32; pixel_count];
+                repaint_splash = !client_active;
+            }
+            ScreenState::Crossfade { target, .. } => {
+                let target = *target;
+                self.finish_splash_to(target);
+            }
+            ScreenState::Active(_) => {}
+        }
+        Ok(repaint_splash)
+    }
+}
+
+/// Coalesced side effects accumulated while draining queued events for one pass.
+#[derive(Clone, Copy, Default)]
+struct FrameActions {
+    pointer_moved: bool,
+    splash_tick: bool,
+    display_changed: bool,
+}
+
+impl FrameActions {
+    fn merge(&mut self, other: Self) {
+        self.pointer_moved |= other.pointer_moved;
+        self.splash_tick |= other.splash_tick;
+        self.display_changed |= other.display_changed;
+    }
 }
 
 /// The desktop's own loop: fold everything that happened into one frame.
@@ -854,17 +953,18 @@ async fn serve(
         let Ok(event) = queue.recv().await else {
             return Err(DesktopError::Starved);
         };
-        let (mut moved, mut tick) = handle(&mut state, event).await?;
+        let mut actions = handle(&mut state, event).await?;
         // Coalesce everything already queued into one repaint pass.
         while let Ok(event) = queue.try_recv() {
-            let (m, t) = handle(&mut state, event).await?;
-            moved |= m;
-            tick |= t;
+            actions.merge(handle(&mut state, event).await?);
         }
-        if moved {
+        if actions.display_changed {
+            actions.splash_tick |= state.apply_display_change().await?;
+        }
+        if actions.pointer_moved {
             state.desktop.present_cursor().await?;
         }
-        if tick {
+        if actions.splash_tick {
             state.step_splash_frame().await?;
         }
         state.present_active().await?;
@@ -879,13 +979,13 @@ struct InputFrame {
     events: Vec<InputEvent>,
 }
 
-/// Fold one event into the desktop state. Reports `(pointer_moved, splash_tick)`.
-async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool), DesktopError> {
+/// Fold one event into the desktop state.
+async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<FrameActions, DesktopError> {
     match event {
         Event::CreateImage { id, size, reply } => {
             state.presentation.create(id, size);
             let _ = reply.send(Ok(())).await;
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::PresentImage {
             id,
@@ -903,12 +1003,22 @@ async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool),
                 Err(Error::Gone)
             };
             let _ = reply.send(answer).await;
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
-        Event::Input(event) => {
+        Event::Input { mut event, axes } => {
+            if event.kind == codes::EV_ABS {
+                let Some(pixels) = axes.to_pixels(event.code, event.value, state.desktop.mode())
+                else {
+                    return Ok(FrameActions::default());
+                };
+                event.value = pixels;
+            }
             if ends_frame(event) {
-                let moved = apply_frame(state).await?;
-                return Ok((moved, false));
+                let pointer_moved = apply_frame(state).await?;
+                return Ok(FrameActions {
+                    pointer_moved,
+                    ..FrameActions::default()
+                });
             }
             match (event.kind, event.code) {
                 (codes::EV_ABS, codes::ABS_X) => {
@@ -920,8 +1030,12 @@ async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool),
                 _ => {}
             }
             state.input_frame.events.push(event);
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
+        Event::DisplayChanged => Ok(FrameActions {
+            display_changed: true,
+            ..FrameActions::default()
+        }),
         Event::Tty(msg) => {
             match msg {
                 TtyServerMsg::Mode { console_shell } => {
@@ -945,14 +1059,14 @@ async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool),
                     state.desktop.terminal().write(&bytes);
                 }
             }
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::TtyClosed => {
             state
                 .desktop
                 .terminal()
                 .write(b"\r\n[console session disconnected]\r\n");
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::Trace(trace_event) => {
             if !should_suppress_trace_event(&trace_event, state.self_instance_id) {
@@ -961,19 +1075,22 @@ async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool),
                     .log_console
                     .push_log(trace_event.timestamp, origin.as_deref(), &message);
             }
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::SelfInstanceId(id) => {
             state.self_instance_id = Some(id);
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::ComponentReady(moniker) => {
             state
                 .log_console
                 .push_status(ServiceStatus::Ok, &format!("Reached component {moniker}"));
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
-        Event::SplashTick => Ok((false, true)),
+        Event::SplashTick => Ok(FrameActions {
+            splash_tick: true,
+            ..FrameActions::default()
+        }),
         Event::Create {
             id,
             width,
@@ -988,7 +1105,7 @@ async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool),
                 println!("compositor:window id={id} width={width} height={height}");
             }
             let _ = reply.send(answer).await;
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::Commit { id, region, reply } => {
             let answer = if state.desktop.holds_client(id) {
@@ -998,14 +1115,14 @@ async fn handle(state: &mut LoopState<'_>, event: Event) -> Result<(bool, bool),
                 Err(Error::Gone)
             };
             let _ = reply.send(answer).await;
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
         Event::Destroy { id, reply } => {
             if !state.presentation.remove(id, state.desktop).await? {
                 state.desktop.remove_client(id);
             }
             let _ = reply.send(()).await;
-            Ok((false, false))
+            Ok(FrameActions::default())
         }
     }
 }
@@ -1291,5 +1408,27 @@ mod tests {
         let (origin, msg) = format_trace_fields(&kernel_event);
         assert_eq!(origin.as_deref(), Some("helios_kernel::virtio"));
         assert_eq!(msg, "virtio-gpu online");
+    }
+
+    #[test]
+    fn absolute_axes_scale_against_live_mode_dimensions() {
+        let axes = AbsoluteAxes {
+            x: Some((0, 32767)),
+            y: Some((0, 32767)),
+        };
+        let initial = Mode {
+            width: 640,
+            height: 480,
+        };
+        let resized = Mode {
+            width: 1280,
+            height: 800,
+        };
+
+        assert_eq!(axes.to_pixels(codes::ABS_X, 32767, initial), Some(639));
+        assert_eq!(axes.to_pixels(codes::ABS_Y, 32767, initial), Some(479));
+        assert_eq!(axes.to_pixels(codes::ABS_X, 32767, resized), Some(1279));
+        assert_eq!(axes.to_pixels(codes::ABS_Y, 32767, resized), Some(799));
+        assert_eq!(axes.to_pixels(codes::ABS_X, 16384, resized), Some(639));
     }
 }

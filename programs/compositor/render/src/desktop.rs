@@ -114,9 +114,7 @@ impl Desktop {
     pub fn new(surface: Surface, mode: Mode) -> Self {
         let bounds = Region::new(0, 0, mode.width, mode.height);
         let terminal_region = terminal_region(mode);
-        let inner = inset(terminal_region, BORDER);
-        let columns = (inner.width as usize / CELL_WIDTH).max(1);
-        let rows = (inner.height as usize / CELL_HEIGHT).max(1);
+        let (columns, rows) = terminal_grid_dimensions(terminal_region);
         Self {
             surface,
             mode,
@@ -127,6 +125,27 @@ impl Desktop {
             pointer: initial_pointer(mode),
             focus: initial_focus(mode),
         }
+    }
+
+    /// Replace the scanout `surface` with one sized to `mode`, resizing the
+    /// terminal grid, clamping the pointer and client window origins, and
+    /// damaging the entire new screen.
+    pub fn resize(&mut self, surface: Surface, mode: Mode) {
+        let bounds = Region::new(0, 0, mode.width, mode.height);
+        let terminal_region = terminal_region(mode);
+        let (columns, rows) = terminal_grid_dimensions(terminal_region);
+        self.surface = surface;
+        self.mode = mode;
+        self.terminal_region = terminal_region;
+        self.terminal.resize(columns, rows);
+        for client in &mut self.clients {
+            client.region = clamp_client_origin(client.region, mode);
+        }
+        self.pointer = clamp_pointer(self.pointer, mode);
+        self.focus = self.focus_at(self.pointer);
+        let mut damage = Damage::new(bounds);
+        damage.add_all();
+        self.damage = damage;
     }
 
     pub const fn terminal(&mut self) -> &mut Terminal {
@@ -217,10 +236,7 @@ impl Desktop {
     /// Returns the focus after the move, so the caller can say when it
     /// changed without asking twice.
     pub fn move_pointer(&mut self, position: Point) -> Focus {
-        self.pointer = Point {
-            x: position.x.min(self.mode.width.saturating_sub(1)),
-            y: position.y.min(self.mode.height.saturating_sub(1)),
-        };
+        self.pointer = clamp_pointer(position, self.mode);
         let focus = self.focus_at(self.pointer);
         if focus != self.focus {
             // The border of whatever gained and whatever lost the
@@ -506,6 +522,33 @@ const fn terminal_region(mode: Mode) -> Region {
     Region::new(DESKTOP_MARGIN, DESKTOP_MARGIN, width, height)
 }
 
+/// Character grid `(columns, rows)` fitting inside `terminal_region`'s border.
+fn terminal_grid_dimensions(region: Region) -> (usize, usize) {
+    let inner = inset(region, BORDER);
+    let columns = (inner.width as usize / CELL_WIDTH).max(1);
+    let rows = (inner.height as usize / CELL_HEIGHT).max(1);
+    (columns, rows)
+}
+
+/// Keeps a pointer inside `[0, mode.width) x [0, mode.height)`.
+fn clamp_pointer(position: Point, mode: Mode) -> Point {
+    Point {
+        x: position.x.min(mode.width.saturating_sub(1)),
+        y: position.y.min(mode.height.saturating_sub(1)),
+    }
+}
+
+/// Keeps a client window's top-left corner inside `mode` without changing its
+/// backing-store dimensions.
+fn clamp_client_origin(region: Region, mode: Mode) -> Region {
+    Region::new(
+        region.x.min(mode.width.saturating_sub(region.width)),
+        region.y.min(mode.height.saturating_sub(region.height)),
+        region.width,
+        region.height,
+    )
+}
+
 /// The rectangle `region` grown by the border drawn around it.
 const fn bordered(region: Region) -> Region {
     Region::new(
@@ -770,5 +813,36 @@ mod tests {
     #[test]
     fn the_pointer_image_is_the_size_the_display_engine_takes() {
         assert_eq!(cursor_image().len(), CURSOR_BYTES);
+    }
+
+    #[test]
+    fn resize_helpers_recompute_terminal_grid_and_clamp_pointer_and_clients() {
+        let small = Mode {
+            width: 640,
+            height: 480,
+        };
+        let large = Mode {
+            width: 1280,
+            height: 800,
+        };
+        let (small_cols, small_rows) = terminal_grid_dimensions(terminal_region(small));
+        let (large_cols, large_rows) = terminal_grid_dimensions(terminal_region(large));
+        assert!(large_cols > small_cols);
+        assert!(large_rows > small_rows);
+        assert_eq!(
+            (large_cols, large_rows),
+            ((1280 - 68) / CELL_WIDTH, (800 - 68) / CELL_HEIGHT)
+        );
+
+        let clamped_pointer = clamp_pointer(Point { x: 1200, y: 790 }, small);
+        assert_eq!((clamped_pointer.x, clamped_pointer.y), (639, 479));
+        assert_eq!(
+            clamp_client_origin(Region::new(900, 600, 200, 150), small),
+            Region::new(440, 330, 200, 150)
+        );
+        assert_eq!(
+            clamp_client_origin(Region::new(50, 50, 800, 600), small),
+            Region::new(0, 0, 800, 600)
+        );
     }
 }

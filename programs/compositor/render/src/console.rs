@@ -128,6 +128,28 @@ impl LogConsole {
         &mut self.terminal
     }
 
+    /// Resizes the log console to `mode`, preserving retained log lines and
+    /// damaging the entire new surface.
+    pub fn resize(&mut self, mode: Mode) {
+        if self.mode.width == mode.width && self.mode.height == mode.height {
+            return;
+        }
+        let columns = (mode.width as usize / CELL_WIDTH).max(1);
+        let total_rows = (mode.height as usize / CELL_HEIGHT).max(1);
+        let has_hint_row = self.hint.is_some() && total_rows > 1;
+        let log_rows = if has_hint_row {
+            total_rows - 1
+        } else {
+            total_rows
+        };
+        self.mode = mode;
+        self.has_hint_row = has_hint_row;
+        self.terminal.resize(columns, log_rows);
+        let mut damage = Damage::new(Region::new(0, 0, mode.width, mode.height));
+        damage.add_all();
+        self.damage = damage;
+    }
+
     /// Updates or hides the bottom hint strip and damages the strip row.
     pub fn set_hint(&mut self, hint: Option<&str>) {
         self.hint = hint.map(String::from);
@@ -396,5 +418,39 @@ mod tests {
         let regions = console.render_u32(&mut fb, mode.width as usize);
         assert!(!regions.is_empty());
         assert_eq!(fb[319], CONSOLE_BACKGROUND.to_bgrx_u32());
+    }
+
+    #[test]
+    fn log_console_resize_preserves_lines_updates_grid_and_damages_full_mode() {
+        let initial = Mode {
+            width: 640,
+            height: 480,
+        };
+        let mut console = LogConsole::new(initial);
+        console.push_status(ServiceStatus::Ok, "Started /inspector");
+        let stride_initial = (initial.width as usize) * BYTES_PER_PIXEL;
+        let mut fb_initial = vec![0_u8; stride_initial * (initial.height as usize)];
+        assert!(!console.render(&mut fb_initial, stride_initial).is_empty());
+        assert!(console.render(&mut fb_initial, stride_initial).is_empty());
+
+        let resized = Mode {
+            width: 1280,
+            height: 800,
+        };
+        console.resize(resized);
+        assert_eq!(
+            (console.mode().width, console.mode().height),
+            (resized.width, resized.height)
+        );
+        assert_eq!(console.terminal().columns(), 1280 / CELL_WIDTH);
+        assert_eq!(console.terminal().rows(), 800 / CELL_HEIGHT - 1);
+        assert!(row_string(&console, 0).contains("[  OK  ] Started /inspector"));
+
+        let stride_resized = (resized.width as usize) * BYTES_PER_PIXEL;
+        let mut fb_resized = vec![0_u8; stride_resized * (resized.height as usize)];
+        let regions = console.render(&mut fb_resized, stride_resized);
+        assert_eq!(regions, vec![Region::new(0, 0, 1280, 800)]);
+        let bg_off = 2 * stride_resized + (1270 * BYTES_PER_PIXEL);
+        assert_eq!(&fb_resized[bg_off..bg_off + 3], &[0x0F, 0x0A, 0x07]);
     }
 }
