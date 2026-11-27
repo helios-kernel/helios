@@ -8,13 +8,16 @@ use helios_inspector_protocol::tls::TlsError;
 use helios_wit_rpc::RpcError;
 use helios_wit_rpc::inspector::helios::system::{
     btrfs::{BtrfsError, BtrfsErrorKind},
-    component_control::ControlError as ComponentControlError,
+    component_control::{
+        ControlError as ComponentControlError, ControlErrorKind as ComponentControlErrorKind,
+    },
     filters::FilterError,
     instances::KillError,
     mounts::{MountError, MountErrorKind},
-    processors::{OfflineError, OnlineError},
-    profiling::{ControlError, InstructionProfileError, RawProfileError},
+    processors::{OfflineError, OfflineRefusal, OnlineError},
+    profiling::{ControlError, InstructionProfileError, ProfileSection, RawProfileError},
     programs::{ExecError, ExecErrorKind},
+    snapshot::SnapshotError,
     tracing::TargetError as TraceTargetError,
 };
 use helios_wit_rpc::inspector_fs::FsRpcError;
@@ -48,57 +51,85 @@ pub enum OpsError {
         #[source]
         source: RpcError,
     },
-    #[error("remote filter for `{operation}` refused: {error:?}")]
+    #[error(
+        "remote filter for `{operation}` refused: {}",
+        format_filter_error(error)
+    )]
     FilterRefused {
         operation: &'static str,
         error: FilterError,
     },
     #[error("no live instance is named `{name}`")]
     NoInstanceNamed { name: String },
-    #[error("guest refused to stop instance {id}: {error:?}")]
+    #[error("guest refused to stop instance {id}: {}", format_kill_error(*error))]
     KillRefused { id: u64, error: KillError },
-    #[error("guest refused tracing target `{target}`: {error:?}")]
+    #[error(
+        "guest refused tracing target `{target}`: {}",
+        format_trace_target_error(target, error)
+    )]
     TraceTargetRefused {
         target: String,
         error: TraceTargetError,
     },
-    #[error("guest refused profiling control `{operation}`: {error:?}")]
+    #[error(
+        "guest refused profiling control `{operation}`: {}",
+        format_profiling_control_error(*error)
+    )]
     ProfilingControlRefused {
         operation: &'static str,
         error: ControlError,
     },
-    #[error("guest refused instruction profiling `{operation}`: {error:?}")]
+    #[error(
+        "guest refused instruction profiling `{operation}`: {}",
+        format_instruction_profile_error(*error)
+    )]
     InstructionProfileRefused {
         operation: &'static str,
         error: InstructionProfileError,
     },
-    #[error("guest refused raw profile `{operation}`: {error:?}")]
+    #[error(
+        "guest refused raw profile `{operation}`: {}",
+        format_raw_profile_error(error)
+    )]
     RawProfileRefused {
         operation: &'static str,
         error: RawProfileError,
     },
-    #[error("guest refused processor offline for CPU {processor}: {error:?}")]
+    #[error(
+        "guest refused processor offline for CPU {processor}: {}",
+        format_offline_error(error)
+    )]
     ProcessorOfflineRefused { processor: u32, error: OfflineError },
-    #[error("guest refused processor online for CPU {processor}: {error:?}")]
+    #[error(
+        "guest refused processor online for CPU {processor}: {}",
+        format_online_error(error)
+    )]
     ProcessorOnlineRefused { processor: u32, error: OnlineError },
-    #[error("guest refused snapshot prepare: {error:?}")]
-    SnapshotRefused {
-        error: helios_wit_rpc::inspector::helios::system::snapshot::SnapshotError,
-    },
-    #[error("component-control `{operation}` refused ({kind:?}): {detail}")]
+    #[error("guest refused snapshot prepare: {}", format_snapshot_error(*error))]
+    SnapshotRefused { error: SnapshotError },
+    #[error(
+        "component-control `{operation}` refused: {}",
+        format_kind_detail(format_component_control_error_kind(*kind), detail)
+    )]
     ComponentControlRefused {
         operation: &'static str,
-        kind: helios_wit_rpc::inspector::helios::system::component_control::ControlErrorKind,
+        kind: ComponentControlErrorKind,
         detail: String,
     },
-    #[error("mount `{operation}` on `{path}` refused ({kind:?}): {detail}")]
+    #[error(
+        "mount `{operation}` on `{path}` refused: {}",
+        format_kind_detail(format_mount_error_kind(*kind), detail)
+    )]
     MountRefused {
         operation: &'static str,
         path: String,
         kind: MountErrorKind,
         detail: String,
     },
-    #[error("btrfs `{operation}` on `{path}` refused ({kind:?}): {detail}")]
+    #[error(
+        "btrfs `{operation}` on `{path}` refused: {}",
+        format_kind_detail(format_btrfs_error_kind(*kind), detail)
+    )]
     BtrfsRefused {
         operation: &'static str,
         path: String,
@@ -107,7 +138,10 @@ pub enum OpsError {
     },
     #[error("{0}")]
     Symbolize(#[from] KernelSymbolsError),
-    #[error("program execution refused ({kind:?}): {detail}")]
+    #[error(
+        "program execution refused: {}",
+        format_kind_detail(format_exec_error_kind(*kind), detail)
+    )]
     ExecRefused { kind: ExecErrorKind, detail: String },
     #[error("child stdin stream is already closed")]
     StdinClosed,
@@ -456,4 +490,563 @@ pub enum BundleError {
     },
     #[error("background archive task panicked: {detail}")]
     TaskJoin { detail: String },
+}
+
+pub(crate) fn format_kind_detail(kind: &str, detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() || detail.eq_ignore_ascii_case(kind) {
+        kind.to_owned()
+    } else if detail
+        .get(..kind.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(kind))
+        && detail[kind.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, ':' | ';' | ',' | ' ' | '('))
+    {
+        detail.to_owned()
+    } else {
+        format!("{kind}: {detail}")
+    }
+}
+
+pub(crate) fn format_filter_error(error: &FilterError) -> String {
+    match error {
+        FilterError::TooManyPrefixes(limit) => {
+            format!("too many filter prefixes (maximum {limit})")
+        }
+        FilterError::PrefixTooLong(limit) => {
+            format!("filter prefix too long (maximum {limit} bytes)")
+        }
+    }
+}
+
+pub(crate) const fn format_kill_error(error: KillError) -> &'static str {
+    match error {
+        KillError::NoSuchInstance => "no such instance",
+        KillError::AlreadyStopping => "instance is already stopping",
+        KillError::Denied => "permission denied",
+    }
+}
+
+pub(crate) fn format_trace_target_error(target: &str, error: &TraceTargetError) -> String {
+    match error {
+        TraceTargetError::UnknownTarget(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed == target {
+                "unknown tracing target".to_owned()
+            } else {
+                format!("unknown tracing target `{trimmed}`")
+            }
+        }
+        TraceTargetError::Denied => "permission denied".to_owned(),
+    }
+}
+
+pub(crate) const fn format_profiling_control_error(error: ControlError) -> &'static str {
+    match error {
+        ControlError::Denied => "permission denied",
+    }
+}
+
+pub(crate) const fn format_instruction_profile_error(
+    error: InstructionProfileError,
+) -> &'static str {
+    match error {
+        InstructionProfileError::NotCaptured => {
+            "instruction sampling is not supported on this backend"
+        }
+        InstructionProfileError::Denied => "permission denied",
+        InstructionProfileError::Busy => "another instruction sampling session is already active",
+    }
+}
+
+const fn format_profile_section(section: ProfileSection) -> &'static str {
+    match section {
+        ProfileSection::Counters => "counters",
+        ProfileSection::Data => "data",
+        ProfileSection::Names => "names",
+    }
+}
+
+pub(crate) fn format_raw_profile_error(error: &RawProfileError) -> String {
+    match error {
+        RawProfileError::NotInstrumented => {
+            "kernel is not built with profile instrumentation".to_owned()
+        }
+        RawProfileError::UnsupportedVersion(version) => {
+            format!("unsupported raw profile version {version}")
+        }
+        RawProfileError::MalformedSection(section) => {
+            format!(
+                "malformed {} profile section",
+                format_profile_section(*section)
+            )
+        }
+        RawProfileError::OutOfRange(length) => {
+            format!("offset past end of raw profile ({length} bytes)")
+        }
+        RawProfileError::ReadTooLarge(limit) => {
+            format!("read exceeds maximum window ({limit} bytes)")
+        }
+        RawProfileError::Denied => "permission denied".to_owned(),
+    }
+}
+
+fn format_offline_refusal(refusal: &OfflineRefusal) -> String {
+    match refusal {
+        OfflineRefusal::PinnedTasks(1) => {
+            "1 pinned task is still running on this processor".to_owned()
+        }
+        OfflineRefusal::PinnedTasks(count) => {
+            format!("{count} pinned tasks are still running on this processor")
+        }
+        OfflineRefusal::NetworkStarting => "network interface is still starting".to_owned(),
+    }
+}
+
+pub(crate) fn format_offline_error(error: &OfflineError) -> String {
+    match error {
+        OfflineError::NotPossible(possible) => {
+            format!("processor out of range ({possible} possible)")
+        }
+        OfflineError::Bootstrap => "cannot take bootstrap processor offline".to_owned(),
+        OfflineError::CurrentProcessor => {
+            "cannot take the currently executing processor offline".to_owned()
+        }
+        OfflineError::NotOnline => "processor is not online".to_owned(),
+        OfflineError::Refused(refusal) => format_offline_refusal(refusal),
+        OfflineError::Denied => "permission denied".to_owned(),
+    }
+}
+
+pub(crate) fn format_online_error(error: &OnlineError) -> String {
+    match error {
+        OnlineError::NotPossible(possible) => {
+            format!("processor out of range ({possible} possible)")
+        }
+        OnlineError::NotOffline => "processor is already online".to_owned(),
+        OnlineError::Denied => "permission denied".to_owned(),
+    }
+}
+
+pub(crate) const fn format_snapshot_error(error: SnapshotError) -> &'static str {
+    match error {
+        SnapshotError::Denied => "permission denied",
+        SnapshotError::Busy => "another snapshot hold is already active",
+    }
+}
+
+pub(crate) const fn format_component_control_error_kind(
+    kind: ComponentControlErrorKind,
+) -> &'static str {
+    match kind {
+        ComponentControlErrorKind::PermissionDenied => "permission denied",
+        ComponentControlErrorKind::NotFound => "not found",
+        ComponentControlErrorKind::AlreadyExists => "already exists",
+        ComponentControlErrorKind::InvalidArgument => "invalid argument",
+        ComponentControlErrorKind::Unavailable => "unavailable",
+        ComponentControlErrorKind::Internal => "internal error",
+    }
+}
+
+pub(crate) const fn format_mount_error_kind(kind: MountErrorKind) -> &'static str {
+    match kind {
+        MountErrorKind::PermissionDenied => "permission denied",
+        MountErrorKind::InvalidPoint => "invalid mount point",
+        MountErrorKind::AlreadyMounted => "already mounted",
+        MountErrorKind::NotMounted => "not mounted",
+        MountErrorKind::Busy => "mount point is busy",
+        MountErrorKind::TableFull => "mount table is full",
+        MountErrorKind::Unavailable => "mount source unavailable",
+        MountErrorKind::InvalidPath => "invalid path",
+        MountErrorKind::InvalidFilesystem => "invalid filesystem",
+        MountErrorKind::Io => "I/O error",
+        MountErrorKind::InvalidOption => "invalid mount option",
+    }
+}
+
+pub(crate) const fn format_btrfs_error_kind(kind: BtrfsErrorKind) -> &'static str {
+    match kind {
+        BtrfsErrorKind::PermissionDenied => "permission denied",
+        BtrfsErrorKind::NotBtrfs => "not a btrfs filesystem",
+        BtrfsErrorKind::NotFound => "not found",
+        BtrfsErrorKind::AlreadyExists => "already exists",
+        BtrfsErrorKind::ReadOnlyFilesystem => "read-only filesystem",
+        BtrfsErrorKind::NotDirectory => "not a directory",
+        BtrfsErrorKind::IsDirectory => "is a directory",
+        BtrfsErrorKind::NotEmpty => "directory not empty",
+        BtrfsErrorKind::NoSpace => "no space left on device",
+        BtrfsErrorKind::InvalidArgument => "invalid argument",
+        BtrfsErrorKind::CrossDevice => "cross-device operation not supported",
+        BtrfsErrorKind::Busy => "resource busy",
+        BtrfsErrorKind::Io => "I/O error",
+        BtrfsErrorKind::NotSubvolume => "not a subvolume",
+        BtrfsErrorKind::ReadOnlySubvolume => "subvolume is read-only",
+        BtrfsErrorKind::SubvolumeNotReadOnly => "subvolume is not read-only",
+        BtrfsErrorKind::SubvolumeNotEmpty => "subvolume is not empty",
+        BtrfsErrorKind::DefaultSubvolume => "cannot modify default subvolume",
+        BtrfsErrorKind::QuotaNotEnabled => "quotas are not enabled",
+        BtrfsErrorKind::QuotaAlreadyEnabled => "quotas are already enabled",
+        BtrfsErrorKind::QuotaExceeded => "quota exceeded",
+        BtrfsErrorKind::QgroupNotFound => "quota group not found",
+        BtrfsErrorKind::QgroupExists => "quota group already exists",
+        BtrfsErrorKind::QgroupInvalidRelation => "invalid quota group relation",
+        BtrfsErrorKind::DeviceNotFound => "device not found",
+        BtrfsErrorKind::LastDevice => "cannot remove the last device",
+        BtrfsErrorKind::DeviceTooSmall => "device is too small",
+        BtrfsErrorKind::InvalidStream => "invalid send stream",
+        BtrfsErrorKind::Alignment => "unaligned extent range",
+        BtrfsErrorKind::Overlap => "overlapping extent range",
+        BtrfsErrorKind::ChecksumPolicyMismatch => "checksum policy mismatch",
+        BtrfsErrorKind::CloneSourceOutOfRange => "clone source out of range",
+    }
+}
+
+pub(crate) const fn format_exec_error_kind(kind: ExecErrorKind) -> &'static str {
+    match kind {
+        ExecErrorKind::InvalidBinary => "invalid binary",
+        ExecErrorKind::MissingEntry => "missing entry point",
+        ExecErrorKind::UnsupportedImport => "unsupported import",
+        ExecErrorKind::InvalidSignature => "invalid signature",
+        ExecErrorKind::InvalidPath => "invalid path",
+        ExecErrorKind::PermissionDenied => "permission denied",
+        ExecErrorKind::InvalidHint => "invalid hint",
+        ExecErrorKind::OutOfMemory => "out of memory",
+        ExecErrorKind::Unavailable => "unavailable",
+        ExecErrorKind::Internal => "internal error",
+        ExecErrorKind::NotFound => "not found",
+        ExecErrorKind::Io => "I/O error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_no_pascal_case_debug_tokens(message: &str) {
+        let forbidden = [
+            "TooManyPrefixes",
+            "PrefixTooLong",
+            "NoSuchInstance",
+            "AlreadyStopping",
+            "UnknownTarget",
+            "NotCaptured",
+            "NotInstrumented",
+            "UnsupportedVersion",
+            "MalformedSection",
+            "OutOfRange",
+            "ReadTooLarge",
+            "NotPossible",
+            "CurrentProcessor",
+            "NotOnline",
+            "PinnedTasks",
+            "NetworkStarting",
+            "NotOffline",
+            "PermissionDenied",
+            "NotFound",
+            "AlreadyExists",
+            "InvalidArgument",
+            "InvalidPoint",
+            "AlreadyMounted",
+            "NotMounted",
+            "TableFull",
+            "InvalidPath",
+            "InvalidFilesystem",
+            "InvalidOption",
+            "NotBtrfs",
+            "ReadOnlyFilesystem",
+            "NotDirectory",
+            "IsDirectory",
+            "NotEmpty",
+            "NoSpace",
+            "CrossDevice",
+            "NotSubvolume",
+            "ReadOnlySubvolume",
+            "SubvolumeNotReadOnly",
+            "SubvolumeNotEmpty",
+            "DefaultSubvolume",
+            "QuotaNotEnabled",
+            "QuotaAlreadyEnabled",
+            "QuotaExceeded",
+            "QgroupNotFound",
+            "QgroupExists",
+            "QgroupInvalidRelation",
+            "DeviceNotFound",
+            "LastDevice",
+            "DeviceTooSmall",
+            "InvalidStream",
+            "ChecksumPolicyMismatch",
+            "CloneSourceOutOfRange",
+            "InvalidBinary",
+            "MissingEntry",
+            "UnsupportedImport",
+            "InvalidSignature",
+            "InvalidHint",
+            "OutOfMemory",
+            "Denied",
+            "Busy",
+            "Unavailable",
+            "Internal",
+            "Bootstrap",
+            "Refused(",
+            "Counters",
+            "Names",
+            "Alignment",
+            "Overlap",
+        ];
+        for token in forbidden {
+            assert!(
+                !message.contains(token),
+                "error display leaked Debug token `{token}` in: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn wit_refusal_errors_format_as_human_prose() {
+        let cases: Vec<(OpsError, &str)> = vec![
+            (
+                OpsError::FilterRefused {
+                    operation: "tracing.recent",
+                    error: FilterError::TooManyPrefixes(8),
+                },
+                "too many filter prefixes (maximum 8)",
+            ),
+            (
+                OpsError::FilterRefused {
+                    operation: "tracing.recent",
+                    error: FilterError::PrefixTooLong(128),
+                },
+                "filter prefix too long (maximum 128 bytes)",
+            ),
+            (
+                OpsError::KillRefused {
+                    id: 42,
+                    error: KillError::NoSuchInstance,
+                },
+                "no such instance",
+            ),
+            (
+                OpsError::KillRefused {
+                    id: 42,
+                    error: KillError::AlreadyStopping,
+                },
+                "instance is already stopping",
+            ),
+            (
+                OpsError::KillRefused {
+                    id: 42,
+                    error: KillError::Denied,
+                },
+                "permission denied",
+            ),
+            (
+                OpsError::TraceTargetRefused {
+                    target: "helios_kernel::exec".to_owned(),
+                    error: TraceTargetError::UnknownTarget("helios_kernel::exec".to_owned()),
+                },
+                "guest refused tracing target `helios_kernel::exec`: unknown tracing target",
+            ),
+            (
+                OpsError::TraceTargetRefused {
+                    target: "helios_kernel::exec".to_owned(),
+                    error: TraceTargetError::Denied,
+                },
+                "permission denied",
+            ),
+            (
+                OpsError::ProfilingControlRefused {
+                    operation: "set-enabled",
+                    error: ControlError::Denied,
+                },
+                "permission denied",
+            ),
+            (
+                OpsError::InstructionProfileRefused {
+                    operation: "start",
+                    error: InstructionProfileError::NotCaptured,
+                },
+                "instruction sampling is not supported on this backend",
+            ),
+            (
+                OpsError::InstructionProfileRefused {
+                    operation: "start",
+                    error: InstructionProfileError::Busy,
+                },
+                "another instruction sampling session is already active",
+            ),
+            (
+                OpsError::RawProfileRefused {
+                    operation: "read",
+                    error: RawProfileError::NotInstrumented,
+                },
+                "kernel is not built with profile instrumentation",
+            ),
+            (
+                OpsError::RawProfileRefused {
+                    operation: "read",
+                    error: RawProfileError::UnsupportedVersion(99),
+                },
+                "unsupported raw profile version 99",
+            ),
+            (
+                OpsError::RawProfileRefused {
+                    operation: "read",
+                    error: RawProfileError::MalformedSection(ProfileSection::Counters),
+                },
+                "malformed counters profile section",
+            ),
+            (
+                OpsError::RawProfileRefused {
+                    operation: "read",
+                    error: RawProfileError::OutOfRange(4096),
+                },
+                "offset past end of raw profile (4096 bytes)",
+            ),
+            (
+                OpsError::RawProfileRefused {
+                    operation: "read",
+                    error: RawProfileError::ReadTooLarge(65536),
+                },
+                "read exceeds maximum window (65536 bytes)",
+            ),
+            (
+                OpsError::ProcessorOfflineRefused {
+                    processor: 3,
+                    error: OfflineError::NotPossible(2),
+                },
+                "processor out of range (2 possible)",
+            ),
+            (
+                OpsError::ProcessorOfflineRefused {
+                    processor: 0,
+                    error: OfflineError::Bootstrap,
+                },
+                "cannot take bootstrap processor offline",
+            ),
+            (
+                OpsError::ProcessorOfflineRefused {
+                    processor: 1,
+                    error: OfflineError::CurrentProcessor,
+                },
+                "cannot take the currently executing processor offline",
+            ),
+            (
+                OpsError::ProcessorOfflineRefused {
+                    processor: 1,
+                    error: OfflineError::NotOnline,
+                },
+                "processor is not online",
+            ),
+            (
+                OpsError::ProcessorOfflineRefused {
+                    processor: 1,
+                    error: OfflineError::Refused(OfflineRefusal::PinnedTasks(2)),
+                },
+                "2 pinned tasks are still running on this processor",
+            ),
+            (
+                OpsError::ProcessorOfflineRefused {
+                    processor: 1,
+                    error: OfflineError::Refused(OfflineRefusal::NetworkStarting),
+                },
+                "network interface is still starting",
+            ),
+            (
+                OpsError::ProcessorOnlineRefused {
+                    processor: 5,
+                    error: OnlineError::NotPossible(4),
+                },
+                "processor out of range (4 possible)",
+            ),
+            (
+                OpsError::ProcessorOnlineRefused {
+                    processor: 1,
+                    error: OnlineError::NotOffline,
+                },
+                "processor is already online",
+            ),
+            (
+                OpsError::SnapshotRefused {
+                    error: SnapshotError::Busy,
+                },
+                "another snapshot hold is already active",
+            ),
+            (
+                OpsError::ComponentControlRefused {
+                    operation: "start",
+                    kind: ComponentControlErrorKind::NotFound,
+                    detail: "no component at /core/missing".to_owned(),
+                },
+                "component-control `start` refused: not found: no component at /core/missing",
+            ),
+            (
+                OpsError::ComponentControlRefused {
+                    operation: "start",
+                    kind: ComponentControlErrorKind::PermissionDenied,
+                    detail: "permission denied".to_owned(),
+                },
+                "component-control `start` refused: permission denied",
+            ),
+            (
+                OpsError::MountRefused {
+                    operation: "mount",
+                    path: "/data".to_owned(),
+                    kind: MountErrorKind::AlreadyMounted,
+                    detail: String::new(),
+                },
+                "mount `mount` on `/data` refused: already mounted",
+            ),
+            (
+                OpsError::BtrfsRefused {
+                    operation: "delete-subvolume",
+                    path: "/data/sub".to_owned(),
+                    kind: BtrfsErrorKind::SubvolumeNotEmpty,
+                    detail: "nested subvolumes remain".to_owned(),
+                },
+                "btrfs `delete-subvolume` on `/data/sub` refused: subvolume is not empty: nested subvolumes remain",
+            ),
+            (
+                OpsError::ExecRefused {
+                    kind: ExecErrorKind::InvalidBinary,
+                    detail: "bad wasm magic".to_owned(),
+                },
+                "program execution refused: invalid binary: bad wasm magic",
+            ),
+        ];
+
+        for (err, expected_substring) in cases {
+            let rendered = err.to_string();
+            assert_no_pascal_case_debug_tokens(&rendered);
+            assert!(
+                rendered.contains(expected_substring),
+                "expected `{expected_substring}` in `{rendered}`"
+            );
+        }
+
+        // Verify duplicate target name is not repeated in TraceTargetRefused.
+        let dup_target = OpsError::TraceTargetRefused {
+            target: "helios_kernel::net".to_owned(),
+            error: TraceTargetError::UnknownTarget("helios_kernel::net".to_owned()),
+        }
+        .to_string();
+        assert_eq!(
+            dup_target,
+            "guest refused tracing target `helios_kernel::net`: unknown tracing target"
+        );
+
+        // Verify duplicate kind prefix in detail is not repeated.
+        let dup_detail = OpsError::MountRefused {
+            operation: "mount",
+            path: "/data".to_owned(),
+            kind: MountErrorKind::NotMounted,
+            detail: "not mounted: /data".to_owned(),
+        }
+        .to_string();
+        assert_eq!(
+            dup_detail,
+            "mount `mount` on `/data` refused: not mounted: /data"
+        );
+    }
 }
