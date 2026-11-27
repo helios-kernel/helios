@@ -19,3 +19,4 @@ pub mod keys;
 pub mod paint;
 pub mod splash;
 pub mod term;
+pub mod tty;

@@ -231,6 +231,12 @@ pub(crate) struct ImageBuildCommand {
     /// Sign artifacts with this 32-byte Ed25519 secret key instead of generating one in `--out-dir`.
     #[arg(long, value_name = "PATH", env = "HELIOS_ROOT_SECRET_KEY")]
     pub(crate) root_secret_key: Option<PathBuf>,
+    /// Stage this pre-encoded postcard `AccountPolicy` at `etc/helios/accounts.postcard`.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ACCOUNTS_POLICY")]
+    pub(crate) accounts_policy: Option<PathBuf>,
+    /// Stage `/etc/helios/console-shell` so VT2 boots directly into an interactive shell.
+    #[arg(long, default_value_t = false)]
+    pub(crate) console_shell: bool,
     #[command(flatten)]
     pub(crate) cache: CacheArgs,
 }
@@ -474,6 +480,18 @@ pub(crate) fn run_image_build(
             .map_err(PrebuildError::from)?,
         kind: BootAssetKind::File,
     });
+    if let Some(accounts_path) = command.accounts_policy.as_deref() {
+        bootfs_assets.push(
+            crate::prepare_accounts_policy(&command.out_dir, accounts_path)
+                .map_err(ComponentBuildError::from)?,
+        );
+    }
+    if command.console_shell {
+        bootfs_assets.push(
+            crate::prepare_console_shell_flag(&command.out_dir)
+                .map_err(ComponentBuildError::from)?,
+        );
+    }
 
     let userspace_payload_path = command.out_dir.join(USERSPACE_PAYLOAD_ARTIFACT_FILE);
     write_bootfs_image(

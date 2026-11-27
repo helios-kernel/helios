@@ -90,6 +90,8 @@ pub enum KeyAction {
     PageDown,
     ScrollLineUp,
     ScrollLineDown,
+    ScrollTop,
+    ScrollBottom,
     SwitchVt(u8),
 }
 
@@ -160,6 +162,8 @@ impl Keyboard {
             codes::KEY_PAGEDOWN => return Some(KeyAction::PageDown),
             codes::KEY_UP if self.shift => return Some(KeyAction::ScrollLineUp),
             codes::KEY_DOWN if self.shift => return Some(KeyAction::ScrollLineDown),
+            codes::KEY_HOME if self.shift => return Some(KeyAction::ScrollTop),
+            codes::KEY_END if self.shift => return Some(KeyAction::ScrollBottom),
             codes::KEY_F1 if self.alt => return Some(KeyAction::SwitchVt(1)),
             codes::KEY_F2 if self.alt => return Some(KeyAction::SwitchVt(2)),
             _ => {}

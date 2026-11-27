@@ -2,6 +2,11 @@ description = "Helios root component realm ceiling"
 runner = "realm"
 oom_tier = "protected"
 
+[[mounts]]
+source = "memory"
+path = "/run"
+sharing = "shared"
+
 [capabilities]
 directories = [
   { source = "/", guest = "/", rights = ["read", "write", "mutate-directory", "execute"] },

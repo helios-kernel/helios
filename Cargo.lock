@@ -3269,6 +3269,21 @@ version = "0.1.0"
 dependencies = [
  "helios-api",
  "noto-sans-mono-bitmap",
+ "postcard",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "helios-console-session"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "futures-lite",
+ "helios-api",
+ "helios-compositor-render",
+ "helios-inspector-protocol",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

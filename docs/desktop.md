@@ -68,11 +68,20 @@ default (`--display none`):
   `--display none` fails at config resolution because `--display none`
   suppresses the host window `--gui` asked for.
 - When no session subcommand is given, `helios vm --gui` prints a
-  readiness line and waits until the user closes the QEMU window or
-  presses `Ctrl-C`, instead of opening the host `nu` REPL on stdio.
+  readiness line, runs the host Touch ID / FIDO2 login broker for VT2
+  console authentication, and waits until the user closes the QEMU window
+  or presses `Ctrl-C`, instead of opening the host `nu` REPL on stdio.
   Explicit subcommands (such as `helios vm --gui shell`,
   `helios vm --gui stats`, or `helios vm --gui repl`) still run as
   normal.
+- Unless `--accounts-policy <PATH>` or `--no-host-accounts` is given,
+  `helios vm` exports operator accounts enrolled via
+  `helios account create <username> --touch-id` (or `--fido2`) into
+  `/etc/helios/accounts.postcard` inside bootfs so VT2 login and remote
+  account authentication work immediately. Passing `--console-shell`
+  stages `/etc/helios/console-shell` so VT2 boots directly into an
+  interactive `/bin/nu` shell without login (used by CI desktop smoke
+  tests).
 
 ## `--renderer`
 
@@ -405,11 +414,17 @@ the check cannot disagree with the desktop about a glyph, a colour or a
 cell.
 
 It claims the display through `helios:system/display` and every device
-`helios:system/input` lists, and says so on the way up. The kernel
-starts it with the display and input device classes in its authority and
-nothing else of the machine's hardware; the programs typed at its
-terminal inherit neither, so they cannot claim the display or read the
-keyboard it holds:
+`helios:system/input` lists, and says so on the way up. Its component
+manifest (`/plugins/compositor`) holds only `devices = ["display", "input"]`,
+`inspect_read = "machine"`, `trace_read = "machine"`, and the
+supervisor-routed `helios:console/tty` IPC channel (`console-tty`); it has
+zero filesystem, network, process, or machine-identity authority. Interactive
+VT2 login and `/bin/nu` shell spawning live in the separate
+`/console-session` daemon (`programs/console-session`), which authenticates
+operators via `MachineIdentity`-bound Touch ID / FIDO2 challenges brokered
+by `helios vm --gui` over `/instances/*/console-auth` inspect and the
+shared `/run` tmpfs mount, and spawns attenuated shells that never receive
+`MachineRight::Identity`, `Display`, or `Input`:
 
 ```text
 compositor:online scanout=0 width=1280 height=800
@@ -417,8 +432,16 @@ compositor:terminal columns=173 rows=45 cell-width=7 cell-height=16 origin=34,34
 compositor:device name=QEMU Virtio Mouse
 compositor:device name=QEMU Virtio Tablet
 compositor:device name=QEMU Virtio Keyboard
-compositor:shell path=/bin/dash
 ```
+
+After claiming the scanout, the compositor runs a 2.0 s analytical SDF boot
+splash and 0.60 s cross-fade into **VT1** (the full-screen dark system log
+console fed by `helios:system/tracing` and `/components/*` readiness lines)
+on normal boots, or directly into **VT2** (the interactive terminal and
+client-surface desktop) when `/etc/helios/console-shell` is staged via
+`--console-shell`. Press `Enter` or `Alt+F2` on VT1 to switch to VT2,
+`Alt+F1` to return to VT1, and `PgUp`/`PgDn` or `Shift+Up`/`Down`/`Home`/`End`
+to navigate scrollback.
 
 and one line per frame it presents, carrying how many rectangles carried
 the change and where it put the pointer:
@@ -566,8 +589,9 @@ restart is one machine before and after, not two machines, so
 
 ```bash
 ./target/release/helios vm --arch x86-64 --release --accel kvm \
-    --desktop --display none \
-    --boot-program dash --boot-program debugger --boot-program compositor \
+    --desktop --display none --console-shell \
+    --boot-program nu --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
+    --boot-program compositor --boot-program console-session \
     screendump --settle-seconds 20 \
       --input tools/desktop/desktop-probe.input --input-interval-ms 150 \
       --kill-instance compositor-plugin --kill-settle-ms 200 \

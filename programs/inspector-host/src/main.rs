@@ -39,11 +39,12 @@ use helios_api::vsock::{self, VsockListener, VsockStream};
 use helios_component_manager::OomTier;
 use helios_inspector_protocol::VSOCK_RPC_PORT;
 use helios_inspector_protocol::auth::{
-    AUTH_PROTOCOL_VERSION, AuthError, AuthPolicy, DEFAULT_INSPECTOR_TCP_PORT,
-    INSPECTOR_POLICY_PATH, MACHINE_IDENTITY_HANDSHAKE_DOMAIN, ServerAuthResult, ServerHello,
-    SessionGrants, TlsControlRequest, TlsControlResponse, TransportKind,
-    compute_handshake_challenge, random_32, read_auth_message, server_handshake,
-    verify_client_auth, write_auth_message,
+    AUTH_PROTOCOL_VERSION, AccountPolicy, AuthError, AuthPolicy, AuthorizedAccount,
+    DEFAULT_INSPECTOR_TCP_PORT, HELIOS_ACCOUNTS_POLICY_PATH, INSPECTOR_POLICY_PATH,
+    MACHINE_IDENTITY_HANDSHAKE_DOMAIN, ServerAuthResult, ServerHello, SessionGrants,
+    TlsControlRequest, TlsControlResponse, TransportKind, compute_handshake_challenge, random_32,
+    read_auth_message, server_handshake_with_accounts, verify_client_auth_with_accounts,
+    write_auth_message,
 };
 
 use crate::grants::{
@@ -162,6 +163,7 @@ where
 
 struct HostContext {
     policy: AuthPolicy,
+    accounts: Vec<AuthorizedAccount>,
     tls_ceiling: SessionGrants,
     worker_ceiling: SessionGrants,
     machine_public_key: [u8; 32],
@@ -202,6 +204,31 @@ fn load_policy() -> Result<AuthPolicy, String> {
         .map_err(|err| format!("failed to decode `{INSPECTOR_POLICY_PATH}`: {err}"))
 }
 
+fn load_accounts_from_path(path: &std::path::Path) -> Result<Vec<AuthorizedAccount>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(format!(
+                "failed to read operator accounts policy `{}`: {err}",
+                path.display()
+            ));
+        }
+    };
+    AccountPolicy::decode_postcard(&bytes)
+        .map(|policy| policy.accounts)
+        .map_err(|err| {
+            format!(
+                "failed to decode operator accounts policy `{}`: {err}",
+                path.display()
+            )
+        })
+}
+
+fn load_accounts() -> Result<Vec<AuthorizedAccount>, String> {
+    load_accounts_from_path(std::path::Path::new(HELIOS_ACCOUNTS_POLICY_PATH))
+}
+
 fn read_machine_public_key() -> Result<[u8; 32], String> {
     let raw = machine_identity::public_key()
         .map_err(|err| format!("machine-identity.public-key failed: {err:?}"))?;
@@ -231,6 +258,7 @@ struct ComponentControlBridge {
 #[helios_api::main]
 async fn main() -> Result<(), String> {
     let policy = load_policy()?;
+    let accounts = load_accounts()?;
     let machine_public_key = read_machine_public_key()?;
 
     let mut loops: FuturesUnordered<LoopFuture> = FuturesUnordered::new();
@@ -261,6 +289,7 @@ async fn main() -> Result<(), String> {
 
     let ctx = Arc::new(HostContext {
         policy,
+        accounts,
         tls_ceiling: compiled_tls_ceiling(),
         worker_ceiling: compiled_worker_ceiling(),
         machine_public_key,
@@ -468,8 +497,9 @@ async fn run_tcp_control_handshake(
                 TcpHandshakeOutcome::Rejected
             } else {
                 let now = current_unix_time();
-                match verify_client_auth(
+                match verify_client_auth_with_accounts(
                     &ctx.policy,
+                    &ctx.accounts,
                     &ctx.worker_ceiling,
                     &signed_hello,
                     Some(expected_binding),
@@ -717,11 +747,12 @@ async fn handle_vsock_session(
         let (mut read, mut write) = futures_util::AsyncReadExt::split(&mut io);
         match with_timeout(
             HANDSHAKE_TIMEOUT,
-            server_handshake(
+            server_handshake_with_accounts(
                 &mut read,
                 &mut write,
                 TransportKind::Vsock,
                 &ctx.policy,
+                &ctx.accounts,
                 &ctx.worker_ceiling,
                 ctx.machine_public_key,
                 now,
@@ -789,11 +820,12 @@ async fn handle_serial_session(ctx: Arc<HostContext>, port: DebugPort) {
 
     let verified = {
         let (mut read, mut write) = futures_util::AsyncReadExt::split(&mut io);
-        match server_handshake(
+        match server_handshake_with_accounts(
             &mut read,
             &mut write,
             TransportKind::Serial,
             &ctx.policy,
+            &ctx.accounts,
             &ctx.worker_ceiling,
             ctx.machine_public_key,
             now,
@@ -914,5 +946,52 @@ mod tests {
             drop(p2);
             drop(p3);
         });
+    }
+
+    #[test]
+    fn load_accounts_handles_missing_valid_and_corrupt_policy_files() {
+        use helios_inspector_protocol::auth::{AuthPublicKey, TransportMask};
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "helios-inspector-host-accounts-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let missing = temp_dir.join("missing.postcard");
+        assert!(
+            load_accounts_from_path(&missing)
+                .expect("missing accounts policy yields empty vec")
+                .is_empty()
+        );
+
+        let seed = [0x33; 32];
+        let pub_key = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let account = AuthorizedAccount {
+            username: "lexo".to_owned(),
+            public_key: AuthPublicKey::Ed25519(pub_key),
+            grants: SessionGrants::full_worker_ceiling(),
+            allowed_transports: TransportMask::ALL,
+        };
+        let policy = AccountPolicy::single_account(account.clone());
+        let valid_path = temp_dir.join("valid.postcard");
+        std::fs::write(
+            &valid_path,
+            policy.encode_postcard().expect("encode account policy"),
+        )
+        .expect("write valid policy");
+        let loaded = load_accounts_from_path(&valid_path).expect("load valid policy");
+        assert_eq!(loaded, vec![account]);
+
+        let corrupt_path = temp_dir.join("corrupt.postcard");
+        std::fs::write(&corrupt_path, b"\xff\xfe\xfd").expect("write corrupt policy");
+        assert!(
+            load_accounts_from_path(&corrupt_path).is_err(),
+            "corrupt accounts policy must fail fast"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -22,7 +22,10 @@ use helios_artifact::{
     CwasmTarget, IsaLevelError, cwasm_target_isa_levels, cwasm_target_supports_wasm_simd,
 };
 use helios_compiler_support::AotCompileHint;
-use helios_inspector_protocol::auth::{AuthError, AuthPolicy, INSPECTOR_POLICY_PATH};
+use helios_inspector_protocol::auth::{
+    AccountPolicy, AuthError, AuthPolicy, CONSOLE_SHELL_FLAG_PATH, HELIOS_ACCOUNTS_POLICY_PATH,
+    INSPECTOR_POLICY_PATH,
+};
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
@@ -212,6 +215,18 @@ pub(crate) enum PrebuildError {
     },
     #[error("failed to encode inspector auth policy: {source}")]
     EncodeInspectorPolicy {
+        #[source]
+        source: AuthError,
+    },
+    #[error("failed to read operator accounts policy {path}: {source}")]
+    ReadAccountsPolicy {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid operator accounts policy {path}: {source}")]
+    InvalidAccountsPolicy {
+        path: String,
         #[source]
         source: AuthError,
     },
@@ -922,6 +937,14 @@ struct KernelPrebuildCommand {
         conflicts_with = "inspector_client_key"
     )]
     inspector_policy: Option<PathBuf>,
+    /// Stage this pre-encoded postcard `AccountPolicy` at
+    /// `etc/helios/accounts.postcard` for VT2 login and remote account auth.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ACCOUNTS_POLICY")]
+    accounts_policy: Option<PathBuf>,
+    /// Stage `/etc/helios/console-shell` so VT2 boots directly into an
+    /// unauthenticated `/bin/nu` shell (for CI desktop smoke tests).
+    #[arg(long, default_value_t = false)]
+    console_shell: bool,
     #[command(flatten)]
     cache: CacheArgs,
 }
@@ -1503,6 +1526,12 @@ fn run_kernel_prebuild(
         source: resolve_bootfs_source(&prepared_inspector.policy_path)?,
         kind: BootAssetKind::File,
     });
+    if let Some(accounts_path) = command.accounts_policy.as_deref() {
+        bootfs_assets.push(prepare_accounts_policy(&command.out_dir, accounts_path)?);
+    }
+    if command.console_shell {
+        bootfs_assets.push(prepare_console_shell_flag(&command.out_dir)?);
+    }
 
     let bootfs_path = command.out_dir.join(BOOTFS_IMAGE_FILE);
     write_bootfs_image(
@@ -3633,6 +3662,53 @@ pub(crate) fn prepare_inspector_auth(
     Ok(PreparedInspectorAuth {
         policy_path,
         client_secret_path: Some(client_secret_path),
+    })
+}
+
+/// Validates a host-supplied `AccountPolicy` postcard file and stages it into
+/// `out_dir` for bootfs packaging at `etc/helios/accounts.postcard`.
+pub(crate) fn prepare_accounts_policy(
+    out_dir: &Path,
+    supplied_policy: &Path,
+) -> Result<BootAsset, PrebuildError> {
+    fs::create_dir_all(out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: out_dir.display().to_string(),
+        source,
+    })?;
+    let raw = fs::read(supplied_policy).map_err(|source| PrebuildError::ReadAccountsPolicy {
+        path: supplied_policy.display().to_string(),
+        source,
+    })?;
+    AccountPolicy::decode_postcard(&raw).map_err(|source| {
+        PrebuildError::InvalidAccountsPolicy {
+            path: supplied_policy.display().to_string(),
+            source,
+        }
+    })?;
+    let staged = out_dir.join("accounts.postcard");
+    write_if_changed(&staged, &raw)?;
+    Ok(BootAsset {
+        path: HELIOS_ACCOUNTS_POLICY_PATH
+            .trim_start_matches('/')
+            .to_owned(),
+        source: resolve_bootfs_source(&staged)?,
+        kind: BootAssetKind::File,
+    })
+}
+
+/// Stages the `/etc/helios/console-shell` marker file into `out_dir` for bootfs
+/// packaging when `--console-shell` is requested.
+pub(crate) fn prepare_console_shell_flag(out_dir: &Path) -> Result<BootAsset, PrebuildError> {
+    fs::create_dir_all(out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: out_dir.display().to_string(),
+        source,
+    })?;
+    let staged = out_dir.join("console-shell");
+    write_if_changed(&staged, b"enabled\n")?;
+    Ok(BootAsset {
+        path: CONSOLE_SHELL_FLAG_PATH.trim_start_matches('/').to_owned(),
+        source: resolve_bootfs_source(&staged)?,
+        kind: BootAssetKind::File,
     })
 }
 

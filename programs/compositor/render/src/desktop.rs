@@ -102,6 +102,14 @@ impl Desktop {
         self.mode
     }
 
+    pub const fn surface(&self) -> &Surface {
+        &self.surface
+    }
+
+    pub const fn surface_mut(&mut self) -> &mut Surface {
+        &mut self.surface
+    }
+
     /// Build the desktop on `surface`, sized to `mode`.
     pub fn new(surface: Surface, mode: Mode) -> Self {
         let bounds = Region::new(0, 0, mode.width, mode.height);
@@ -306,6 +314,29 @@ impl Desktop {
         Region::new(x, y, width, height)
     }
 
+    /// Renders the entire desktop into `pixels` (`bgrx8888` `u32` words,
+    /// `stride_pixels` per row) for cross-fade transitions without mutating the
+    /// live scanout surface.
+    pub fn render_u32(&self, pixels: &mut [u32], stride_pixels: usize) {
+        let row_bytes = (self.mode.width as usize) * BYTES_PER_PIXEL;
+        let mut scratch = vec![0_u8; row_bytes * (self.mode.height as usize)];
+        let full = Region::new(0, 0, self.mode.width, self.mode.height);
+        self.compose_into(&mut scratch, row_bytes, full);
+        for y in 0..self.mode.height as usize {
+            let src_row = y * row_bytes;
+            let dst_row = y * stride_pixels;
+            for x in 0..self.mode.width as usize {
+                let src_off = src_row + x * BYTES_PER_PIXEL;
+                let dst_off = dst_row + x;
+                if let (Some(bytes), Some(dst)) =
+                    (scratch.get(src_off..src_off + 4), pixels.get_mut(dst_off))
+                {
+                    *dst = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+                }
+            }
+        }
+    }
+
     /// Draw one rectangle of the desktop, bottom to top.
     fn compose(&mut self, region: Region) {
         let stride = self.surface.stride();
@@ -313,77 +344,107 @@ impl Desktop {
         let terminal_region = self.terminal_region;
         let focus = self.focus;
         let origin = self.terminal_origin();
+        let pixels = self.surface.pixels();
+        compose_desktop(
+            pixels,
+            stride,
+            mode,
+            terminal_region,
+            focus,
+            origin,
+            &self.terminal,
+            &self.clients,
+            region,
+        );
+    }
 
-        {
-            let pixels = self.surface.pixels();
-            fill_wallpaper(pixels, stride, region, mode);
-        }
+    fn compose_into(&self, pixels: &mut [u8], stride: usize, region: Region) {
+        compose_desktop(
+            pixels,
+            stride,
+            self.mode,
+            self.terminal_region,
+            self.focus,
+            self.terminal_origin(),
+            &self.terminal,
+            &self.clients,
+            region,
+        );
+    }
+}
 
-        // The terminal panel and its border.
-        if terminal_region.intersection(bordered(region)).is_empty() {
-            // Nothing of the terminal is in this rectangle.
-        } else {
-            let inner = inset(terminal_region, BORDER);
-            {
-                let pixels = self.surface.pixels();
-                fill(
-                    pixels,
-                    stride,
-                    inner.intersection(region),
-                    TERMINAL_BACKGROUND,
-                );
-                draw_border(
-                    pixels,
-                    stride,
-                    terminal_region,
-                    region,
-                    if focus == Focus::Terminal {
-                        BORDER_FOCUSED
-                    } else {
-                        BORDER_UNFOCUSED
-                    },
-                );
-            }
-            let first_row = row_of(region.y, origin.1);
-            let last_row = row_of(region.bottom().saturating_sub(1), origin.1);
-            let rows = self.terminal.rows();
-            for row in first_row..=last_row.min(rows.saturating_sub(1)) {
-                let pixels = self.surface.pixels();
-                self.terminal.render_row(
-                    row,
-                    pixels,
-                    stride,
-                    origin,
-                    TERMINAL_FOREGROUND,
-                    TERMINAL_BACKGROUND,
-                );
-            }
-            let pixels = self.surface.pixels();
-            self.terminal
-                .render_cursor(pixels, stride, origin, TERMINAL_CURSOR);
-        }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared composition helper called by both scanout surface and u32 snapshot paths"
+)]
+fn compose_desktop(
+    pixels: &mut [u8],
+    stride: usize,
+    mode: Mode,
+    terminal_region: Region,
+    focus: Focus,
+    origin: (usize, usize),
+    terminal: &Terminal,
+    clients: &[ClientWindow],
+    region: Region,
+) {
+    fill_wallpaper(pixels, stride, region, mode);
 
-        // The client windows, oldest first, so the newest is in front.
-        for client in &self.clients {
-            let (client_region, id) = (client.region, client.id);
-            if client_region.intersection(bordered(region)).is_empty() {
-                continue;
-            }
-            let visible = client_region.intersection(region);
-            let pixels = self.surface.pixels();
-            blit(pixels, stride, client, visible);
-            draw_border(
+    // The terminal panel and its border.
+    if !terminal_region.intersection(bordered(region)).is_empty() {
+        let inner = inset(terminal_region, BORDER);
+        fill(
+            pixels,
+            stride,
+            inner.intersection(region),
+            TERMINAL_BACKGROUND,
+        );
+        draw_border(
+            pixels,
+            stride,
+            terminal_region,
+            region,
+            if focus == Focus::Terminal {
+                BORDER_FOCUSED
+            } else {
+                BORDER_UNFOCUSED
+            },
+        );
+        let first_row = row_of(region.y, origin.1);
+        let last_row = row_of(region.bottom().saturating_sub(1), origin.1);
+        let rows = terminal.rows();
+        for row in first_row..=last_row.min(rows.saturating_sub(1)) {
+            terminal.render_row(
+                row,
                 pixels,
                 stride,
-                client_region,
-                region,
-                if focus == Focus::Client(id) {
-                    BORDER_FOCUSED
-                } else {
-                    BORDER_UNFOCUSED
-                },
+                origin,
+                TERMINAL_FOREGROUND,
+                TERMINAL_BACKGROUND,
             );
         }
+        terminal.render_cursor(pixels, stride, origin, TERMINAL_CURSOR);
+    }
+
+    // The client windows, oldest first, so the newest is in front.
+    for client in clients {
+        let (client_region, id) = (client.region, client.id);
+        if client_region.intersection(bordered(region)).is_empty() {
+            continue;
+        }
+        let visible = client_region.intersection(region);
+        blit(pixels, stride, client, visible);
+        draw_border(
+            pixels,
+            stride,
+            client_region,
+            region,
+            if focus == Focus::Client(id) {
+                BORDER_FOCUSED
+            } else {
+                BORDER_UNFOCUSED
+            },
+        );
     }
 }
 
