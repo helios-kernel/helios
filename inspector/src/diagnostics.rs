@@ -372,6 +372,19 @@ fn find_hint(err: &InspectorError) -> Option<String> {
                             .to_owned(),
                     );
                 }
+                AccountError::KeychainAccessDenied { adhoc_binary, .. } => {
+                    return Some(if *adhoc_binary {
+                        "build a signed binary with `just build-helios-signed` (or `codesign \
+                         --force --sign <identity> --identifier cool.lexo.helios \
+                         target/release/helios`), then re-enroll once with `helios account \
+                         create <username> --touch-id --replace`"
+                            .to_owned()
+                    } else {
+                        "re-enroll once with `helios account create <username> --touch-id \
+                         --replace` so the Keychain item is bound to this signing identity"
+                            .to_owned()
+                    });
+                }
                 AccountError::Fido2 { .. } => {
                     return Some(
                         "ensure your FIDO2 security key is connected and OpenSSH `ssh-keygen` \
@@ -685,6 +698,28 @@ mod tests {
 
         let gui_none = InspectorError::Vm(VmError::Config(VmConfigError::GuiWithDisplayNone));
         assert!(format_error(&gui_none, false).contains("--desktop"));
+
+        let keychain_adhoc =
+            InspectorError::Ops(OpsCliError::Account(AccountError::KeychainAccessDenied {
+                operation: "generic_password",
+                code: -25293,
+                adhoc_binary: true,
+                detail: "The user name or passphrase you entered is not correct.".to_owned(),
+            }));
+        let rendered_adhoc = format_error(&keychain_adhoc, false);
+        assert!(rendered_adhoc.contains("just build-helios-signed"));
+        assert!(rendered_adhoc.contains("hint:"));
+
+        let keychain_signed =
+            InspectorError::Ops(OpsCliError::Account(AccountError::KeychainAccessDenied {
+                operation: "generic_password",
+                code: -25293,
+                adhoc_binary: false,
+                detail: "The user name or passphrase you entered is not correct.".to_owned(),
+            }));
+        let rendered_signed = format_error(&keychain_signed, false);
+        assert!(rendered_signed.contains("re-enroll once"));
+        assert!(rendered_signed.contains("hint:"));
     }
 
     #[test]

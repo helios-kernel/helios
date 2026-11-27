@@ -37,6 +37,105 @@ use crate::target::{Attenuation, GrantRight, TargetStore, normalize_scope};
 /// macOS Keychain generic-password service name for Touch ID operator accounts.
 pub const TOUCH_ID_KEYCHAIN_SERVICE: &str = "cool.lexo.helios.touch-id";
 
+/// Stable macOS code-signing identifier used for signed `helios` binaries so
+/// `login.keychain-db` binds Touch ID items to a stable Team ID and designated
+/// requirement instead of a per-build ad-hoc CDHash.
+pub const MACOS_CODESIGN_IDENTIFIER: &str = "cool.lexo.helios";
+
+/// Code-signing identity state of the running macOS process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacOsCodeSigningStatus {
+    /// Signed with a certificate carrying a stable Apple Team ID and signing
+    /// identifier (`login.keychain-db` binds to `teamid:<TEAM>`).
+    Signed {
+        identifier: String,
+        team_identifier: String,
+    },
+    /// Ad-hoc signed (`kSecCodeSignatureAdhoc`) or missing a Team ID
+    /// (`login.keychain-db` binds to the binary's per-build `cdhash:`).
+    AdHoc { identifier: Option<String> },
+    /// Code-signing status could not be determined, or running on a non-macOS host.
+    Unavailable,
+}
+
+impl MacOsCodeSigningStatus {
+    /// Returns whether the binary lacks a stable Apple Team ID and will
+    /// therefore pin `login.keychain-db` items to a volatile CDHash.
+    #[must_use]
+    pub const fn is_adhoc_or_unsigned(&self) -> bool {
+        !matches!(self, Self::Signed { .. })
+    }
+}
+
+/// Inspects the running process's macOS code signature in-process via
+/// `Security.framework` (`SecCodeCopySelf` + `SecCodeCopySigningInformation`).
+///
+/// Returns [`MacOsCodeSigningStatus::Unavailable`] on non-macOS hosts.
+#[must_use]
+pub fn current_macos_signing_status() -> MacOsCodeSigningStatus {
+    #[cfg(target_os = "macos")]
+    {
+        macos_touch_id::inspect_self_signing_status()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        MacOsCodeSigningStatus::Unavailable
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+// `errSecAuthFailed = -25293` from `Security.framework/Headers/SecBase.h`.
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
+
+#[cfg(any(target_os = "macos", test))]
+// `errSecInvalidOwnerEdit = -25244` from `Security.framework/Headers/SecBase.h`.
+const ERR_SEC_INVALID_OWNER_EDIT: i32 = -25244;
+
+#[cfg(any(target_os = "macos", test))]
+// `errSecItemNotFound = -25300` from `Security.framework/Headers/SecBase.h`.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_signing_info(
+    flags: u32,
+    identifier: Option<String>,
+    team_identifier: Option<String>,
+) -> MacOsCodeSigningStatus {
+    // `kSecCodeSignatureAdhoc = 0x0002` from `Security.framework/Headers/CSCommon.h`.
+    const SEC_CODE_SIGNATURE_ADHOC: u32 = 0x0002;
+    if flags & SEC_CODE_SIGNATURE_ADHOC != 0 {
+        return MacOsCodeSigningStatus::AdHoc { identifier };
+    }
+    match (identifier, team_identifier) {
+        (Some(id), Some(team)) if !id.is_empty() && !team.is_empty() => {
+            MacOsCodeSigningStatus::Signed {
+                identifier: id,
+                team_identifier: team,
+            }
+        }
+        (identifier, _) => MacOsCodeSigningStatus::AdHoc { identifier },
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn map_keychain_error(
+    operation: &'static str,
+    code: i32,
+    detail: String,
+    signing_status: &MacOsCodeSigningStatus,
+) -> AccountError {
+    if matches!(code, ERR_SEC_AUTH_FAILED | ERR_SEC_INVALID_OWNER_EDIT) {
+        AccountError::KeychainAccessDenied {
+            operation,
+            code,
+            adhoc_binary: signing_status.is_adhoc_or_unsigned(),
+            detail,
+        }
+    } else {
+        AccountError::Keychain { operation, detail }
+    }
+}
+
 /// Supported FIDO2 security-key algorithms enrolled through OpenSSH `-sk` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1479,18 +1578,20 @@ impl TouchIdProvider for UnsupportedTouchIdProvider {
 
 #[cfg(target_os = "macos")]
 mod macos_touch_id {
-    use std::ffi::c_void;
+    use std::ffi::{CStr, c_char, c_void};
+    use std::ptr;
     use std::sync::{Arc, Condvar, Mutex};
 
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Bool};
     use objc2_foundation::{NSError, NSString};
-    use security_framework::passwords::{
-        PasswordOptions, delete_generic_password, generic_password, set_generic_password,
-    };
+    use security_framework::passwords::{PasswordOptions, generic_password, set_generic_password};
 
-    use super::TouchIdProvider;
+    use super::{
+        ERR_SEC_ITEM_NOT_FOUND, MacOsCodeSigningStatus, TouchIdProvider,
+        classify_macos_signing_info, map_keychain_error,
+    };
     use crate::error::AccountError;
 
     // `kLAPolicyDeviceOwnerAuthenticationWithBiometrics = 1` from
@@ -1500,11 +1601,212 @@ mod macos_touch_id {
     // `BLOCK_HAS_COPY_DISPOSE = 1 << 25` from the Clang Block ABI specification.
     const BLOCK_HAS_COPY_DISPOSE: i32 = 1 << 25;
 
-    // `errSecItemNotFound = -25300` from `Security.framework/Headers/SecBase.h`.
-    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+    // `kSecCSSigningInformation = 1 << 1` from `Security.framework/Headers/SecCode.h`.
+    const SEC_CS_SIGNING_INFORMATION: u32 = 1 << 1;
+
+    // `kCFNumberSInt32Type = 3` from `CoreFoundation.framework/Headers/CFNumber.h`.
+    const CF_NUMBER_SINT32_TYPE: isize = 3;
+
+    // `kCFStringEncodingUTF8 = 0x0800_0100` from `CoreFoundation.framework/Headers/CFString.h`.
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
     #[link(name = "LocalAuthentication", kind = "framework")]
     unsafe extern "C" {}
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        static kSecCodeInfoFlags: *const c_void;
+        static kSecCodeInfoIdentifier: *const c_void;
+        static kSecCodeInfoTeamIdentifier: *const c_void;
+
+        fn SecCodeCopySelf(flags: u32, self_code: *mut *mut c_void) -> i32;
+        fn SecCodeCopyStaticCode(
+            code: *const c_void,
+            flags: u32,
+            static_code: *mut *mut c_void,
+        ) -> i32;
+        fn SecCodeCopySigningInformation(
+            code: *const c_void,
+            flags: u32,
+            information: *mut *const c_void,
+        ) -> i32;
+        fn SecKeychainFindGenericPassword(
+            keychain_or_array: *const c_void,
+            service_name_length: u32,
+            service_name: *const c_char,
+            account_name_length: u32,
+            account_name: *const c_char,
+            password_length: *mut u32,
+            password_data: *mut *mut c_void,
+            item_ref: *mut *mut c_void,
+        ) -> i32;
+        fn SecKeychainItemDelete(item_ref: *mut c_void) -> i32;
+        fn SecCopyErrorMessageString(status: i32, reserved: *mut c_void) -> *const c_void;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+        fn CFGetTypeID(cf: *const c_void) -> usize;
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFStringGetTypeID() -> usize;
+        fn CFStringGetLength(string: *const c_void) -> isize;
+        fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+        fn CFStringGetCString(
+            string: *const c_void,
+            buffer: *mut c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> u8;
+    }
+
+    /// RAII guard for owned CoreFoundation (`+1` retain count) references.
+    struct CfGuard(*const c_void);
+
+    impl Drop for CfGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is an owned CoreFoundation object created by a Copy/Create rule.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    /// Converts a borrowed `CFStringRef` into a Rust `String`, returning `None`
+    /// if the pointer is null or does not have `CFString` type ID.
+    ///
+    /// # Safety
+    /// `value` must be null or a valid live CoreFoundation object reference.
+    unsafe fn cf_string_to_rust(value: *const c_void) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        // SAFETY: Caller guarantees `value` is a live CoreFoundation object.
+        let type_id = unsafe { CFGetTypeID(value) };
+        // SAFETY: `CFStringGetTypeID` has no preconditions.
+        let string_type_id = unsafe { CFStringGetTypeID() };
+        if type_id != string_type_id {
+            return None;
+        }
+        // SAFETY: Type ID check above verified `value` is a `CFStringRef`.
+        let utf16_len = unsafe { CFStringGetLength(value) };
+        // SAFETY: `utf16_len` is the valid length returned by `CFStringGetLength`.
+        let max_utf8 =
+            unsafe { CFStringGetMaximumSizeForEncoding(utf16_len, CF_STRING_ENCODING_UTF8) };
+        let buf_len = usize::try_from(max_utf8).ok()?.checked_add(1)?;
+        let buf_len_isize = isize::try_from(buf_len).ok()?;
+        let mut buf = vec![0u8; buf_len];
+        // SAFETY: `value` is a valid `CFStringRef` and `buf` has `buf_len` writable bytes.
+        let ok = unsafe {
+            CFStringGetCString(
+                value,
+                buf.as_mut_ptr().cast::<c_char>(),
+                buf_len_isize,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
+        Some(cstr.to_string_lossy().into_owned())
+    }
+
+    /// Converts a borrowed `CFNumberRef` into a `u32` bitmask, returning `None`
+    /// if null or not a `CFNumber`.
+    ///
+    /// # Safety
+    /// `value` must be null or a valid live CoreFoundation object reference.
+    unsafe fn cf_number_to_u32(value: *const c_void) -> Option<u32> {
+        if value.is_null() {
+            return None;
+        }
+        // SAFETY: Caller guarantees `value` is a live CoreFoundation object.
+        let type_id = unsafe { CFGetTypeID(value) };
+        // SAFETY: `CFNumberGetTypeID` has no preconditions.
+        let number_type_id = unsafe { CFNumberGetTypeID() };
+        if type_id != number_type_id {
+            return None;
+        }
+        let mut raw: i32 = 0;
+        // SAFETY: Type ID check verified `value` is a `CFNumberRef` and `raw` points to an `i32`.
+        let ok = unsafe {
+            CFNumberGetValue(
+                value,
+                CF_NUMBER_SINT32_TYPE,
+                ptr::addr_of_mut!(raw).cast::<c_void>(),
+            )
+        };
+        (ok != 0).then_some(raw as u32)
+    }
+
+    fn sec_error_message(status: i32) -> String {
+        // SAFETY: `SecCopyErrorMessageString` accepts any `OSStatus` and null reserved pointer.
+        let msg_ref = unsafe { SecCopyErrorMessageString(status, ptr::null_mut()) };
+        if msg_ref.is_null() {
+            return format!("OSStatus {status}");
+        }
+        let _guard = CfGuard(msg_ref);
+        // SAFETY: `msg_ref` is a non-null `CFStringRef` owned by `_guard`.
+        unsafe { cf_string_to_rust(msg_ref) }.unwrap_or_else(|| format!("OSStatus {status}"))
+    }
+
+    pub(super) fn inspect_self_signing_status() -> MacOsCodeSigningStatus {
+        let mut raw_code: *mut c_void = ptr::null_mut();
+        // SAFETY: `raw_code` is a valid out-pointer for `SecCodeCopySelf`.
+        if unsafe { SecCodeCopySelf(0, &mut raw_code) } != 0 || raw_code.is_null() {
+            return MacOsCodeSigningStatus::Unavailable;
+        }
+        let _code_guard = CfGuard(raw_code);
+
+        let mut raw_static: *mut c_void = ptr::null_mut();
+        // SAFETY: `raw_code` is a live `SecCodeRef` owned by `_code_guard`.
+        if unsafe { SecCodeCopyStaticCode(raw_code, 0, &mut raw_static) } != 0
+            || raw_static.is_null()
+        {
+            return MacOsCodeSigningStatus::Unavailable;
+        }
+        let _static_guard = CfGuard(raw_static);
+
+        let mut raw_info: *const c_void = ptr::null();
+        // SAFETY: `raw_static` is a live `SecStaticCodeRef` owned by `_static_guard`.
+        if unsafe {
+            SecCodeCopySigningInformation(raw_static, SEC_CS_SIGNING_INFORMATION, &mut raw_info)
+        } != 0
+            || raw_info.is_null()
+        {
+            return MacOsCodeSigningStatus::Unavailable;
+        }
+        let _info_guard = CfGuard(raw_info);
+
+        // SAFETY: `kSecCodeInfoFlags` is a Security.framework constant CFString key.
+        let flags_key = unsafe { kSecCodeInfoFlags };
+        // SAFETY: `raw_info` is a live `CFDictionaryRef` owned by `_info_guard`.
+        let flags_val = unsafe { CFDictionaryGetValue(raw_info, flags_key) };
+        // SAFETY: `flags_val` is borrowed from `raw_info`, which outlives this call.
+        let flags = unsafe { cf_number_to_u32(flags_val) }.unwrap_or(0);
+
+        // SAFETY: `kSecCodeInfoIdentifier` is a Security.framework constant CFString key.
+        let id_key = unsafe { kSecCodeInfoIdentifier };
+        // SAFETY: `raw_info` is a live `CFDictionaryRef` owned by `_info_guard`.
+        let id_val = unsafe { CFDictionaryGetValue(raw_info, id_key) };
+        // SAFETY: `id_val` is borrowed from `raw_info`, which outlives this call.
+        let identifier = unsafe { cf_string_to_rust(id_val) };
+
+        // SAFETY: `kSecCodeInfoTeamIdentifier` is a Security.framework constant CFString key.
+        let team_key = unsafe { kSecCodeInfoTeamIdentifier };
+        // SAFETY: `raw_info` is a live `CFDictionaryRef` owned by `_info_guard`.
+        let team_val = unsafe { CFDictionaryGetValue(raw_info, team_key) };
+        // SAFETY: `team_val` is borrowed from `raw_info`, which outlives this call.
+        let team_identifier = unsafe { cf_string_to_rust(team_val) };
+
+        if identifier.is_none() && team_identifier.is_none() && flags == 0 {
+            return MacOsCodeSigningStatus::Unavailable;
+        }
+        classify_macos_signing_info(flags, identifier, team_identifier)
+    }
 
     unsafe extern "C" {
         static _NSConcreteStackBlock: c_void;
@@ -1695,29 +1997,79 @@ mod macos_touch_id {
             account: &str,
             secret: &[u8],
         ) -> Result<(), AccountError> {
-            set_generic_password(service, account, secret).map_err(|err| AccountError::Keychain {
-                operation: "set_generic_password",
-                detail: err.to_string(),
+            set_generic_password(service, account, secret).map_err(|err| {
+                map_keychain_error(
+                    "set_generic_password",
+                    err.code(),
+                    err.to_string(),
+                    &inspect_self_signing_status(),
+                )
             })
         }
 
         fn load_secret(&self, service: &str, account: &str) -> Result<Vec<u8>, AccountError> {
             generic_password(PasswordOptions::new_generic_password(service, account)).map_err(
-                |err| AccountError::Keychain {
-                    operation: "generic_password",
-                    detail: err.to_string(),
+                |err| {
+                    map_keychain_error(
+                        "generic_password",
+                        err.code(),
+                        err.to_string(),
+                        &inspect_self_signing_status(),
+                    )
                 },
             )
         }
 
         fn delete_secret(&self, service: &str, account: &str) -> Result<(), AccountError> {
-            match delete_generic_password(service, account) {
-                Ok(()) => Ok(()),
-                Err(err) if err.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-                Err(err) => Err(AccountError::Keychain {
-                    operation: "delete_generic_password",
-                    detail: err.to_string(),
-                }),
+            // Locate the item handle by metadata only (null password outputs) and
+            // delete via `SecKeychainItemDelete`. Unlike `SecItemDelete`, this
+            // succeeds across separately built binaries sharing the same signing
+            // identity instead of failing with `errSecInvalidOwnerEdit` (-25244).
+            let service_len = u32::try_from(service.len()).map_err(|_| AccountError::Keychain {
+                operation: "SecKeychainFindGenericPassword",
+                detail: "Keychain service name exceeds u32 length".to_owned(),
+            })?;
+            let account_len = u32::try_from(account.len()).map_err(|_| AccountError::Keychain {
+                operation: "SecKeychainFindGenericPassword",
+                detail: "Keychain account name exceeds u32 length".to_owned(),
+            })?;
+            let mut item_ref: *mut c_void = ptr::null_mut();
+            // SAFETY: `service` and `account` point to valid UTF-8 byte slices of their
+            // respective lengths; null password outputs request metadata lookup only.
+            let find_status = unsafe {
+                SecKeychainFindGenericPassword(
+                    ptr::null(),
+                    service_len,
+                    service.as_ptr().cast::<c_char>(),
+                    account_len,
+                    account.as_ptr().cast::<c_char>(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut item_ref,
+                )
+            };
+            if find_status == ERR_SEC_ITEM_NOT_FOUND {
+                return Ok(());
+            }
+            if find_status != 0 || item_ref.is_null() {
+                return Err(map_keychain_error(
+                    "SecKeychainFindGenericPassword",
+                    find_status,
+                    sec_error_message(find_status),
+                    &inspect_self_signing_status(),
+                ));
+            }
+            let _item_guard = CfGuard(item_ref);
+            // SAFETY: `item_ref` is a live `SecKeychainItemRef` owned by `_item_guard`.
+            let delete_status = unsafe { SecKeychainItemDelete(item_ref) };
+            match delete_status {
+                0 | ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+                code => Err(map_keychain_error(
+                    "SecKeychainItemDelete",
+                    code,
+                    sec_error_message(code),
+                    &inspect_self_signing_status(),
+                )),
             }
         }
     }
@@ -2390,5 +2742,111 @@ mod tests {
         back_to_touch
             .verify_self_with(&touch_id, &fido_p256)
             .expect("back-to-Touch-ID account verifies");
+    }
+
+    #[test]
+    fn classify_macos_signing_info_distinguishes_signed_and_adhoc() {
+        let adhoc_linker = classify_macos_signing_info(0x20002, Some("helios".to_owned()), None);
+        assert_eq!(
+            adhoc_linker,
+            MacOsCodeSigningStatus::AdHoc {
+                identifier: Some("helios".to_owned()),
+            }
+        );
+        assert!(adhoc_linker.is_adhoc_or_unsigned());
+
+        let adhoc_flag_overrides_team = classify_macos_signing_info(
+            0x0002,
+            Some(MACOS_CODESIGN_IDENTIFIER.to_owned()),
+            Some("TEAM123456".to_owned()),
+        );
+        assert!(adhoc_flag_overrides_team.is_adhoc_or_unsigned());
+
+        let missing_team =
+            classify_macos_signing_info(0, Some(MACOS_CODESIGN_IDENTIFIER.to_owned()), None);
+        assert!(missing_team.is_adhoc_or_unsigned());
+
+        let signed = classify_macos_signing_info(
+            0,
+            Some(MACOS_CODESIGN_IDENTIFIER.to_owned()),
+            Some("TEAM123456".to_owned()),
+        );
+        assert_eq!(
+            signed,
+            MacOsCodeSigningStatus::Signed {
+                identifier: MACOS_CODESIGN_IDENTIFIER.to_owned(),
+                team_identifier: "TEAM123456".to_owned(),
+            }
+        );
+        assert!(!signed.is_adhoc_or_unsigned());
+    }
+
+    #[test]
+    fn map_keychain_error_classifies_partition_mismatch_and_other_codes() {
+        let adhoc = MacOsCodeSigningStatus::AdHoc {
+            identifier: Some("helios".to_owned()),
+        };
+        let signed = MacOsCodeSigningStatus::Signed {
+            identifier: MACOS_CODESIGN_IDENTIFIER.to_owned(),
+            team_identifier: "TEAM123456".to_owned(),
+        };
+
+        let auth_failed_adhoc = map_keychain_error(
+            "generic_password",
+            ERR_SEC_AUTH_FAILED,
+            "The user name or passphrase you entered is not correct.".to_owned(),
+            &adhoc,
+        );
+        assert!(matches!(
+            auth_failed_adhoc,
+            AccountError::KeychainAccessDenied {
+                operation: "generic_password",
+                code: ERR_SEC_AUTH_FAILED,
+                adhoc_binary: true,
+                ..
+            }
+        ));
+        let rendered_adhoc = auth_failed_adhoc.to_string();
+        assert!(rendered_adhoc.contains("ad-hoc signed"));
+        assert!(rendered_adhoc.contains("just build-helios-signed"));
+
+        let owner_edit_signed = map_keychain_error(
+            "SecKeychainItemDelete",
+            ERR_SEC_INVALID_OWNER_EDIT,
+            "Invalid attempt to change the owner of this item.".to_owned(),
+            &signed,
+        );
+        assert!(matches!(
+            owner_edit_signed,
+            AccountError::KeychainAccessDenied {
+                operation: "SecKeychainItemDelete",
+                code: ERR_SEC_INVALID_OWNER_EDIT,
+                adhoc_binary: false,
+                ..
+            }
+        ));
+        let rendered_signed = owner_edit_signed.to_string();
+        assert!(rendered_signed.contains("different code-signing identity"));
+        assert!(rendered_signed.contains("--replace"));
+
+        let generic_param =
+            map_keychain_error("generic_password", -50, "invalid param".to_owned(), &signed);
+        assert!(matches!(
+            generic_param,
+            AccountError::Keychain {
+                operation: "generic_password",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_macos_signing_status_inspects_running_binary() {
+        let status = current_macos_signing_status();
+        assert!(
+            !matches!(status, MacOsCodeSigningStatus::Unavailable),
+            "macOS test binary must report a concrete signing status, got {status:?}"
+        );
     }
 }
