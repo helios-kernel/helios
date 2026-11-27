@@ -1815,17 +1815,20 @@ jobs:
           rm -rf "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
           mkdir -p "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
 
-          # Boot 1: establish live RAM state + entropy sample, then hibernate.
+          # Boot 1: capture pre-hibernate guest entropy, then hibernate.
           ./target/release/helios vm --arch aarch64 --release --memory 2G --acpi \
             --accel tcg --tpm swtpm --hibernate-disk-size 512M \
             --runtime-dir "$hib_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program date --boot-program python3 \
+            --boot-program nu --boot-program date \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
             hibernate --power-off-timeout-seconds 180 \
-            --before-shell /bin/dash \
-            -c 'echo hib-ram-state-ok > /hib-live; /bin/python3 -c "import os; print(os.urandom(32).hex())" > /entropy-before; printf "/bin/python3 -c \"import os; print(os.urandom(32).hex())\"\n" > /read-entropy.sh' \
-            2>&1 | tee "$hib_dir/inspector.hibernate.log"
+            --before-shell /bin/nu \
+            -c 'print $"e1=(random uuid)"' \
+            > "$hib_dir/hibernate.stdout" 2> "$hib_dir/inspector.hibernate.log"
+          cat "$hib_dir/hibernate.stdout"
+          e1="$(sed -n 's/^e1=//p' "$hib_dir/hibernate.stdout" | tr -d '\r' | head -n 1)"
+          test -n "$e1"
 
           bootfs_saved="$hib_dir/helios-bootfs.saved"
           cp target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs "$bootfs_saved"
@@ -1839,25 +1842,29 @@ jobs:
           # Advance wall clock before resuming.
           sleep 2
 
-          # Boot 2: resume once and verify RAM state, generation, entropy, and wall clock.
+          # Boot 2: resume once and verify live RAM continuity (inspector-worker-2),
+          # generation advance, fresh entropy, and updated wall clock.
           # shellcheck disable=SC2016
           ./target/release/helios vm --resume "$hib_dir" \
-            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /entropy-before | first | get stdout | str trim); let e2 = (fleet exec /bin/dash /read-entropy.sh | first | get stdout | str trim); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
-            2>&1 > "$hib_dir/resume.out" | tee "$hib_dir/inspector.resume.log"
+            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let workers = (fleet ps | where name == "inspector-worker-2" | length); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e2 = (fleet exec /bin/nu -- -c "random uuid" | first | get stdout | str trim); print $"generation=($gen)"; print $"worker2_count=($workers)"; print $"wall=($wall)"; print $"e2=($e2)"' \
+            > "$hib_dir/resume.out" 2> "$hib_dir/inspector.resume.log"
           host_after="$(date +%s)"
           cat "$hib_dir/resume.out"
           grep -aF 'resumed from hibernate image' "$hib_dir/debug-serial.log"
-          grep -Fqx 'live=hib-ram-state-ok' "$hib_dir/resume.out"
-          grep -Fqx 'entropy=changed' "$hib_dir/resume.out"
-          gen="$(sed -n 's/^generation=//p' "$hib_dir/resume.out")"
-          test "$gen" -ge 2
-          guest_ts="$(sed -n 's/^wall=unix_seconds=//p' "$hib_dir/resume.out")"
+          gen="$(sed -n 's/^generation=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          workers="$(sed -n 's/^worker2_count=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          e2="$(sed -n 's/^e2=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          guest_ts="$(sed -n 's/^wall=unix_seconds=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          test "$gen" -ge 1
+          test "$workers" -eq 1
+          test -n "$e2"
+          test "$e1" != "$e2"
           diff_ts=$((guest_ts - host_after))
           test "$diff_ts" -ge -5 -a "$diff_ts" -le 5
 
           # Second boot against the already-resumed image must NOT resume.
           if ./target/release/helios vm --resume "$hib_dir" \
-            shell --shell /bin/dash -c 'echo should-not-resume' \
+            nu -c 'print should-not-resume' \
             > "$cold_dir/resume-fail.out" 2> "$cold_dir/resume-fail.log"; then
             echo 'expected second --resume against invalidated hibernate image to fail'
             exit 1
@@ -1867,9 +1874,9 @@ jobs:
             --tpm swtpm --tpm-state "$hib_dir/tpm" \
             --disk "$hib_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$cold_dir" --keep-runtime-dir \
-            shell --shell /bin/dash -c 'echo cold:ok' \
-            2>&1 > "$cold_dir/shell.out" | tee "$cold_dir/inspector.log"
-          grep -Fqx 'cold:ok' "$cold_dir/shell.out"
+            nu -c 'let workers = (fleet ps | where name == "inspector-worker-1" | length); print $"cold:ok worker1=($workers)"' \
+            > "$cold_dir/shell.out" 2> "$cold_dir/inspector.log"
+          grep -Fqx 'cold:ok worker1=1' "$cold_dir/shell.out"
           if grep -aF 'resumed from hibernate image' "$cold_dir/debug-serial.log"; then
             echo 'unexpected resume on second boot after header invalidation'
             exit 1
@@ -1890,8 +1897,8 @@ jobs:
             --tpm swtpm --tpm-state "$tampered_dir/tpm" \
             --disk "$tampered_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$tampered_dir" --keep-runtime-dir \
-            shell --shell /bin/dash -c 'echo tampered:cold' \
-            2>&1 > "$tampered_dir/shell.out" | tee "$tampered_dir/inspector.log"
+            nu -c 'print tampered:cold' \
+            > "$tampered_dir/shell.out" 2> "$tampered_dir/inspector.log"
           grep -Fqx 'tampered:cold' "$tampered_dir/shell.out"
           grep -aF 'hibernate image refused' "$tampered_dir/debug-serial.log"
           if grep -aF 'resumed from hibernate image' "$tampered_dir/debug-serial.log"; then
@@ -1904,11 +1911,11 @@ jobs:
             --accel tcg --tpm swtpm --tpm-state "$changed_dir/tpm" \
             --disk "$changed_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$changed_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program date --boot-program python3 --boot-program ls \
+            --boot-program nu --boot-program date --boot-program ping \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
-            shell --shell /bin/dash -c 'echo changed:cold' \
-            2>&1 > "$changed_dir/shell.out" | tee "$changed_dir/inspector.log"
+            nu -c 'print changed:cold' \
+            > "$changed_dir/shell.out" 2> "$changed_dir/inspector.log"
           grep -Fqx 'changed:cold' "$changed_dir/shell.out"
           grep -aF 'hibernate image refused' "$changed_dir/debug-serial.log"
           if grep -aF 'resumed from hibernate image' "$changed_dir/debug-serial.log"; then
@@ -2469,16 +2476,19 @@ jobs:
           rm -rf "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
           mkdir -p "$hib_dir" "$tampered_dir" "$changed_dir" "$cold_dir"
 
-          # Boot 1: establish live RAM state + entropy sample, then hibernate.
+          # Boot 1: capture pre-hibernate guest entropy, then hibernate.
           ./target/release/helios vm --arch x86-64 --release --memory 2G \
             --accel kvm --tpm swtpm --hibernate-disk-size 512M \
             --runtime-dir "$hib_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program date --boot-program python3 \
+            --boot-program nu --boot-program date \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
-            hibernate --before-shell /bin/dash \
-            -c 'echo hib-ram-state-ok > /hib-live; /bin/python3 -c "import os; print(os.urandom(32).hex())" > /entropy-before; printf "/bin/python3 -c \"import os; print(os.urandom(32).hex())\"\n" > /read-entropy.sh' \
-            2>&1 | tee "$hib_dir/inspector.hibernate.log"
+            hibernate --before-shell /bin/nu \
+            -c 'print $"e1=(random uuid)"' \
+            > "$hib_dir/hibernate.stdout" 2> "$hib_dir/inspector.hibernate.log"
+          cat "$hib_dir/hibernate.stdout"
+          e1="$(sed -n 's/^e1=//p' "$hib_dir/hibernate.stdout" | tr -d '\r' | head -n 1)"
+          test -n "$e1"
 
           bootfs_saved="$hib_dir/helios-bootfs.saved"
           cp target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs "$bootfs_saved"
@@ -2492,25 +2502,29 @@ jobs:
           # Advance wall clock before resuming.
           sleep 2
 
-          # Boot 2: resume once and verify RAM state, generation, entropy, and wall clock.
+          # Boot 2: resume once and verify live RAM continuity (inspector-worker-2),
+          # generation advance, fresh entropy, and updated wall clock.
           # shellcheck disable=SC2016
           ./target/release/helios vm --resume "$hib_dir" \
-            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let live = (fleet exec /bin/cat /hib-live | first | get stdout | str trim); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e1 = (fleet exec /bin/cat /entropy-before | first | get stdout | str trim); let e2 = (fleet exec /bin/dash /read-entropy.sh | first | get stdout | str trim); if ($e1 | is-empty) or ($e2 | is-empty) or ($e1 == $e2) { error make { msg: "entropy did not change across hibernate/resume" } }; print $"generation=($gen)"; print $"live=($live)"; print $"wall=($wall)"; print "entropy=changed"' \
-            2>&1 > "$hib_dir/resume.out" | tee "$hib_dir/inspector.resume.log"
+            nu -c 'let gen = (fleet inspect /kernel/machine/generation | first | get value); let workers = (fleet ps | where name == "inspector-worker-2" | length); let wall = (fleet exec /bin/date | first | get stdout | str trim); let e2 = (fleet exec /bin/nu -- -c "random uuid" | first | get stdout | str trim); print $"generation=($gen)"; print $"worker2_count=($workers)"; print $"wall=($wall)"; print $"e2=($e2)"' \
+            > "$hib_dir/resume.out" 2> "$hib_dir/inspector.resume.log"
           host_after="$(date +%s)"
           cat "$hib_dir/resume.out"
           grep -aF 'resumed from hibernate image' "$hib_dir/debug-serial.log"
-          grep -Fqx 'live=hib-ram-state-ok' "$hib_dir/resume.out"
-          grep -Fqx 'entropy=changed' "$hib_dir/resume.out"
-          gen="$(sed -n 's/^generation=//p' "$hib_dir/resume.out")"
-          test "$gen" -ge 2
-          guest_ts="$(sed -n 's/^wall=unix_seconds=//p' "$hib_dir/resume.out")"
+          gen="$(sed -n 's/^generation=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          workers="$(sed -n 's/^worker2_count=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          e2="$(sed -n 's/^e2=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          guest_ts="$(sed -n 's/^wall=unix_seconds=//p' "$hib_dir/resume.out" | tr -d '\r')"
+          test "$gen" -ge 1
+          test "$workers" -eq 1
+          test -n "$e2"
+          test "$e1" != "$e2"
           diff_ts=$((guest_ts - host_after))
           test "$diff_ts" -ge -5 -a "$diff_ts" -le 5
 
           # Second boot against the already-resumed image must NOT resume.
           if ./target/release/helios vm --resume "$hib_dir" \
-            shell --shell /bin/dash -c 'echo should-not-resume' \
+            nu -c 'print should-not-resume' \
             > "$cold_dir/resume-fail.out" 2> "$cold_dir/resume-fail.log"; then
             echo 'expected second --resume against invalidated hibernate image to fail'
             exit 1
@@ -2520,9 +2534,9 @@ jobs:
             --tpm swtpm --tpm-state "$hib_dir/tpm" \
             --disk "$hib_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$cold_dir" --keep-runtime-dir \
-            shell --shell /bin/dash -c 'echo cold:ok' \
-            2>&1 > "$cold_dir/shell.out" | tee "$cold_dir/inspector.log"
-          grep -Fqx 'cold:ok' "$cold_dir/shell.out"
+            nu -c 'let workers = (fleet ps | where name == "inspector-worker-1" | length); print $"cold:ok worker1=($workers)"' \
+            > "$cold_dir/shell.out" 2> "$cold_dir/inspector.log"
+          grep -Fqx 'cold:ok worker1=1' "$cold_dir/shell.out"
           if grep -aF 'resumed from hibernate image' "$cold_dir/debug-serial.log"; then
             echo 'unexpected resume on second boot after header invalidation'
             exit 1
@@ -2543,8 +2557,8 @@ jobs:
             --tpm swtpm --tpm-state "$tampered_dir/tpm" \
             --disk "$tampered_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$tampered_dir" --keep-runtime-dir \
-            shell --shell /bin/dash -c 'echo tampered:cold' \
-            2>&1 > "$tampered_dir/shell.out" | tee "$tampered_dir/inspector.log"
+            nu -c 'print tampered:cold' \
+            > "$tampered_dir/shell.out" 2> "$tampered_dir/inspector.log"
           grep -Fqx 'tampered:cold' "$tampered_dir/shell.out"
           grep -aF 'hibernate image refused' "$tampered_dir/debug-serial.log"
           if grep -aF 'resumed from hibernate image' "$tampered_dir/debug-serial.log"; then
@@ -2557,11 +2571,11 @@ jobs:
             --accel kvm --tpm swtpm --tpm-state "$changed_dir/tpm" \
             --disk "$changed_dir/hibernate.img,serial=helios-hibernate" \
             --runtime-dir "$changed_dir" --keep-runtime-dir \
-            --boot-program dash --boot-program cat --boot-program date --boot-program python3 --boot-program ls \
+            --boot-program nu --boot-program date --boot-program ping \
             --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker \
             --no-compiler-plugin \
-            shell --shell /bin/dash -c 'echo changed:cold' \
-            2>&1 > "$changed_dir/shell.out" | tee "$changed_dir/inspector.log"
+            nu -c 'print changed:cold' \
+            > "$changed_dir/shell.out" 2> "$changed_dir/inspector.log"
           grep -Fqx 'changed:cold' "$changed_dir/shell.out"
           grep -aF 'hibernate image refused' "$changed_dir/debug-serial.log"
           if grep -aF 'resumed from hibernate image' "$changed_dir/debug-serial.log"; then

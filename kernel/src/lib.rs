@@ -599,6 +599,12 @@ struct KernelAllocator {
     /// it, and then every other processor behind it (#206). See
     /// [`memory::IrqSafeMutex`] for the contract.
     heap: IrqSafeMutex<KernelHeapState>,
+    /// Dedicated scratch allocator active only while the frozen BSP encodes a
+    /// hibernate snapshot after `capture_bsp_state`. Backed by pre-reserved
+    /// user frames excluded from the snapshot so `self.heap` stays completely
+    /// read-only and bit-for-bit consistent with the captured continuation.
+    snapshot_scratch_active: AtomicBool,
+    snapshot_scratch: IrqSafeMutex<KernelHeap>,
     /// Every usable byte the boot memory map described, and the free
     /// kernel heap a user grow may not dip into. Both are fixed by
     /// [`memory::BootMemoryPlan`] at boot and never move afterwards:
@@ -616,6 +622,8 @@ impl KernelAllocator {
     const fn empty() -> Self {
         Self {
             heap: IrqSafeMutex::new(KernelHeapState::new()),
+            snapshot_scratch_active: AtomicBool::new(false),
+            snapshot_scratch: IrqSafeMutex::new(Talc::new(Manual)),
             machine_usable_bytes: AtomicUsize::new(0),
             kernel_reserve_bytes: AtomicUsize::new(0),
             top_up_backoff: AtomicUsize::new(0),
@@ -777,6 +785,63 @@ impl KernelAllocator {
         self.heap
             .with(|heap| heap.counters.size_class_metrics_enabled = enabled);
     }
+
+    /// Activates the isolated snapshot-encoding scratch allocator backed by
+    /// exclusively owned `blocks` excluded from the hibernate snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The machine must be single-core frozen on the BSP, every `(ptr, size)`
+    /// block must remain valid and exclusively owned until
+    /// [`Self::exit_snapshot_scratch`] runs, and no allocation created outside
+    /// scratch mode may be freed or reallocated while scratch mode is active.
+    unsafe fn enter_snapshot_scratch(&self, blocks: &[(ptr::NonNull<u8>, usize)]) {
+        self.snapshot_scratch.with(|scratch| {
+            *scratch = Talc::new(Manual);
+            let min_first = talc::min_first_heap_layout::<DefaultBinning>().size();
+            for &(base, len) in blocks {
+                if !scratch.is_metadata_established() && len < min_first {
+                    continue;
+                }
+                // SAFETY: caller guarantees each block is exclusively owned,
+                // mapped writable, and outlives the scratch scope.
+                let _ = unsafe { scratch.claim(base.as_ptr(), len) };
+            }
+            assert!(
+                scratch.is_metadata_established(),
+                "hibernate scratch reservation failed to establish allocator metadata"
+            );
+        });
+        self.snapshot_scratch_active.store(true, Ordering::Release);
+    }
+
+    /// Deactivates and clears the isolated snapshot-encoding scratch allocator
+    /// without touching `self.heap` or performing any allocation.
+    fn exit_snapshot_scratch(&self) {
+        self.snapshot_scratch_active.store(false, Ordering::Release);
+        self.snapshot_scratch
+            .with(|scratch| *scratch = Talc::new(Manual));
+    }
+
+    fn alloc_from_scratch(&self, layout: Layout) -> *mut u8 {
+        assert_ne!(layout.size(), 0, "kernel scratch allocation has zero size");
+        self.snapshot_scratch.with(|scratch| {
+            // SAFETY: `layout` has non-zero size and `scratch` is exclusively
+            // locked for the duration of the allocation.
+            unsafe { scratch.try_allocate(layout) }.map_or(ptr::null_mut(), ptr::NonNull::as_ptr)
+        })
+    }
+
+    unsafe fn dealloc_from_scratch(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+        self.snapshot_scratch.with(|scratch| {
+            // SAFETY: caller guarantees `ptr` was allocated from `scratch` with
+            // `layout` while scratch mode was active.
+            unsafe { scratch.deallocate(ptr, layout) };
+        });
+    }
 }
 
 // SAFETY: `KernelAllocator` serialises all heap mutations through
@@ -784,13 +849,20 @@ impl KernelAllocator {
 // `talc::Talc`, and never unwinds or frees foreign pointers.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if self.snapshot_scratch_active.load(Ordering::Acquire) {
+            return self.alloc_from_scratch(layout);
+        }
         let size = layout.size();
         self.alloc_growing(layout, |counters| counters.record_alloc(size))
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let size = layout.size();
-        let ptr = self.alloc_growing(layout, |counters| counters.record_alloc(size));
+        let ptr = if self.snapshot_scratch_active.load(Ordering::Acquire) {
+            self.alloc_from_scratch(layout)
+        } else {
+            self.alloc_growing(layout, |counters| counters.record_alloc(size))
+        };
         if !ptr.is_null() {
             // SAFETY: `ptr` is non-null, properly aligned, and points to a
             // newly allocated, exclusively owned block of at least `size` bytes.
@@ -802,6 +874,12 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if self.snapshot_scratch_active.load(Ordering::Acquire) {
+            // SAFETY: forwarded from `GlobalAlloc::dealloc`; every allocation
+            // freed while scratch mode is active came from `snapshot_scratch`.
+            unsafe { self.dealloc_from_scratch(ptr, layout) };
+            return;
+        }
         let size = layout.size();
         // SAFETY: forwarded from `GlobalAlloc::dealloc`; `ptr` was allocated by
         // this allocator with `layout`.
@@ -812,6 +890,23 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // SAFETY: `GlobalAlloc::realloc` requires `new_size` to be non-zero
         // and rounded up to `layout.align()` not to exceed `isize::MAX`.
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        if self.snapshot_scratch_active.load(Ordering::Acquire) {
+            let new_ptr = self.alloc_from_scratch(new_layout);
+            if new_ptr.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `ptr` and `new_ptr` are distinct live allocations in the
+            // scratch arena of at least `layout.size()` and `new_size` bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
+            }
+            // SAFETY: `ptr` came from the scratch arena with `layout` and is
+            // no longer used after the copy.
+            unsafe {
+                self.dealloc_from_scratch(ptr, layout);
+            }
+            return new_ptr;
+        }
         // A reallocation is one operation: it is charged once, in the
         // free below, which is the critical section that ends it.
         let new_ptr = self.alloc_growing(new_layout, |_| {});
@@ -1826,6 +1921,38 @@ pub fn heap_stats() -> HeapStats {
 /// the user pool), returned without allocating on the heap.
 pub fn kernel_heap_regions() -> ArrayVec<(usize, usize), MAX_KERNEL_HEAP_REGIONS> {
     ALLOCATOR.claimed_regions()
+}
+
+/// Scope guard keeping [`ALLOCATOR`] routed to an isolated hibernate snapshot
+/// scratch arena until dropped.
+pub(crate) struct HibernateScratchGuard;
+
+impl Drop for HibernateScratchGuard {
+    fn drop(&mut self) {
+        exit_hibernate_scratch_allocator();
+    }
+}
+
+/// Switches [`ALLOCATOR`] into isolated snapshot-encoding scratch mode backed
+/// by exclusively owned `blocks` excluded from the hibernate snapshot.
+///
+/// # Safety
+///
+/// See [`KernelAllocator::enter_snapshot_scratch`]. Every allocation created
+/// while the returned guard is alive must be dropped before the guard drops.
+pub(crate) unsafe fn enter_hibernate_scratch_allocator(
+    blocks: &[(ptr::NonNull<u8>, usize)],
+) -> HibernateScratchGuard {
+    // SAFETY: forwarded from caller.
+    unsafe { ALLOCATOR.enter_snapshot_scratch(blocks) };
+    HibernateScratchGuard
+}
+
+/// Deactivates [`ALLOCATOR`]'s hibernate snapshot scratch mode without
+/// allocating. Must run immediately upon returning into `SnapshotPoint::Resumed`
+/// because `.bss` was snapshotted while scratch mode was active.
+pub(crate) fn exit_hibernate_scratch_allocator() {
+    ALLOCATOR.exit_snapshot_scratch();
 }
 
 pub fn set_kernel_heap_size_class_metrics_enabled(enabled: bool) {

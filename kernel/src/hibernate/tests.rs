@@ -731,6 +731,54 @@ fn normalize_physical_runs_merges_and_subtracts_exclusions() {
 }
 
 #[test]
+fn kernel_allocator_scratch_mode_isolates_main_heap() {
+    use core::alloc::GlobalAlloc;
+
+    let main_backing = AlignedPoolBacking::new(256 * 1024);
+    let scratch_backing = AlignedPoolBacking::new(256 * 1024);
+    let allocator = KernelAllocator::empty();
+    let (ms, me) = main_backing.range();
+    let (ss, se) = scratch_backing.range();
+    // SAFETY: `main_backing` stays live for the duration of this test.
+    unsafe { allocator.add_to_heap(ms, me) };
+
+    let layout = Layout::from_size_align(128, 16).unwrap();
+    // SAFETY: `allocator` has a claimed main heap and non-zero `layout`.
+    let main_ptr = unsafe { allocator.alloc(layout) };
+    assert!(!main_ptr.is_null());
+    assert!((ms..me).contains(&(main_ptr as usize)));
+
+    let before_stats = allocator.stats();
+    // SAFETY: single-threaded test; `scratch_backing` stays live until exit.
+    unsafe { allocator.enter_snapshot_scratch(&[(scratch_backing.ptr, se - ss)]) };
+
+    // SAFETY: scratch mode is active with 256 KiB claimed.
+    let s1 = unsafe { allocator.alloc(layout) };
+    assert!(!s1.is_null());
+    assert!((ss..se).contains(&(s1 as usize)));
+    // SAFETY: `s1` came from scratch mode with `layout`.
+    let s2 = unsafe { allocator.realloc(s1, layout, 512) };
+    assert!(!s2.is_null());
+    assert!((ss..se).contains(&(s2 as usize)));
+    // SAFETY: `s2` came from scratch mode with 512-byte layout.
+    unsafe { allocator.dealloc(s2, Layout::from_size_align(512, 16).unwrap()) };
+
+    assert_eq!(
+        allocator.stats(),
+        before_stats,
+        "scratch-mode alloc/realloc/dealloc must not mutate main heap metadata or counters"
+    );
+
+    allocator.exit_snapshot_scratch();
+    // SAFETY: `main_ptr` came from main heap before scratch mode.
+    unsafe { allocator.dealloc(main_ptr, layout) };
+    assert_eq!(
+        allocator.stats().deallocation_count,
+        before_stats.deallocation_count + 1
+    );
+}
+
+#[test]
 fn atomic_snapshot_reservation_exhaustion_thaws_and_releases_frames() {
     use super::snapshot::{AtomicSnapshotParams, SnapshotOutcome, capture_atomic_snapshot};
     use core::fmt;
@@ -811,9 +859,10 @@ fn atomic_snapshot_reservation_exhaustion_thaws_and_releases_frames() {
         }
     }
 
-    // Prime a 16 MiB synthetic machine so `prime_bootstrap_allocator` and
-    // `Kernel::freeze` run against real allocator + pool structures.
-    let backing = AlignedPoolBacking::new(16 * 1024 * 1024);
+    // Prime a 32 MiB synthetic machine so `prime_bootstrap_allocator`,
+    // `HIBERNATE_ENCODE_SCRATCH_BYTES`, and `Kernel::freeze` run against real
+    // allocator + pool structures.
+    let backing = AlignedPoolBacking::new(32 * 1024 * 1024);
     let (start, end) = backing.range();
     let span = NonNull::slice_from_raw_parts(backing.ptr, end - start);
     // SAFETY: `backing` stays alive for the rest of this test process.

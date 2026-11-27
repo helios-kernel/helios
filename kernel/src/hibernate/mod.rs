@@ -46,8 +46,8 @@ pub use resume::{
     plan_frame_placement, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 pub use snapshot::{
-    AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, ReservationWriter,
-    SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
+    AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, HIBERNATE_ENCODE_SCRATCH_BYTES,
+    ReservationWriter, SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
     collect_snapshot_physical_runs, encode_snapshot, normalize_physical_runs,
 };
 pub use storage::{
@@ -102,7 +102,8 @@ pub fn compute_hibernate_reservation_bytes(
     let used_estimate = usable_bytes
         .saturating_sub(free_bytes)
         .saturating_add(HIBERNATE_RESERVATION_HEADROOM_BYTES);
-    let max_from_free = ((free_bytes / 4).saturating_mul(3)) & page_mask;
+    let available_for_image = free_bytes.saturating_sub(HIBERNATE_ENCODE_SCRATCH_BYTES);
+    let max_from_free = ((available_for_image / 4).saturating_mul(3)) & page_mask;
     let mut target = used_estimate.min(max_from_free);
     if let Ok(disk_usize) = usize::try_from(disk_bytes) {
         let disk_aligned = disk_usize & page_mask;
