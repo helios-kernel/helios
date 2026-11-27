@@ -103,8 +103,9 @@ pub(crate) async fn connect_after_boot(
 ) -> Result<RpcClient, BootError> {
     let (read, mut write) = io.into_split();
     let mut read = wait_for_boot(read).await?;
+    let mut server_public_key = None;
     if let Some(identity) = identity {
-        let _accepted = client_handshake(
+        let (hello, _, _) = client_handshake(
             &mut read,
             &mut write,
             TransportKind::Serial,
@@ -114,8 +115,9 @@ pub(crate) async fn connect_after_boot(
             None,
         )
         .await?;
+        server_public_key = Some(hello.machine_public_key);
     }
-    let mut client = RpcClient::new(read, write)?;
+    let mut client = RpcClient::new(read, write)?.with_server_public_key(server_public_key);
     wait_until_ready(&mut client).await?;
     Ok(client)
 }
@@ -710,5 +712,100 @@ mod tests {
             assert!(!lines.advance().await.expect("reaching end of stream"));
             assert_eq!(lines.line(), b"panicked at");
         });
+    }
+
+    struct ReadyInspectDispatcher;
+
+    impl helios_wit_rpc::Dispatcher for ReadyInspectDispatcher {
+        type Resource = core::convert::Infallible;
+
+        fn supports(&self, instance: &str, func: &str) -> bool {
+            instance.contains("helios:system/inspect") && func == "snapshot"
+        }
+
+        async fn dispatch<'a>(
+            &'a self,
+            ctx: helios_wit_rpc::ServerInvocation<'a, Self::Resource>,
+            _instance: &'a str,
+            _func: &'a str,
+        ) -> Result<(), helios_wit_rpc::WireError> {
+            let (_query, _limit): (inspect::Query, u32) = ctx.decode_request().await?;
+            ctx.encode_response(Ok::<
+                inspect::SnapshotResult,
+                helios_wit_rpc::inspector::helios::system::filters::FilterError,
+            >(inspect::SnapshotResult {
+                timestamp: 1,
+                truncated: false,
+                publications: Vec::new(),
+                entries: Vec::new(),
+            }))
+            .await
+        }
+    }
+
+    #[test]
+    fn connect_after_boot_retains_authenticated_server_machine_public_key() {
+        use async_io::Async;
+        use futures_lite::io::AsyncWriteExt as _;
+        use helios_inspector_protocol::auth::{
+            AuthPolicy, MACHINE_IDENTITY_HANDSHAKE_DOMAIN, SessionGrants, server_handshake,
+            sign_machine_identity_seed,
+        };
+        use std::os::unix::net::UnixStream;
+
+        let (host_sock, guest_sock) = UnixStream::pair().expect("socket pair");
+        let identity = ClientIdentity::from_static_seed([0x11; 32]);
+        let policy = AuthPolicy::single_static_key("dev", identity.public_key());
+        let machine_seed = [0x42; 32];
+        let expected_machine_pk = ClientIdentity::from_static_seed(machine_seed).public_key();
+
+        let server = std::thread::spawn(move || {
+            runtime::block_on(async move {
+                let mut guest_read =
+                    Async::new(guest_sock.try_clone().expect("clone guest read")).expect("read");
+                let mut guest_write = Async::new(guest_sock).expect("write");
+                guest_write
+                    .write_all(b"[KDBG boot]\n[KDBG run:begin]\n")
+                    .await
+                    .expect("write stage markers");
+                guest_write.flush().await.expect("flush stage markers");
+
+                server_handshake(
+                    &mut guest_read,
+                    &mut guest_write,
+                    TransportKind::Serial,
+                    &policy,
+                    &SessionGrants::full_worker_ceiling(),
+                    expected_machine_pk,
+                    1_700_000_000,
+                    1,
+                    None,
+                    None,
+                    |challenge| {
+                        Ok(sign_machine_identity_seed(
+                            &machine_seed,
+                            MACHINE_IDENTITY_HANDSHAKE_DOMAIN,
+                            challenge,
+                        ))
+                    },
+                )
+                .await
+                .expect("server handshake");
+
+                let endpoint =
+                    helios_wit_rpc::Endpoint::new(guest_read, guest_write, ReadyInspectDispatcher);
+                let _ = endpoint.drive().await;
+            });
+        });
+
+        let io = SerialIo::from_parts(
+            Box::new(Async::new(host_sock.try_clone().expect("clone host read")).expect("read")),
+            Box::new(Async::new(host_sock).expect("write")),
+        );
+        let client = runtime::block_on(connect_after_boot(io, Some(&identity)))
+            .expect("connect_after_boot must succeed");
+        assert_eq!(client.server_public_key(), Some(expected_machine_pk));
+        drop(client);
+        server.join().expect("server thread");
     }
 }

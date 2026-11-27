@@ -3009,19 +3009,28 @@ impl ByteSerial for DebugSerial {
     /// Receive and receive-timeout are the only mask bits this port
     /// uses, so a plain write of exactly them rather than a
     /// read-modify-write. Idempotent, and callable from interrupt
-    /// context: a register write, no lock, no allocation.
+    /// context: a register write plus `dsb sy` so the Device-nGnRnE
+    /// MMIO store completes before the caller releases its spinlock.
     fn enable_receive_interrupt(&self) {
-        // SAFETY: `self.base + PL011_IMSC` is a mapped, 32-bit aligned PL011
-        // interrupt mask register.
+        // SAFETY: `self.base + PL011_IMSC` is a mapped, 32-bit aligned PL011 interrupt mask register.
         unsafe {
-            ((self.base + PL011_IMSC) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT)
-        };
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(PL011_INT_RX | PL011_INT_RT);
+        }
+        // SAFETY: `dsb sy` orders the Device-nGnRnE MMIO store across PEs.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
     }
 
     fn disable_receive_interrupt(&self) {
-        // SAFETY: `self.base + PL011_IMSC` is a mapped, 32-bit aligned PL011
-        // interrupt mask register.
-        unsafe { ((self.base + PL011_IMSC) as *mut u32).write_volatile(0) };
+        // SAFETY: `self.base + PL011_IMSC` is a mapped, 32-bit aligned PL011 interrupt mask register.
+        unsafe {
+            ((self.base + PL011_IMSC) as *mut u32).write_volatile(0);
+        }
+        // SAFETY: `dsb sy` orders the Device-nGnRnE MMIO store across PEs.
+        unsafe {
+            asm!("dsb sy", options(nostack, preserves_flags));
+        }
     }
 }
 
