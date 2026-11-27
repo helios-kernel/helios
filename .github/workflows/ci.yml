@@ -924,7 +924,7 @@ jobs:
             --accel tcg --iommu \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program inspector-host --boot-program inspector-tls --boot-program inspector-worker --no-compiler-plugin \
-            shell --trace-log "$runtime/guest-tracing.log" \
+            shell --shell /bin/dash --trace-log "$runtime/guest-tracing.log" \
             -c 'echo ok' 2>&1 > boot-iommu.out | tee "$runtime/inspector.log"
           cat boot-iommu.out
           grep -Fqx ok boot-iommu.out

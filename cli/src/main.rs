@@ -1323,6 +1323,16 @@ struct ProgramRole {
     /// name under `programs/`).
     #[serde(default)]
     command: Option<String>,
+    /// Program emits Wasm SIMD128 instructions and can only be precompiled for
+    /// targets whose AOT backend enables Wasm SIMD.
+    #[serde(default)]
+    requires_wasm_simd: bool,
+}
+
+impl ProgramManifest {
+    fn supports_target(&self, target: &str) -> bool {
+        !self.role.requires_wasm_simd || cwasm_target_supports_wasm_simd(target)
+    }
 }
 
 /// Every command's failure is a typed error whose message names what was
@@ -2216,6 +2226,22 @@ pub(crate) fn build_boot_program_assets(
         }
         manifests.push(manifest);
     }
+    if let Some(selected_programs) = selected_programs {
+        let mismatches = manifests
+            .iter()
+            .filter(|manifest| selected_programs.contains(&manifest.command))
+            .filter(|manifest| !manifest.supports_target(build.target.triple()))
+            .map(|manifest| format!("{} requires wasm SIMD", manifest.command))
+            .collect::<Vec<_>>();
+        if !mismatches.is_empty() {
+            return Err(BootArtifactsError::TargetMismatch {
+                target: build.target.triple().to_owned(),
+                mismatches: mismatches.join("; "),
+            }
+            .into());
+        }
+    }
+    manifests.retain(|manifest| manifest.supports_target(build.target.triple()));
     for artifact in &external_artifacts {
         if !available_programs.insert(artifact.command.clone()) {
             return Err(BootArtifactsError::DuplicateCommand {

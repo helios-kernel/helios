@@ -6,6 +6,10 @@ autobins = false
 
 [package.metadata.helios]
 command = "nu"
+# `nu-table` -> `papergrid` -> `bytecount 0.6.9` unconditionally compiles a
+# `#[target_feature(enable = "simd128")]` helper on `wasm32`, so AOT targets
+# without Wasm SIMD128 (such as `riscv64gc` without RVV) cannot compile it.
+requires-wasm-simd = true
 
 [dependencies]
 async-channel = { version = "2.5.0", default-features = false }
