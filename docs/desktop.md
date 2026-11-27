@@ -439,7 +439,12 @@ compositor:device name=QEMU Virtio Tablet
 compositor:device name=QEMU Virtio Keyboard
 ```
 
-After claiming the scanout, the compositor runs a 2.0 s analytical SDF boot
+After claiming the scanout, the compositor subscribes to `Display::changed()`
+and follows host display resizes at runtime (reallocating the scanout surface,
+resizing the VT1/VT2 terminal grids, emitting `TtyClientMsg::Resize` to
+`/console-session`, re-establishing the hardware cursor plane, and scaling
+absolute pointer axes against the live mode, logging `compositor:resize ...`).
+It runs a 2.0 s analytical SDF boot
 splash and 0.60 s cross-fade into **VT1** (the full-screen dark system log
 console fed by `helios:system/tracing` and `/components/*` readiness lines)
 on normal boots, or directly into **VT2** (the interactive terminal and

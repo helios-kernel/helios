@@ -252,6 +252,32 @@ impl Terminal {
         self.rows
     }
 
+    /// Resizes the visible character grid while preserving retained lines and
+    /// scrollback up to [`SCROLLBACK_LINES`] behind the new viewport height.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `columns == 0 || rows == 0`.
+    pub fn resize(&mut self, columns: usize, rows: usize) {
+        assert!(
+            columns > 0 && rows > 0,
+            "a terminal grid is at least one cell, not {columns}x{rows}"
+        );
+        if self.columns == columns && self.rows == rows {
+            return;
+        }
+        self.columns = columns;
+        self.rows = rows;
+        let max_lines = SCROLLBACK_LINES + rows;
+        while self.lines.len() > max_lines {
+            self.lines.pop_front();
+        }
+        self.column = self.column.min(columns);
+        self.scroll_offset = self.scroll_offset.min(self.scrollback());
+        self.dirty.resize(rows, true);
+        self.dirty_all();
+    }
+
     /// How many lines are behind the screen.
     pub fn scrollback(&self) -> usize {
         self.lines.len().saturating_sub(self.rows)
@@ -1021,5 +1047,52 @@ mod tests {
         assert_eq!(terminal.scroll_offset(), 0);
         assert_eq!(row_text(&terminal, 0), "L4");
         assert_eq!(row_text(&terminal, 2), "L6");
+    }
+
+    #[test]
+    fn resize_preserves_content_clamps_cursor_and_scrollback_and_marks_all_rows_dirty() {
+        let mut terminal = Terminal::new(20, 3);
+        terminal.write(b"L0\nL1\nL2\nL3\n0123456789abcdef");
+        let _ = terminal.take_dirty_rows();
+
+        // Scroll into history, then grow the viewport so scrollback shrinks.
+        terminal.scroll_up(2);
+        assert_eq!(terminal.scroll_offset(), 2);
+        let _ = terminal.take_dirty_rows();
+
+        terminal.resize(40, 5);
+        assert_eq!(terminal.columns(), 40);
+        assert_eq!(terminal.rows(), 5);
+        assert_eq!(terminal.scroll_offset(), 0);
+        assert_eq!(terminal.take_dirty_rows(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(row_text(&terminal, 0), "L0");
+        assert_eq!(row_text(&terminal, 4), "0123456789abcdef");
+
+        // Shrink columns below the current cursor column and verify wrapping still works.
+        terminal.resize(8, 2);
+        assert_eq!(terminal.columns(), 8);
+        assert_eq!(terminal.rows(), 2);
+        assert_eq!(terminal.cursor(), (7, 1));
+        assert_eq!(terminal.take_dirty_rows(), vec![0, 1]);
+        assert_eq!(row_text(&terminal, 0), "L3");
+        assert_eq!(row_text(&terminal, 1), "0123456789abcdef");
+
+        // Writing at the clamped right edge wraps onto a fresh line cleanly.
+        terminal.write(b"Z");
+        assert_eq!(row_text(&terminal, 1), "Z");
+        assert_eq!(terminal.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn resize_trims_excess_scrollback_to_the_new_viewport_bound() {
+        let mut terminal = Terminal::new(16, 10);
+        for index in 0..(SCROLLBACK_LINES + 10) {
+            terminal.write(format!("line-{index}\n").as_bytes());
+        }
+        assert_eq!(terminal.scrollback(), SCROLLBACK_LINES);
+
+        terminal.resize(16, 2);
+        assert_eq!(terminal.scrollback(), SCROLLBACK_LINES);
+        assert_eq!(terminal.take_dirty_rows(), vec![0, 1]);
     }
 }
