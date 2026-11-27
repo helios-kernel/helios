@@ -1,6 +1,54 @@
 # Base container image for non-KVM Helios PR CI jobs (ubuntu-24.04 amd64 and arm64).
 # Pre-bakes apt packages, the pinned Rust nightly toolchain, and host CI binaries
 # so PR check/test/wasm-build jobs skip per-job package and tool installation.
+#
+# Also builds the TPM2-enabled RISC-V EDK2 OVMF firmware (`RiscVVirtQemu`) in an
+# isolated builder stage so only the 32 MiB flash images enter the final image
+# (helios#1292). Ubuntu 24.04's distro `qemu-efi-riscv64` omits `TPM2_ENABLE`.
+
+FROM ubuntu:24.04 AS edk2-riscv64
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG EDK2_TAG=edk2-stable202611
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        gcc-riscv64-linux-gnu \
+        git \
+        iasl \
+        python3 \
+        uuid-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    git clone --depth 1 --branch "${EDK2_TAG}" https://github.com/tianocore/edk2.git /src/edk2; \
+    cd /src/edk2; \
+    git submodule update --init --depth 1; \
+    make -C BaseTools -j"$(nproc)"; \
+    bash -c 'set -eo pipefail; \
+        export WORKSPACE=/src/edk2; \
+        export PACKAGES_PATH=/src/edk2; \
+        export PYTHON_COMMAND=python3; \
+        export GCC_RISCV64_PREFIX=riscv64-linux-gnu-; \
+        source edksetup.sh; \
+        set -u; \
+        build -a RISCV64 -t GCC -b RELEASE -n "$(nproc)" \
+            -p OvmfPkg/RiscVVirt/RiscVVirtQemu.dsc \
+            -D RISCVVIRT_PEI_BOOTING=TRUE \
+            -D TPM2_ENABLE=TRUE \
+            -D TPM2_CONFIG_ENABLE=TRUE'; \
+    mkdir -p /out/usr/share/helios-edk2-riscv64; \
+    cp /src/edk2/Build/RiscVVirtQemu/RELEASE_GCC/FV/RISCV_VIRT_CODE.fd \
+        /out/usr/share/helios-edk2-riscv64/RISCV_VIRT_CODE.fd; \
+    cp /src/edk2/Build/RiscVVirtQemu/RELEASE_GCC/FV/RISCV_VIRT_VARS.fd \
+        /out/usr/share/helios-edk2-riscv64/RISCV_VIRT_VARS.fd; \
+    truncate -s 32M \
+        /out/usr/share/helios-edk2-riscv64/RISCV_VIRT_CODE.fd \
+        /out/usr/share/helios-edk2-riscv64/RISCV_VIRT_VARS.fd; \
+    test -s /out/usr/share/helios-edk2-riscv64/RISCV_VIRT_CODE.fd; \
+    test -s /out/usr/share/helios-edk2-riscv64/RISCV_VIRT_VARS.fd
 
 FROM ubuntu:24.04
 
@@ -162,3 +210,8 @@ RUN set -eu; \
     setfacl --version; \
     mkfs.btrfs --version; \
     command -v mkfs.erofs
+
+COPY --from=edk2-riscv64 /out/usr/share/helios-edk2-riscv64 /usr/share/helios-edk2-riscv64
+
+RUN test -s /usr/share/helios-edk2-riscv64/RISCV_VIRT_CODE.fd \
+    && test -s /usr/share/helios-edk2-riscv64/RISCV_VIRT_VARS.fd
