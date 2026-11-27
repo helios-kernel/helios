@@ -78,9 +78,14 @@ default (`--display none`):
   `helios vm` exports operator accounts enrolled via
   `helios account create <username> --touch-id` (or `--fido2`) into
   `/etc/helios/accounts.postcard` inside bootfs so VT2 login and remote
-  account authentication work immediately. Passing `--console-shell`
-  stages `/etc/helios/console-shell` so VT2 boots directly into an
-  interactive `/bin/nu` shell without login (used by CI desktop smoke
+  account authentication work immediately. On macOS, build `helios` with
+  `just build-helios-signed` (or sign with
+  `codesign --force --sign <identity> --identifier cool.lexo.helios`, or set
+  `HELIOS_CODESIGN_IDENTITY`): plain `cargo build` binaries are ad-hoc
+  linker-signed, so `login.keychain-db` pins their Touch ID entries to a
+  per-build CDHash that breaks after the next rebuild. Passing
+  `--console-shell` stages `/etc/helios/console-shell` so VT2 boots directly
+  into an interactive `/bin/nu` shell without login (used by CI desktop smoke
   tests).
 
 ## `--renderer`

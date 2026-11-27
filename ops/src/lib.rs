@@ -37,8 +37,9 @@ pub mod vm;
 
 pub use account::{
     AccountAuthenticatorChoice, AccountStore, AuthenticatorSpec, CreateAccountRequest, Fido2Alg,
-    Fido2Enrollment, Fido2Provider, OpenSshFido2Provider, OperatorAccount,
-    TOUCH_ID_KEYCHAIN_SERVICE, TouchIdProvider, session_grants_from_attenuation, validate_username,
+    Fido2Enrollment, Fido2Provider, MACOS_CODESIGN_IDENTIFIER, MacOsCodeSigningStatus,
+    OpenSshFido2Provider, OperatorAccount, TOUCH_ID_KEYCHAIN_SERVICE, TouchIdProvider,
+    current_macos_signing_status, session_grants_from_attenuation, validate_username,
 };
 pub use bundle::{BundleEntry, BundleManifest, DiagnosticBundle};
 pub use components::{ComponentsClient, DynamicDirSource, DynamicSubtreeSource};

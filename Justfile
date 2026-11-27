@@ -408,3 +408,69 @@ check-bench-tools:
     uv run ruff check .
     uv run ruff format --check .
     uv run pytest -q
+
+# Sign a built macOS `helios` binary with a stable code-signing identity and
+# identifier (`cool.lexo.helios`) so `login.keychain-db` binds Touch ID items
+# to the certificate's Team ID instead of a per-build ad-hoc CDHash.
+# Resolves identity from the `identity` arg, `HELIOS_CODESIGN_IDENTITY`, or the
+# sole valid code-signing certificate in the user's keychain.
+sign-helios binary="target/release/helios" identity="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "sign-helios is only supported on macOS" >&2
+        exit 1
+    fi
+    bin="{{ binary }}"
+    if [[ ! -f "${bin}" ]]; then
+        echo "binary not found: ${bin}" >&2
+        exit 1
+    fi
+    resolved="{{ identity }}"
+    if [[ -z "${resolved}" ]]; then
+        resolved="${HELIOS_CODESIGN_IDENTITY:-}"
+    fi
+    if [[ -z "${resolved}" ]]; then
+        identities=()
+        while IFS= read -r line; do
+            if [[ -n "${line}" ]]; then
+                identities+=("${line}")
+            fi
+        done < <(
+            security find-identity -v -p codesigning \
+                | sed -n 's/^[[:space:]]*[0-9][0-9]*)[[:space:]]\([0-9A-F]\{40\}\)[[:space:]]"\(.*\)"$/\1\t\2/p'
+        )
+        if [[ "${#identities[@]}" -eq 0 ]]; then
+            echo "no valid macOS code-signing identity found; install an Apple Development or Developer ID certificate, or pass identity=<SHA1-or-name>" >&2
+            exit 1
+        elif [[ "${#identities[@]}" -gt 1 ]]; then
+            echo "multiple macOS code-signing identities found; pass identity=<SHA1-or-name> or set HELIOS_CODESIGN_IDENTITY:" >&2
+            printf '  %s\n' "${identities[@]}" >&2
+            exit 1
+        fi
+        resolved="${identities[0]%%$'\t'*}"
+    fi
+    codesign --force --sign "${resolved}" --identifier cool.lexo.helios "${bin}"
+    codesign --verify --strict "${bin}"
+    codesign -dvv "${bin}" 2>&1 | grep -E '^(Executable|Identifier|TeamIdentifier|Authority)='
+
+# Build `helios` (`helios-inspector`) and sign it on macOS with a stable
+# code-signing identity so Touch ID Keychain items survive rebuilds.
+build-helios-signed profile="release" identity="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ profile }}" in
+        release)
+            cargo build --release -p helios-inspector
+            bin="{{ repo_root }}/target/release/helios"
+            ;;
+        debug)
+            cargo build -p helios-inspector
+            bin="{{ repo_root }}/target/debug/helios"
+            ;;
+        *)
+            cargo build --profile "{{ profile }}" -p helios-inspector
+            bin="{{ repo_root }}/target/{{ profile }}/helios"
+            ;;
+    esac
+    just sign-helios "${bin}" "{{ identity }}"

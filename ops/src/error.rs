@@ -415,6 +415,16 @@ pub enum AccountError {
         operation: &'static str,
         detail: String,
     },
+    #[error(
+        "{}",
+        format_keychain_access_denied(operation, *code, *adhoc_binary, detail)
+    )]
+    KeychainAccessDenied {
+        operation: &'static str,
+        code: i32,
+        adhoc_binary: bool,
+        detail: String,
+    },
     #[error("FIDO2 operation `{operation}` failed: {detail}")]
     Fido2 {
         operation: &'static str,
@@ -490,6 +500,28 @@ pub enum BundleError {
     },
     #[error("background archive task panicked: {detail}")]
     TaskJoin { detail: String },
+}
+
+pub(crate) fn format_keychain_access_denied(
+    operation: &str,
+    code: i32,
+    adhoc_binary: bool,
+    detail: &str,
+) -> String {
+    if adhoc_binary {
+        format!(
+            "macOS Keychain rejected `{operation}` ({detail}; OSStatus {code}): this `helios` \
+             binary is ad-hoc signed, so its CDHash changed across rebuilds; build a signed \
+             binary with `just build-helios-signed` and re-enroll once with \
+             `helios account create <user> --touch-id --replace`"
+        )
+    } else {
+        format!(
+            "macOS Keychain rejected `{operation}` ({detail}; OSStatus {code}): this Keychain \
+             item belongs to a different code-signing identity or an earlier ad-hoc build; \
+             re-enroll once with `helios account create <user> --touch-id --replace`"
+        )
+    }
 }
 
 pub(crate) fn format_kind_detail(kind: &str, detail: &str) -> String {

@@ -1084,6 +1084,15 @@ where
 
             match authenticator {
                 AccountAuthenticatorChoice::TouchId => {
+                    #[cfg(target_os = "macos")]
+                    if helios_ops::current_macos_signing_status().is_adhoc_or_unsigned() {
+                        eprintln!(
+                            "{} this `helios` binary is ad-hoc signed; macOS Keychain pins \
+                             Touch ID items to this build's CDHash, so future rebuilds will \
+                             reject it until built with `just build-helios-signed`",
+                            err_theme.yellow("warn"),
+                        );
+                    }
                     eprintln!(
                         "{} confirm macOS Touch ID to enroll operator account {}...",
                         err_theme.bold_cyan("touch-id"),
