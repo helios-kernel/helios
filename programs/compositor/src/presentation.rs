@@ -38,6 +38,20 @@ impl Presentation {
         }
     }
 
+    pub(super) const fn display(&self) -> &Display {
+        &self.display
+    }
+
+    /// Re-activates any fullscreen client image surface after the compositor
+    /// created a replacement desktop scanout surface.
+    pub(super) async fn reactivate_if_active(&self) -> Result<bool, DesktopError> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(false);
+        };
+        active._surface.activate().await?;
+        Ok(true)
+    }
+
     pub(super) fn create(&mut self, id: u64, size: Size) {
         self.windows.push(Window { id, size });
     }
