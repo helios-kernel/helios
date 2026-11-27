@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -4366,20 +4367,68 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     if !restored && let Some(cache) = &cache {
         cache.store()?;
     }
-    // An inspector named by `HELIOS_INSPECTOR_BIN` is already built and staged
-    // by the caller, so rebuilding the workspace binary is waste.
-    if std::env::var_os("HELIOS_INSPECTOR_BIN").is_none() {
+    // An inspector named by `HELIOS_INSPECTOR_BIN`, or the workspace binary
+    // currently executing this command, is already built; rebuilding it in
+    // place wastes a compile and on macOS overwrites a code-signed `helios`
+    // binary with a fresh ad-hoc build.
+    let host_profile = command.kind.host();
+    if should_build_workspace_inspector(
+        &repo_root,
+        host_profile,
+        std::env::var_os("HELIOS_INSPECTOR_BIN").as_deref(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+        std::env::current_exe().ok().as_deref(),
+    ) {
         run_step(
             "building inspector",
-            command
-                .kind
-                .host()
+            host_profile
                 .cargo_build_command(&repo_root)
                 .arg("-p")
                 .arg("helios-inspector"),
         )?;
     }
     Ok(())
+}
+
+fn workspace_inspector_binary_path(
+    repo_root: &Path,
+    host_profile: HostBuildProfile,
+    cargo_target_dir: Option<&OsStr>,
+) -> PathBuf {
+    let target_root = match cargo_target_dir.filter(|value| !value.is_empty()) {
+        Some(dir) => {
+            let path = PathBuf::from(dir);
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        }
+        None => repo_root.join("target"),
+    };
+    target_root
+        .join(host_profile.directory())
+        .join(format!("helios{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn should_build_workspace_inspector(
+    repo_root: &Path,
+    host_profile: HostBuildProfile,
+    inspector_bin_env: Option<&OsStr>,
+    cargo_target_dir: Option<&OsStr>,
+    current_exe: Option<&Path>,
+) -> bool {
+    if inspector_bin_env.is_some() {
+        return false;
+    }
+    let expected = workspace_inspector_binary_path(repo_root, host_profile, cargo_target_dir);
+    match (
+        current_exe.and_then(|path| fs::canonicalize(path).ok()),
+        fs::canonicalize(&expected).ok(),
+    ) {
+        (Some(running), Some(target)) => running != target,
+        _ => true,
+    }
 }
 
 fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
@@ -12848,5 +12897,87 @@ mod tests {
             fs::read(&hib_path).expect("read hibernate.img"),
             b"existing-hibernate-image-bytes"
         );
+    }
+
+    #[test]
+    fn should_build_workspace_inspector_skips_running_binary_and_env_override() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let repo = tempdir.path().join("repo");
+        let debug_bin = repo
+            .join("target")
+            .join("debug")
+            .join(format!("helios{}", std::env::consts::EXE_SUFFIX));
+        let release_bin = repo
+            .join("target")
+            .join("release")
+            .join(format!("helios{}", std::env::consts::EXE_SUFFIX));
+        fs::create_dir_all(debug_bin.parent().expect("debug dir")).expect("create debug dir");
+        fs::create_dir_all(release_bin.parent().expect("release dir")).expect("create release dir");
+        fs::write(&debug_bin, b"debug-bin").expect("write debug bin");
+        fs::write(&release_bin, b"release-bin").expect("write release bin");
+
+        // Running `target/release/helios` for a release build must not overwrite itself.
+        assert!(!should_build_workspace_inspector(
+            &repo,
+            HostBuildProfile::Release,
+            None,
+            None,
+            Some(&release_bin),
+        ));
+
+        // Symlinked invocation pointing at `target/release/helios` also resolves to itself.
+        let alias = tempdir.path().join("helios-link");
+        symlink(&release_bin, &alias).expect("symlink release bin");
+        assert!(!should_build_workspace_inspector(
+            &repo,
+            HostBuildProfile::Release,
+            None,
+            None,
+            Some(&alias),
+        ));
+
+        // Running `target/debug/helios` while building a release VM still builds release inspector.
+        assert!(should_build_workspace_inspector(
+            &repo,
+            HostBuildProfile::Release,
+            None,
+            None,
+            Some(&debug_bin),
+        ));
+
+        // Explicit `HELIOS_INSPECTOR_BIN` still skips the build regardless of current_exe.
+        assert!(!should_build_workspace_inspector(
+            &repo,
+            HostBuildProfile::Release,
+            Some(OsStr::new("/staged/helios")),
+            None,
+            Some(&debug_bin),
+        ));
+
+        // `CARGO_TARGET_DIR` override is respected when checking for self-overwrite.
+        let custom_target = tempdir.path().join("custom-target");
+        let custom_release = custom_target
+            .join("release")
+            .join(format!("helios{}", std::env::consts::EXE_SUFFIX));
+        fs::create_dir_all(custom_release.parent().expect("custom release dir"))
+            .expect("create custom release dir");
+        fs::write(&custom_release, b"custom-release").expect("write custom release");
+        assert!(!should_build_workspace_inspector(
+            &repo,
+            HostBuildProfile::Release,
+            None,
+            Some(custom_target.as_os_str()),
+            Some(&custom_release),
+        ));
+
+        // When the target binary does not exist yet, it must still be built.
+        fs::remove_file(&release_bin).expect("remove release bin");
+        assert!(should_build_workspace_inspector(
+            &repo,
+            HostBuildProfile::Release,
+            None,
+            None,
+            Some(&debug_bin),
+        ));
     }
 }
