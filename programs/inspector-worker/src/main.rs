@@ -42,16 +42,23 @@ async fn main() -> Result<(), String> {
     }
 
     let (read, write) = split(transport);
-    let dispatcher = WorkerDispatcher::new(spawner, cc_peer);
+    let (resume_exit_tx, resume_exit_rx) = async_channel::bounded::<()>(1);
+    let dispatcher = WorkerDispatcher::new(spawner, cc_peer, resume_exit_tx);
     let endpoint = Endpoint::new(read, write, dispatcher);
 
     let drive_fut = Box::pin(endpoint.drive());
     let pump_fut = Box::pin(drive_background_pumps(task_rx));
+    let resume_fut = Box::pin(async move {
+        let _ = resume_exit_rx.recv().await;
+    });
 
-    match select(drive_fut, pump_fut).await {
-        Either::Left((Ok(()), _)) => Ok(()),
-        Either::Left((Err(err), _)) => Err(format!("inspector-worker RPC endpoint failed: {err}")),
-        Either::Right(((), _)) => Ok(()),
+    match select(resume_fut, select(drive_fut, pump_fut)).await {
+        Either::Left(((), _)) => Ok(()),
+        Either::Right((Either::Left((Ok(()), _)), _)) => Ok(()),
+        Either::Right((Either::Left((Err(err), _)), _)) => {
+            Err(format!("inspector-worker RPC endpoint failed: {err}"))
+        }
+        Either::Right((Either::Right(((), _)), _)) => Ok(()),
     }
 }
 

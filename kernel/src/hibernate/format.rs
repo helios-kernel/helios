@@ -12,7 +12,10 @@
 //! [ chunk_table_offset .. total_image_bytes )   ChunkDescriptor[chunk_count] (64B each)
 //! ```
 
-use helios_hal::boot::BootMemoryRegion;
+use alloc::vec::Vec;
+use core::ops::Range;
+
+use helios_hal::boot::{BootMemoryKind, BootMemoryRegion};
 use helios_hal::cpu::{BSP_SNAPSHOT_CONTEXT_BYTES, BspSnapshotContext, SnapshotArch};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::{DeviceInventory, DmaModel};
@@ -61,15 +64,58 @@ pub struct DeviceFeatureRecord {
     pub features: u64,
 }
 
-/// Canonical SHA-256 of the firmware memory map entries.
+/// Extracts all physical DRAM banks from `entries` and coalesces adjacent or
+/// overlapping regions into canonical sorted spans.
+///
+/// Firmware (OVMF/AAVMF/Limine) splits the same physical DRAM banks differently
+/// across boots (shifting `BootloaderReclaimable`, `KernelAndModules`,
+/// `AcpiReclaimable`, `AcpiNvs`, and adjacent UEFI Runtime Services `Reserved`
+/// entries after NVRAM updates), while the underlying DRAM banks themselves
+/// remain invariant on identical hardware and memory size. Standalone
+/// `Reserved` spans outside DRAM (such as flash or MMIO) and `Unusable`
+/// (`BAD_MEMORY`, `FRAMEBUFFER`) entries are excluded.
+pub fn canonical_dram_regions(entries: &[BootMemoryRegion]) -> Vec<Range<u64>> {
+    let mut ranges: Vec<(Range<u64>, bool)> = entries
+        .iter()
+        .filter(|entry| entry.kind != BootMemoryKind::Unusable && entry.end > entry.start)
+        .map(|entry| (entry.start..entry.end, entry.kind.is_dram()))
+        .collect();
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    ranges.sort_unstable_by_key(|(r, _)| r.start);
+    let mut merged: Vec<(Range<u64>, bool)> = Vec::with_capacity(ranges.len());
+    for (range, is_dram) in ranges {
+        if let Some((last, last_has_dram)) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            *last_has_dram |= is_dram;
+            continue;
+        }
+        merged.push((range, is_dram));
+    }
+    merged
+        .into_iter()
+        .filter_map(|(range, has_dram)| has_dram.then_some(range))
+        .collect()
+}
+
+/// Number of coalesced physical DRAM banks in `entries`, stored in
+/// [`HibernateIdentity::firmware_memory_map_count`].
+pub fn canonical_firmware_memory_map_count(entries: &[BootMemoryRegion]) -> u32 {
+    canonical_dram_regions(entries).len() as u32
+}
+
+/// Canonical SHA-256 of the coalesced physical DRAM banks in `entries`.
 pub fn hash_firmware_memory_map(entries: &[BootMemoryRegion]) -> [u8; 32] {
+    let dram = canonical_dram_regions(entries);
     let mut hasher = Sha256::new();
-    hasher.update(b"helios.hibernate.fwmap.v1\0");
-    hasher.update((entries.len() as u64).to_le_bytes());
-    for entry in entries {
-        hasher.update(entry.start.to_le_bytes());
-        hasher.update(entry.end.to_le_bytes());
-        hasher.update(entry.kind.tag().to_le_bytes());
+    hasher.update(b"helios.hibernate.fwmap.v2\0");
+    hasher.update((dram.len() as u64).to_le_bytes());
+    for range in &dram {
+        hasher.update(range.start.to_le_bytes());
+        hasher.update(range.end.to_le_bytes());
     }
     hasher.finalize().into()
 }

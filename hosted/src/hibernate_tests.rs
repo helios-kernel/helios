@@ -39,7 +39,7 @@ use crate::cpu::HostedCpu;
 use crate::runtime::HostedMachine;
 
 const PROCESSORS: usize = 4;
-const TEST_HEAP_BYTES: usize = 32 * 1024 * 1024;
+const TEST_HEAP_BYTES: usize = 64 * 1024 * 1024;
 const RESERVATION_BYTES: usize = 4 * 1024 * 1024;
 const PATIENCE: Duration = Duration::from_secs(20);
 const ARRIVAL_DEADLINE: Duration = Duration::from_secs(10);
@@ -1177,8 +1177,11 @@ fn hibernate_end_to_end_boot_probe_restore_and_post_resume_continuation() {
         &identity,
         machine_max_frames,
         &usable_frames,
+        &usable_frames,
+        None,
         core::slice::from_ref(&boot_protected_range),
         4,
+        |_, _| {},
         |dst_phys, frame_bytes| {
             staged_ram.insert(dst_phys, *frame_bytes);
         },
@@ -1292,8 +1295,11 @@ fn hibernate_end_to_end_boot_probe_restore_and_post_resume_continuation() {
                 &identity,
                 machine_max_frames,
                 &usable_frames,
+                &usable_frames,
+                None,
                 core::slice::from_ref(&boot_protected_range),
                 4,
+                |_, _| {},
                 |_, _| {},
                 || {},
             );
@@ -1460,8 +1466,11 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
         &identity,
         machine_max_frames,
         &usable,
+        &usable,
+        None,
         &[],
         2,
+        |_, _| {},
         |_, _| {},
         || {},
     );
@@ -1477,8 +1486,11 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
             &identity,
             machine_max_frames,
             &usable,
+            &usable,
+            None,
             &[],
             2,
+            |_, _| {},
             |_, _| {},
             || {},
         ),
@@ -1500,8 +1512,11 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
         &identity,
         machine_max_frames,
         &usable,
+        &usable,
+        None,
         &[],
         2,
+        |_, _| {},
         |_, _| {},
         || {},
     );
@@ -1517,8 +1532,11 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
             &identity,
             machine_max_frames,
             &usable,
+            &usable,
+            None,
             &[],
             2,
+            |_, _| {},
             |_, _| {},
             || {},
         ),
@@ -1542,8 +1560,11 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
         &different_kernel_identity,
         machine_max_frames,
         &usable,
+        &usable,
+        None,
         &[],
         2,
+        |_, _| {},
         |_, _| {},
         || {},
     );
@@ -1559,8 +1580,11 @@ fn hibernate_resume_probe_refuses_tampered_or_mismatched_images_and_invalidates_
             &different_kernel_identity,
             machine_max_frames,
             &usable,
+            &usable,
+            None,
             &[],
             2,
+            |_, _| {},
             |_, _| {},
             || {},
         ),

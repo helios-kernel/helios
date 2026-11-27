@@ -13,6 +13,15 @@ use helios_wit_rpc::inspector::helios::system::inspect;
 use crate::runtime;
 use crate::serial::{RpcClient, RpcReader, SerialIo};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootExpectation {
+    /// Normal cold boot: wait for `[KDBG run:begin]`.
+    ColdBoot,
+    /// Hibernate resume: require `"resumed from hibernate image"` and
+    /// `[KDBG resume:ok]`, failing immediately if `[KDBG run:begin]` appears.
+    Resume,
+}
+
 /// Why the inspector never saw the guest reach `wasi:cli/run`.
 ///
 /// The variants separate the three things that can go wrong on the way
@@ -40,6 +49,10 @@ pub(crate) enum BootError {
     },
     #[error("debug serial link closed before the inspector entered wasi:cli/run")]
     LinkClosedBeforeRun,
+    #[error("guest cold-booted ([KDBG run:begin]) instead of resuming from the hibernate image")]
+    ColdBootedInsteadOfResuming,
+    #[error("guest emitted [KDBG resume:ok] without logging \"resumed from hibernate image\"")]
+    MissingResumeLog,
     #[error("kernel panicked before the inspector entered wasi:cli/run: {report}{trailer}")]
     GuestPanicked { report: String, trailer: String },
     #[error("debug serial preamble contained non-utf8 bytes: {source}")]
@@ -67,6 +80,8 @@ const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const PANIC_TRAILER_QUIET_PERIOD: Duration = Duration::from_secs(2);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
+const DEBUGGER_RESUME_STAGE: &str = "resume:ok";
+const RESUMED_LOG_SUBSTRING: &str = "resumed from hibernate image";
 /// Bytes one serial line may gather before it is rendered anyway.
 ///
 /// A guest that stops emitting newlines — a corrupted stream, a binary
@@ -97,12 +112,13 @@ fn boot_sync_timeout() -> Duration {
         .unwrap_or(BOOT_SYNC_TIMEOUT)
 }
 
-pub(crate) async fn connect_after_boot(
+pub(crate) async fn connect_after_boot_with_expectation(
     io: SerialIo,
     identity: Option<&ClientIdentity>,
+    expectation: BootExpectation,
 ) -> Result<RpcClient, BootError> {
     let (read, mut write) = io.into_split();
-    let mut read = wait_for_boot(read).await?;
+    let mut read = wait_for_boot_with_expectation(read, expectation).await?;
     let mut server_public_key = None;
     if let Some(identity) = identity {
         let (hello, _, _) = client_handshake(
@@ -137,12 +153,20 @@ pub(crate) async fn connect_after_boot(
 /// happened to be read with it. Nothing is drained: a reader that waited
 /// for the line to go quiet would throw away every line a guest printing
 /// steadily through the handover produced (#343).
+#[cfg(test)]
 pub(crate) async fn wait_for_boot(read: RpcReader) -> Result<RpcReader, BootError> {
+    wait_for_boot_with_expectation(read, BootExpectation::ColdBoot).await
+}
+
+pub(crate) async fn wait_for_boot_with_expectation(
+    read: RpcReader,
+    expectation: BootExpectation,
+) -> Result<RpcReader, BootError> {
     let echo = ConsoleEcho::new();
     let mut lines = SerialLines::new(read);
     runtime::timeout(
         boot_sync_timeout(),
-        wait_for_debugger_stage(&mut lines, &echo),
+        wait_for_debugger_stage(&mut lines, &echo, expectation),
     )
     .await
     .ok_or(BootError::MarkersTimedOut)??;
@@ -298,7 +322,9 @@ impl<R: AsyncRead + Unpin> SerialLines<R> {
 async fn wait_for_debugger_stage(
     lines: &mut SerialLines<RpcReader>,
     echo: &ConsoleEcho,
+    expectation: BootExpectation,
 ) -> Result<(), BootError> {
+    let mut saw_resumed_log = false;
     loop {
         let framed = lines
             .advance()
@@ -309,12 +335,29 @@ async fn wait_for_debugger_stage(
         }
 
         if let Some(stage) = parse_stage_marker(lines.line())? {
-            let run_begin = stage == DEBUGGER_RUN_STAGE;
             echo.stage(stage);
-            if run_begin {
-                return Ok(());
+            match expectation {
+                BootExpectation::ColdBoot => {
+                    if stage == DEBUGGER_RUN_STAGE {
+                        return Ok(());
+                    }
+                }
+                BootExpectation::Resume => {
+                    if stage == DEBUGGER_RUN_STAGE {
+                        return Err(BootError::ColdBootedInsteadOfResuming);
+                    }
+                    if stage == DEBUGGER_RESUME_STAGE {
+                        if !saw_resumed_log {
+                            return Err(BootError::MissingResumeLog);
+                        }
+                        return Ok(());
+                    }
+                }
             }
         } else if let Some(text) = printable_guest_line(lines.line()) {
+            if text.contains(RESUMED_LOG_SUBSTRING) {
+                saw_resumed_log = true;
+            }
             echo.guest_line(&text);
             if text.contains("panicked at") {
                 let trailer = collect_panic_trailer(lines).await;
@@ -426,6 +469,7 @@ fn stage_detail(stage: &str) -> &str {
         "instantiate:begin" => "instantiating component",
         "instantiate:ok" => "entering wasi:cli/run",
         "run:begin" => "embedded debugger is accepting RPC",
+        "resume:ok" => "resumed from hibernate image and accepting RPC",
         "run:ok" => "embedded debugger exited",
         "done" => "embedded debugger shut down",
         other => other,
@@ -714,6 +758,48 @@ mod tests {
         });
     }
 
+    #[test]
+    fn resume_expectation_succeeds_after_resume_log_and_marker() {
+        let log = b"INFO helios_kernel::hibernate::storage: resumed from hibernate image generation=2\n[KDBG resume:ok]\n";
+        let reader: RpcReader = Box::new(ChunkedTransport::new(log, &[7, 13], 0));
+        runtime::block_on(wait_for_boot_with_expectation(
+            reader,
+            BootExpectation::Resume,
+        ))
+        .expect("resume log followed by [KDBG resume:ok] should satisfy Resume expectation");
+    }
+
+    #[test]
+    fn resume_expectation_fails_immediately_on_cold_boot_marker() {
+        let reader: RpcReader = Box::new(ChunkedTransport::new(BOOT_LOG.as_bytes(), &[11], 0));
+        let err = runtime::block_on(wait_for_boot_with_expectation(
+            reader,
+            BootExpectation::Resume,
+        ))
+        .err()
+        .expect("cold boot must fail Resume expectation");
+        assert!(
+            matches!(err, BootError::ColdBootedInsteadOfResuming),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_expectation_requires_resumed_log_line() {
+        let log = b"[KDBG resume:ok]\n";
+        let reader: RpcReader = Box::new(ChunkedTransport::new(log, &[8], 0));
+        let err = runtime::block_on(wait_for_boot_with_expectation(
+            reader,
+            BootExpectation::Resume,
+        ))
+        .err()
+        .expect("missing resume log line must fail Resume expectation");
+        assert!(
+            matches!(err, BootError::MissingResumeLog),
+            "unexpected error: {err}"
+        );
+    }
+
     struct ReadyInspectDispatcher;
 
     impl helios_wit_rpc::Dispatcher for ReadyInspectDispatcher {
@@ -802,8 +888,12 @@ mod tests {
             Box::new(Async::new(host_sock.try_clone().expect("clone host read")).expect("read")),
             Box::new(Async::new(host_sock).expect("write")),
         );
-        let client = runtime::block_on(connect_after_boot(io, Some(&identity)))
-            .expect("connect_after_boot must succeed");
+        let client = runtime::block_on(connect_after_boot_with_expectation(
+            io,
+            Some(&identity),
+            BootExpectation::ColdBoot,
+        ))
+        .expect("connect_after_boot must succeed");
         assert_eq!(client.server_public_key(), Some(expected_machine_pk));
         drop(client);
         server.join().expect("server thread");

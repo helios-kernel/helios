@@ -353,6 +353,11 @@ pub fn normalize_physical_runs(included: &[Range<u64>], excluded: &[Range<u64>])
     out
 }
 
+/// Pre-freeze scratch arena size (8 MiB) reserved from `user_pool` and excluded
+/// from the snapshot so [`encode_snapshot`] and `zrip` allocate strictly
+/// outside the main kernel heap while live RAM is being read.
+pub const HIBERNATE_ENCODE_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+
 /// Parameters controlling snapshot compression and chunking.
 #[derive(Clone, Copy, Debug)]
 pub struct SnapshotConfig {
@@ -694,61 +699,83 @@ where
         .ok_or(HibernateError::MissingBootMemoryMetadata)?;
 
     // Reserve free user frames BEFORE freezing so snapshot encoding never
-    // needs to grow memory while the machine is stopped.
+    // needs to grow memory while the machine is stopped, plus an isolated
+    // scratch arena so `encode_snapshot` never mutates the main kernel heap.
     let reservation = user_pool
         .reserve_hibernate_frames(reservation_bytes)
         .map_err(|oom| HibernateError::ReservationUnavailable {
             requested_bytes: oom.requested_bytes,
             available_bytes: oom.available_bytes,
         })?;
-    let reservation_ranges = reservation.frame_ranges();
+    let scratch_reservation = user_pool
+        .reserve_hibernate_frames(HIBERNATE_ENCODE_SCRATCH_BYTES)
+        .map_err(|oom| HibernateError::ReservationUnavailable {
+            requested_bytes: oom.requested_bytes,
+            available_bytes: oom.available_bytes,
+        })?;
+    let mut excluded_ranges = reservation.frame_ranges();
+    excluded_ranges.extend(scratch_reservation.frame_ranges());
     let mut writer = ReservationWriter::new(reservation);
 
     // Freeze all other processors at a scheduler boundary.
     let frozen = kernel.freeze(arrival_deadline, interrupt_guests).await?;
 
+    // Drain frame slabs and enumerate live physical runs BEFORE the BSP
+    // snapshot point so neither `user_pool` nor the main kernel heap changes
+    // after `capture_bsp_state`.
+    let frame_runs =
+        collect_snapshot_physical_runs(user_pool, boot_memory, balloon, &excluded_ranges);
+    let max_phys = boot_memory.max_physical_address();
+    let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
+    let direct_offset = boot_memory.physical_memory_offset;
+
     // Double-return snapshot point on the BSP.
     let mut bsp_context = BspSnapshotContext::empty();
     match cpu.capture_bsp_state(&mut bsp_context)? {
         SnapshotPoint::Resumed(handoff) => {
-            // Returning here drops `frozen` (thawing all processors) and
-            // `writer` (returning reserved frames to the user pool).
+            crate::exit_hibernate_scratch_allocator();
+            // Returning here drops `frozen` (thawing all processors),
+            // `writer`, and `scratch_reservation` (returning all reserved
+            // frames to the user pool).
             return Ok(SnapshotOutcome::Resumed(handoff));
         }
         SnapshotPoint::Captured => {}
     }
 
-    let frame_runs =
-        collect_snapshot_physical_runs(user_pool, boot_memory, balloon, &reservation_ranges);
-    let max_phys = boot_memory.max_physical_address();
-    let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
-    let direct_offset = boot_memory.physical_memory_offset;
-
-    let header = encode_snapshot(
-        EncodeParams {
-            auth_key: Some(auth_key),
-            identity,
-            machine_max_frames,
-            bsp_context,
-            config,
-        },
-        &frame_runs,
-        &mut writer,
-        |phys_frame, dst| {
-            let direct_addr = (phys_frame as usize) * PhysFrame::SIZE + direct_offset;
-            // SAFETY: `phys_frame` came from `collect_snapshot_physical_runs`
-            // while the machine is frozen (`FrozenMachine`), and every live
-            // RAM frame is mapped readable at `phys + physical_memory_offset`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    core::ptr::with_exposed_provenance::<u8>(direct_addr),
-                    dst.as_mut_ptr(),
-                    PhysFrame::SIZE,
-                );
-            }
-        },
-        || frozen.pet_watchdog(),
-    )?;
+    let header = {
+        // SAFETY: the machine is single-core frozen on the BSP,
+        // `scratch_reservation` owns exclusively reserved frames excluded from
+        // `frame_runs`, and every allocation made inside `encode_snapshot` is
+        // dropped before `_scratch` leaves scope.
+        let _scratch =
+            unsafe { crate::enter_hibernate_scratch_allocator(scratch_reservation.blocks()) };
+        encode_snapshot(
+            EncodeParams {
+                auth_key: Some(auth_key),
+                identity,
+                machine_max_frames,
+                bsp_context,
+                config,
+            },
+            &frame_runs,
+            &mut writer,
+            |phys_frame, dst| {
+                let direct_addr = (phys_frame as usize) * PhysFrame::SIZE + direct_offset;
+                // SAFETY: `phys_frame` came from `collect_snapshot_physical_runs`
+                // while the machine is frozen (`FrozenMachine`), and every live
+                // RAM frame is mapped readable at `phys + physical_memory_offset`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::with_exposed_provenance::<u8>(direct_addr),
+                        dst.as_mut_ptr(),
+                        PhysFrame::SIZE,
+                    );
+                }
+            },
+            || frozen.pet_watchdog(),
+        )
+    }?;
+    drop(scratch_reservation);
 
     Ok(SnapshotOutcome::Captured(Box::new(CapturedSnapshot {
         header,

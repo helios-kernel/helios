@@ -160,9 +160,14 @@ impl VmTpm {
         }
     }
 
+    /// The emulator backend (`swtpm`) backing this TPM.
+    pub(crate) const fn backend(&self) -> VmTpmBackend {
+        self.backend
+    }
+
     /// Where the emulator keeps the TPM's state for a VM whose runtime
     /// directory is `runtime_dir`.
-    fn state_dir(&self, runtime_dir: &Path) -> PathBuf {
+    pub(crate) fn state_dir(&self, runtime_dir: &Path) -> PathBuf {
         self.state_dir
             .clone()
             .unwrap_or_else(|| runtime_dir.join(RUNTIME_STATE_DIR))
@@ -267,13 +272,24 @@ impl Swtpm {
         &self.socket
     }
 
-    /// Ends the emulator. `--terminate` already ends it once QEMU closes
-    /// the control channel; this covers a QEMU that never connected, and
-    /// a spawn that failed after the emulator started.
+    /// Ends the emulator, giving `--terminate` a brief grace window to flush
+    /// its non-volatile TPM state after QEMU closes the control channel before
+    /// forcing termination.
     pub(crate) fn shutdown(&mut self) {
-        if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return;
+                }
+                Err(_) => return,
+            }
         }
     }
 }
@@ -317,11 +333,12 @@ mod tests {
 
     #[test]
     fn a_profile_without_a_front_end_refuses_the_tpm() {
-        let error = VmTpm::resolve(Some(VmTpmBackend::Swtpm), None, None, "riscv64").unwrap_err();
+        let error =
+            VmTpm::resolve(Some(VmTpmBackend::Swtpm), None, None, "no-tpm-arch").unwrap_err();
         assert!(
             error
                 .to_string()
-                .starts_with("--tpm is not available on riscv64"),
+                .starts_with("--tpm is not available on no-tpm-arch"),
             "{error}"
         );
     }

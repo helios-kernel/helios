@@ -3153,6 +3153,10 @@ mod tests {
         async fn snapshot_hold_has_generation_id(&self, _self_: &Self::SnapshotHold) -> bool {
             true
         }
+
+        async fn hibernate(&self) -> Result<(), rpc_snapshot::HibernateError> {
+            Err(rpc_snapshot::HibernateError::Unsupported)
+        }
     }
 
     struct TestProfiling {

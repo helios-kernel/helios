@@ -15,11 +15,13 @@
 //!   on store teardown via [`crate::StoreSocketRetirement`]) reopens the 9p
 //!   host-share gate.
 
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
 use wasmtime::component::{Accessor, HasSelf, Linker, Resource};
 
+use crate::hibernate::{HibernateError, HibernateRequestError};
 use crate::wasmtime_adapter::bindings::instances::bindings::helios::system::instances as instances_wit;
 use crate::wasmtime_adapter::bindings::snapshot::bindings::helios::system::snapshot as snapshot_wit;
 use crate::{ComponentHostNetwork, InstanceId, InstanceSnapshot, KillOutcome, KillReason};
@@ -191,6 +193,79 @@ where
         hold.disarm();
         crate::audit::diagnostic_gate_change(caller_id, "snapshot.prepare", "held", true);
         Ok(Ok(handle))
+    }
+
+    async fn hibernate(
+        accessor: &Accessor<U, Self>,
+    ) -> wasmtime::Result<Result<(), snapshot_wit::HibernateError>> {
+        let request = accessor.with(|mut access| {
+            let data = access.get();
+            let caller_id = data.instance().id();
+            if data
+                .process_authority()
+                .derive_machine_control_cap()
+                .is_err()
+            {
+                return Err(caller_id);
+            }
+            Ok((
+                caller_id,
+                data.runtime_state.clone(),
+                data.holds_serial_port(),
+            ))
+        });
+        let (caller_id, state, defer_resume_marker) = match request {
+            Ok(values) => values,
+            Err(caller_id) => {
+                crate::audit::diagnostic_gate_change(
+                    caller_id,
+                    "snapshot.hibernate",
+                    "denied",
+                    false,
+                );
+                return Ok(Err(snapshot_wit::HibernateError::Denied));
+            }
+        };
+        crate::audit::diagnostic_gate_change(caller_id, "snapshot.hibernate", "requested", true);
+        let outcome = state.request_hibernate(defer_resume_marker).await;
+        match outcome {
+            Ok(_) => {
+                crate::audit::diagnostic_gate_change(
+                    caller_id,
+                    "snapshot.hibernate",
+                    "resumed",
+                    true,
+                );
+                Ok(Ok(()))
+            }
+            Err(error) => {
+                let mapped = map_hibernate_request_error(error);
+                crate::audit::diagnostic_gate_change(
+                    caller_id,
+                    "snapshot.hibernate",
+                    "refused",
+                    false,
+                );
+                Ok(Err(mapped))
+            }
+        }
+    }
+}
+
+fn map_hibernate_request_error(error: HibernateRequestError) -> snapshot_wit::HibernateError {
+    match error {
+        HibernateRequestError::Unsupported => snapshot_wit::HibernateError::Unsupported,
+        HibernateRequestError::Busy => snapshot_wit::HibernateError::Busy,
+        HibernateRequestError::NoHibernateDisk => snapshot_wit::HibernateError::NoHibernateDisk,
+        HibernateRequestError::Hibernate(HibernateError::NoAuthenticationKey) => {
+            snapshot_wit::HibernateError::NoAuthenticationKey
+        }
+        HibernateRequestError::Hibernate(err @ HibernateError::DiskTooSmall { .. }) => {
+            snapshot_wit::HibernateError::DiskTooSmall(err.to_string())
+        }
+        HibernateRequestError::Hibernate(err) => {
+            snapshot_wit::HibernateError::Failed(err.to_string())
+        }
     }
 }
 

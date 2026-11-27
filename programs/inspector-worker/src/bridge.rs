@@ -179,7 +179,11 @@ pub struct WorkerDispatcher {
 }
 
 impl WorkerDispatcher {
-    pub fn new(spawner: TaskSpawner, component_control_peer: Option<PeerHandle>) -> Self {
+    pub fn new(
+        spawner: TaskSpawner,
+        component_control_peer: Option<PeerHandle>,
+        resume_exit: Sender<()>,
+    ) -> Self {
         Self {
             programs: rpc_programs::RpcServer::new(ProgramsBridge {
                 spawner: spawner.clone(),
@@ -192,7 +196,7 @@ impl WorkerDispatcher {
             }),
             profiling: rpc_profiling::RpcServer::new(ProfilingBridge),
             instances: rpc_instances::RpcServer::new(InstancesBridge),
-            snapshot: rpc_snapshot::RpcServer::new(SnapshotBridge),
+            snapshot: rpc_snapshot::RpcServer::new(SnapshotBridge { resume_exit }),
             processors: rpc_processors::RpcServer::new(ProcessorsBridge),
             net: rpc_net::RpcServer::new(NetBridge),
             serial: rpc_serial::RpcServer::new(SerialBridge),
@@ -1388,7 +1392,9 @@ impl rpc_instances::RpcHandler for InstancesBridge {
 // 8. helios:system/snapshot
 // ---------------------------------------------------------------------------
 
-struct SnapshotBridge;
+struct SnapshotBridge {
+    resume_exit: Sender<()>,
+}
 
 impl rpc_snapshot::RpcHandler for SnapshotBridge {
     type SnapshotHold = raw_sys::snapshot::SnapshotHold;
@@ -1402,6 +1408,40 @@ impl rpc_snapshot::RpcHandler for SnapshotBridge {
             raw_sys::snapshot::SnapshotError::Denied => rpc_snapshot::SnapshotError::Denied,
             raw_sys::snapshot::SnapshotError::Busy => rpc_snapshot::SnapshotError::Busy,
         })
+    }
+
+    async fn hibernate(&self) -> Result<(), rpc_snapshot::HibernateError> {
+        match raw_sys::snapshot::hibernate().await {
+            Ok(()) => {
+                // Resumed from a hibernate image on a subsequent boot: the
+                // pre-hibernate client is gone. Exit immediately without
+                // writing a stale RPC reply onto the transport so
+                // `inspector-host` reclaims `DebugPort` cleanly on serial and
+                // enters `server_handshake` for the resuming client.
+                let _ = self.resume_exit.try_send(());
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+            Err(err) => Err(match err {
+                raw_sys::snapshot::HibernateError::Denied => rpc_snapshot::HibernateError::Denied,
+                raw_sys::snapshot::HibernateError::Busy => rpc_snapshot::HibernateError::Busy,
+                raw_sys::snapshot::HibernateError::Unsupported => {
+                    rpc_snapshot::HibernateError::Unsupported
+                }
+                raw_sys::snapshot::HibernateError::NoHibernateDisk => {
+                    rpc_snapshot::HibernateError::NoHibernateDisk
+                }
+                raw_sys::snapshot::HibernateError::NoAuthenticationKey => {
+                    rpc_snapshot::HibernateError::NoAuthenticationKey
+                }
+                raw_sys::snapshot::HibernateError::DiskTooSmall(msg) => {
+                    rpc_snapshot::HibernateError::DiskTooSmall(msg)
+                }
+                raw_sys::snapshot::HibernateError::Failed(msg) => {
+                    rpc_snapshot::HibernateError::Failed(msg)
+                }
+            }),
+        }
     }
 }
 

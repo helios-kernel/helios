@@ -29,6 +29,7 @@ use helios_hal::cpu::{
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::numa::NumaTopology;
+use helios_hal::pmm::PhysFrame;
 use helios_hal::serial::ByteSerial;
 use helios_hal::tagging::MemoryTagging;
 use helios_hal::{
@@ -44,7 +45,10 @@ use limine::firmware::{
     FIRMWARE_TYPE_EFI32, FIRMWARE_TYPE_EFI64, FIRMWARE_TYPE_SBI, FIRMWARE_TYPE_X86BIOS,
 };
 use limine::framebuffer::FRAMEBUFFER_RGB;
-use limine::memmap::{Entry, MEMMAP_BOOTLOADER_RECLAIMABLE, MEMMAP_USABLE};
+use limine::memmap::{
+    Entry, MEMMAP_ACPI_NVS, MEMMAP_ACPI_RECLAIMABLE, MEMMAP_BOOTLOADER_RECLAIMABLE,
+    MEMMAP_EXECUTABLE_AND_MODULES, MEMMAP_RESERVED, MEMMAP_USABLE,
+};
 use limine::mp::MpInfo;
 use limine::request::{
     DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
@@ -1293,6 +1297,16 @@ extern "C" fn aarch64_kernel_main() -> ! {
         physical_memory_offset,
         &[],
     );
+    let hibernate_receiver = debug_state.install_hibernate_service();
+    kernel.spawn_local_detached(hibernate::serve_hibernate_requests(
+        cpu,
+        kernel.hibernate_handle(),
+        debug_state.clone(),
+        pool,
+        hibernate_devices,
+        hibernate_receiver,
+        DEBUG_SERIAL_WRITER,
+    ));
     helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
 
     // Everything the kernel drives itself has claimed its interrupt by
@@ -3240,8 +3254,16 @@ fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {
             BootMemoryKind::Usable
         } else if entry.type_ == MEMMAP_BOOTLOADER_RECLAIMABLE {
             BootMemoryKind::BootloaderReclaimable
-        } else {
+        } else if entry.type_ == MEMMAP_EXECUTABLE_AND_MODULES {
+            BootMemoryKind::KernelAndModules
+        } else if entry.type_ == MEMMAP_ACPI_RECLAIMABLE {
+            BootMemoryKind::AcpiReclaimable
+        } else if entry.type_ == MEMMAP_ACPI_NVS {
+            BootMemoryKind::AcpiNvs
+        } else if entry.type_ == MEMMAP_RESERVED {
             BootMemoryKind::Reserved
+        } else {
+            BootMemoryKind::Unusable
         },
     }
 }
@@ -3265,28 +3287,49 @@ fn collect_boot_memory_metadata(
     physical_memory_offset: usize,
     payload_sha256: &[u8; 32],
 ) -> BootMemoryMetadata {
+    let text = kernel_section_range(
+        &raw const __helios_text_start,
+        &raw const __helios_text_end,
+        handoff,
+    );
+    let rodata = kernel_section_range(
+        &raw const __helios_rodata_start,
+        &raw const __helios_rodata_end,
+        handoff,
+    );
+    let data = kernel_section_range(
+        &raw const __helios_data_start,
+        &raw const __helios_data_end,
+        handoff,
+    );
+    let bss = kernel_section_range(
+        &raw const __helios_bss_start,
+        &raw const __helios_bss_end,
+        handoff,
+    );
+    let image_end_virt = [
+        text.virtual_end(),
+        rodata.virtual_end(),
+        data.virtual_end(),
+        bss.virtual_end(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(handoff.kernel.virtual_base);
+    let image_len = image_end_virt
+        .saturating_sub(handoff.kernel.virtual_base)
+        .next_multiple_of(PhysFrame::SIZE as u64);
     let mut metadata = BootMemoryMetadata {
         kernel_sections: KernelImageSections {
-            text: kernel_section_range(
-                &raw const __helios_text_start,
-                &raw const __helios_text_end,
-                handoff,
-            ),
-            rodata: kernel_section_range(
-                &raw const __helios_rodata_start,
-                &raw const __helios_rodata_end,
-                handoff,
-            ),
-            data: kernel_section_range(
-                &raw const __helios_data_start,
-                &raw const __helios_data_end,
-                handoff,
-            ),
-            bss: kernel_section_range(
-                &raw const __helios_bss_start,
-                &raw const __helios_bss_end,
-                handoff,
-            ),
+            image: Some(KernelSectionRange::new(
+                handoff.kernel.physical_base,
+                handoff.kernel.virtual_base,
+                image_len,
+            )),
+            text,
+            rodata,
+            data,
+            bss,
             uninit: None,
             stack: None,
         },

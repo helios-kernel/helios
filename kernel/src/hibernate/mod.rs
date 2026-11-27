@@ -35,34 +35,137 @@ pub use format::{
     CHUNK_DESCRIPTOR_BYTES, ChunkDescriptor, DEFAULT_CHUNK_FRAMES,
     DEFAULT_HIBERNATE_COMPRESSION_LEVEL, DeviceFeatureRecord, FORMAT_VERSION, HEADER_BYTES,
     HEADER_MAC_BYTES, HEADER_MAC_OFFSET, HEADER_MAGIC, HibernateHeader, HibernateIdentity,
-    MAX_CHUNKS, hash_device_inventory, hash_firmware_memory_map, hash_negotiated_features,
+    MAX_CHUNKS, canonical_dram_regions, canonical_firmware_memory_map_count, hash_device_inventory,
+    hash_firmware_memory_map, hash_negotiated_features,
 };
 pub use helios_hal::cpu::{DisplacedFrameCopy, ResumeHandoff, ResumeHandoffWire};
 pub use resume::{
-    ChunkPlacement, FramePlacementPlan, LoadedHibernateImage, ResumeProbe, build_machine_identity,
-    build_machine_identity_with_hashes, collect_boot_protected_ranges, plan_frame_placement,
-    probe_and_load_hibernate_image, usable_physical_frame_runs,
+    ChunkPlacement, FramePlacementPlan, LoadedHibernateImage, RelocatedFramePlacement,
+    RelocatedRegion, ResumeProbe, build_machine_identity, build_machine_identity_with_hashes,
+    build_relocated_regions, collect_boot_protected_ranges, dram_physical_frame_runs,
+    plan_frame_placement, probe_and_load_hibernate_image, usable_physical_frame_runs,
 };
 pub use snapshot::{
-    AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, ReservationWriter,
-    SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
+    AtomicSnapshotParams, CapturedSnapshot, EncodeParams, FrameRun, HIBERNATE_ENCODE_SCRATCH_BYTES,
+    ReservationWriter, SnapshotConfig, SnapshotOutcome, SnapshotSink, capture_atomic_snapshot,
     collect_snapshot_physical_runs, encode_snapshot, normalize_physical_runs,
 };
 pub use storage::{
     HIBERNATE_HEADER_SECTORS, HIBERNATE_SECTOR_BYTES, HibernateDeviceController,
     HibernateDeviceError, HibernateOutcome, HibernateStorage, HibernateStorageError, ResumeTargets,
-    VirtioBlockHibernateStorage, hibernate_machine, hibernate_to_disk,
-    hibernate_to_disk_with_power_off, invalidate_hibernate_header, required_disk_bytes,
-    validate_sector_size, write_image_to_storage,
+    VirtioBlockHibernateStorage, hibernate_machine, hibernate_machine_with_handle,
+    hibernate_to_disk, hibernate_to_disk_with_power_off, invalidate_hibernate_header,
+    required_disk_bytes, validate_sector_size, write_image_to_storage,
 };
 pub use verify::{
     VerifiedHibernateImage, decode_image_into, verify_identity, verify_image_header_and_table,
 };
 
+use core::time::Duration;
+
+use futures::channel::oneshot;
 use helios_hal::cpu::SnapshotUnsupported;
+use helios_hal::pmm::PhysFrame;
 use thiserror::Error;
 
 use crate::FreezeError;
+
+/// Default maximum time [`crate::Kernel::freeze_for_hibernate`] waits for
+/// secondary processors to park at a scheduler boundary.
+pub const HIBERNATE_FREEZE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Minimum pre-freeze user-memory reservation in bytes (16 MiB).
+///
+/// Any hibernate disk smaller than this floor is rejected immediately with
+/// [`HibernateError::DiskTooSmall`] before reserving frames or freezing.
+pub const MIN_HIBERNATE_RESERVATION_BYTES: usize = 16 * 1024 * 1024;
+
+/// Safety margin added on top of currently allocated machine RAM when sizing
+/// the pre-freeze snapshot reservation (32 MiB) to cover kernel writable
+/// sections, reclaimable firmware ranges, and in-flight allocations.
+const HIBERNATE_RESERVATION_HEADROOM_BYTES: usize = 32 * 1024 * 1024;
+
+/// Computes the pre-freeze frame reservation size in bytes for a machine whose
+/// memory snapshot reports `(usable_bytes, free_bytes)` and whose hibernate
+/// disk has `disk_bytes` capacity.
+///
+/// Always frame-aligned (`PhysFrame::SIZE`). Never returns less than
+/// [`MIN_HIBERNATE_RESERVATION_BYTES`], so an undersized disk is still caught
+/// pre-freeze by [`HibernateError::DiskTooSmall`], and never asks the user pool
+/// for more than three quarters of currently free RAM.
+pub fn compute_hibernate_reservation_bytes(
+    usable_bytes: usize,
+    free_bytes: usize,
+    disk_bytes: u64,
+) -> usize {
+    let page_mask = !(PhysFrame::SIZE - 1);
+    let used_estimate = usable_bytes
+        .saturating_sub(free_bytes)
+        .saturating_add(HIBERNATE_RESERVATION_HEADROOM_BYTES);
+    let available_for_image = free_bytes.saturating_sub(HIBERNATE_ENCODE_SCRATCH_BYTES);
+    let max_from_free = ((available_for_image / 4).saturating_mul(3)) & page_mask;
+    let mut target = used_estimate.min(max_from_free);
+    if let Ok(disk_usize) = usize::try_from(disk_bytes) {
+        let disk_aligned = disk_usize & page_mask;
+        if disk_aligned >= MIN_HIBERNATE_RESERVATION_BYTES {
+            target = target.min(disk_aligned);
+        }
+    }
+    (target & page_mask).max(MIN_HIBERNATE_RESERVATION_BYTES)
+}
+
+/// Typed errors returned by [`crate::RuntimeState::request_hibernate`].
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum HibernateRequestError {
+    /// This platform does not register a BSP hibernate handler (for example,
+    /// the hosted backend).
+    #[error("hibernate is not supported on this platform")]
+    Unsupported,
+
+    /// Another hibernate request is already executing.
+    #[error("a hibernate operation is already in progress")]
+    Busy,
+
+    /// No virtio-blk device carrying the `helios-hibernate` serial was found.
+    #[error("no hibernate disk (serial `helios-hibernate`) is attached")]
+    NoHibernateDisk,
+
+    /// Snapshot capture, disk write, or device lifecycle failed.
+    #[error(transparent)]
+    Hibernate(#[from] HibernateError),
+}
+
+/// Static-dispatch request sent from a guest `helios:system/snapshot.hibernate`
+/// call to the BSP-pinned hibernate service task.
+pub struct HibernateRequest {
+    defer_resume_marker: bool,
+    reply: oneshot::Sender<Result<HibernateOutcome, HibernateRequestError>>,
+}
+
+impl HibernateRequest {
+    pub fn new(
+        defer_resume_marker: bool,
+        reply: oneshot::Sender<Result<HibernateOutcome, HibernateRequestError>>,
+    ) -> Self {
+        Self {
+            defer_resume_marker,
+            reply,
+        }
+    }
+
+    /// Whether the caller owns the debug serial port, so emitting
+    /// `[KDBG resume:ok]` must wait until `inspector-host` reclaims it after
+    /// the serial worker tears down on resume.
+    pub const fn defer_resume_marker(&self) -> bool {
+        self.defer_resume_marker
+    }
+
+    /// Delivers the hibernate outcome (either a refusal before power-off or
+    /// [`HibernateOutcome::Resumed`] after restoring on a subsequent boot).
+    pub fn respond(self, result: Result<HibernateOutcome, HibernateRequestError>) {
+        let _ = self.reply.send(result);
+    }
+}
 
 /// Typed errors returned by hibernate snapshot capture and image decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

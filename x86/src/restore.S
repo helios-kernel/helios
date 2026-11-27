@@ -21,6 +21,7 @@
 #   0x60: efer    0x68: fs_base 0x70: gs_base
 #   0x78: mxcsr (u32)           0x7c: fcw (u16)
 .section .text.helios_x86_restore, "ax"
+.balign 4096
 
 .global helios_x86_restore_trampoline
 helios_x86_restore_trampoline:
@@ -28,13 +29,14 @@ helios_x86_restore_trampoline:
     mov rbx, rdi
     # Switch to private stack on the safe trampoline page.
     mov rsp, qword ptr [rbx + 0x20]
-    # Activate the safe trampoline page table so displaced copies overwriting
-    # bootloader-reclaimable memory cannot touch active page tables.
+    # Activate the safe trampoline page table. `V_enter` maps to
+    # `trampoline_enter_copy_phys` (an exact byte-for-byte copy of this page),
+    # so the copy loop can overwrite Boot 2's `.text` without faulting.
     mov rax, qword ptr [rbx + 0x00]
     mov cr3, rax
 
     # Linear copy of all displaced 4 KiB pages (every src_phys is disjoint from
-    # every dst_phys, the trampoline page, the copy table, and trampoline_cr3).
+    # every dst_phys, the trampoline pages, the copy table, and trampoline_cr3).
     mov r8,  qword ptr [rbx + 0x08]
     mov r9,  qword ptr [rbx + 0x10]
     mov r10, qword ptr [rbx + 0x18]
@@ -52,7 +54,15 @@ helios_x86_restore_trampoline:
     dec r9
     jmp .Lhelios_x86_restore_copy_loop
 .Lhelios_x86_restore_copy_done:
+    # Transition to `V_finish`, which is mapped to Boot 1's `image_finish_phys`
+    # in BOTH `trampoline_cr3` and Boot 1's saved `ctx.cr3`.
+    jmp helios_x86_restore_finish
+.global helios_x86_restore_trampoline_enter_end
+helios_x86_restore_trampoline_enter_end:
 
+.balign 4096
+.global helios_x86_restore_finish
+helios_x86_restore_finish:
     # Load pointer to saved X86_64SnapshotContext on the safe trampoline page.
     mov r11, qword ptr [rbx + 0x30]
 
@@ -67,8 +77,8 @@ helios_x86_restore_trampoline:
     wrmsr
 
     # Restore saved CR0, CR4, and switch to the image kernel's CR3.
-    # This instruction stream sits in immutable `.text`, mapped at the same
-    # virtual address in both `trampoline_cr3` and `ctx.cr3`.
+    # `V_finish` maps to Boot 1's `image_finish_phys` in both `trampoline_cr3`
+    # and `ctx.cr3`.
     mov rax, qword ptr [r11 + 0x50]
     mov cr0, rax
     mov rax, qword ptr [r11 + 0x58]
@@ -100,5 +110,5 @@ helios_x86_restore_trampoline:
     mov r15, qword ptr [r11 + 0x28]
     mov eax, 1
     jmp qword ptr [r11 + 0x38]
-.global helios_x86_restore_trampoline_end
-helios_x86_restore_trampoline_end:
+.global helios_x86_restore_finish_end
+helios_x86_restore_finish_end:

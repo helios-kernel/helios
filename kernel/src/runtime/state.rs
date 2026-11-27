@@ -26,8 +26,11 @@ use spin::{Mutex, Once};
 use crate::memory::BalloonHandle;
 
 use crate::ComponentHostVsockService;
-use crate::component::{ComponentRuntimeState, PerProcessorProvider, ProviderSlot};
+use crate::component::{
+    ComponentRuntimeState, PerProcessorProvider, ProviderReceiver, ProviderSlot, provider_channel,
+};
 use crate::device::DeviceGrantRegistry;
+use crate::hibernate::{HibernateOutcome, HibernateRequest, HibernateRequestError};
 use crate::network::HttpExchange;
 use crate::{AttachedStorage, BlockCache, BlockService, HostFileSystem, Storage};
 
@@ -91,6 +94,18 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// Monotonic token generator for `snapshot_hold_token` (starts at `1`;
     /// skips `0` on wrap).
     next_snapshot_hold_token: AtomicU64,
+    /// Single-slot static-dispatch hand-off to the BSP-local hibernate service
+    /// task installed by bare-metal backends. Empty on backends without
+    /// hibernation (such as `hosted`), where `request_hibernate` returns
+    /// [`HibernateRequestError::Unsupported`].
+    hibernate_service: ProviderSlot<HibernateRequest>,
+    /// True while a hibernate request is executing on the BSP, so concurrent
+    /// callers fail immediately with [`HibernateRequestError::Busy`].
+    hibernate_in_progress: AtomicBool,
+    /// Armed on resume when the caller owned the debug serial port, so the
+    /// `[KDBG resume:ok]` marker is emitted atomically when `inspector-host`
+    /// reclaims `DebugPort` right before starting the next serial handshake.
+    deferred_resume_marker: AtomicBool,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock last set them: at bring-up, and again
     /// after each machine restore. Unseeded on a machine that carries no
@@ -421,6 +436,9 @@ where
                 settled_cwasm_signing_key: Mutex::new(None),
                 snapshot_hold_token: AtomicU64::new(0),
                 next_snapshot_hold_token: AtomicU64::new(1),
+                hibernate_service: ProviderSlot::new(),
+                hibernate_in_progress: AtomicBool::new(false),
+                deferred_resume_marker: AtomicBool::new(false),
                 wall_clock: crate::exec::WallClock::new(),
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
@@ -1238,6 +1256,72 @@ where
         Ok(hold)
     }
 
+    /// Installs the BSP-local hibernate service receiver once during backend
+    /// bring-up.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same runtime state.
+    pub fn install_hibernate_service(&self) -> ProviderReceiver<HibernateRequest> {
+        let (sender, receiver) = provider_channel(1);
+        self.inner
+            .hibernate_service
+            .install(sender)
+            .expect("hibernate service was installed more than once");
+        receiver
+    }
+
+    /// Sends a hibernate request to the BSP-pinned hibernate service task and
+    /// awaits its outcome (`Ok(HibernateOutcome::Resumed)` after a resume on a
+    /// subsequent boot, or a typed refusal error before power-off).
+    pub async fn request_hibernate(
+        &self,
+        defer_resume_marker: bool,
+    ) -> Result<HibernateOutcome, HibernateRequestError> {
+        if !self.inner.hibernate_service.is_installed() {
+            return Err(HibernateRequestError::Unsupported);
+        }
+        if self
+            .inner
+            .hibernate_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(HibernateRequestError::Busy);
+        }
+        struct InProgressGuard<'a>(&'a AtomicBool);
+        impl Drop for InProgressGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = InProgressGuard(&self.inner.hibernate_in_progress);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let request = HibernateRequest::new(defer_resume_marker, tx);
+        self.inner
+            .hibernate_service
+            .send(request)
+            .await
+            .map_err(|_| HibernateRequestError::Unsupported)?;
+        rx.await.unwrap_or(Err(HibernateRequestError::Unsupported))
+    }
+
+    /// Arms a deferred `[KDBG resume:ok]` marker so the next `serial.debug-port`
+    /// claim by `inspector-host` emits it right before entering `server_handshake`.
+    pub fn arm_deferred_resume_marker(&self) {
+        self.inner
+            .deferred_resume_marker
+            .store(true, Ordering::Release);
+    }
+
+    /// Consumes an armed deferred `[KDBG resume:ok]` marker, returning `true`
+    /// once so only the first post-resume `serial.debug-port` claim emits it.
+    pub fn take_deferred_resume_marker(&self) -> bool {
+        self.inner
+            .deferred_resume_marker
+            .swap(false, Ordering::AcqRel)
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -1583,6 +1667,11 @@ where
             timestamp: uptime,
             uptime,
             wall_clock: self.wall_clock_nanos(current_ticks),
+            machine_generation: self
+                .inner
+                .machine_generation
+                .get()
+                .map_or(0, |generation| generation.current().get()),
             configured_processors: self.inner.processor_count,
             online_processors: u32::try_from(crate::online_processor_count())
                 .unwrap_or_else(|_| panic!("the online processor count does not fit a u32")),

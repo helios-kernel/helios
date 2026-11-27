@@ -46,12 +46,12 @@ use super::HibernateError;
 use super::format::{DeviceFeatureRecord, HEADER_BYTES, HibernateHeader};
 use super::resume::build_machine_identity;
 use super::snapshot::{
-    AtomicSnapshotParams, EncodeParams, ReservationWriter, SnapshotConfig, SnapshotSink,
-    collect_snapshot_physical_runs, encode_snapshot,
+    AtomicSnapshotParams, EncodeParams, HIBERNATE_ENCODE_SCRATCH_BYTES, ReservationWriter,
+    SnapshotConfig, SnapshotSink, collect_snapshot_physical_runs, encode_snapshot,
 };
 use crate::machine::{AdvanceCause, MachineGeneration};
-use crate::memory::{RootEntropy, UserMemoryPool};
-use crate::{Kernel, RuntimeState};
+use crate::memory::{HibernateReservation, RootEntropy, UserMemoryPool};
+use crate::{HibernateHandle, Kernel, RuntimeState};
 
 /// Canonical 512-byte sector size for the hibernate on-disk layout.
 pub const HIBERNATE_SECTOR_BYTES: usize = 512;
@@ -553,6 +553,7 @@ fn complete_resume_continuation<CpuImpl, WatchdogImpl, Storage, Devices, ReseedW
     storage: &mut Storage,
     devices: &mut Devices,
     writer: ReservationWriter<'_>,
+    scratch_reservation: HibernateReservation<'_>,
     frozen: crate::FrozenMachine<CpuImpl, WatchdogImpl>,
 ) -> Result<HibernateOutcome, HibernateError>
 where
@@ -598,6 +599,7 @@ where
     // 5. Release reserved frames, restart all stopped secondary processors
     //    into their saved states, and thaw `FrozenMachine`.
     drop(writer);
+    drop(scratch_reservation);
     frozen.thaw();
 
     reinit_result?;
@@ -614,27 +616,20 @@ where
     Ok(HibernateOutcome::Resumed)
 }
 
-/// Orchestrates the complete hibernate-to-disk workflow and invokes `power_off`
-/// only after the final header flush succeeds while the machine is still frozen.
-///
-/// Production callers should use [`hibernate_to_disk`] or [`hibernate_machine`],
-/// which pass `|| cpu.shutdown()`. Tests that cannot exit the host process use
-/// this entry point with a recording power-off hook.
 #[expect(
     clippy::too_many_arguments,
     reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
 )]
-pub async fn hibernate_to_disk_with_power_off<
+async fn hibernate_to_disk_with_handle_and_power_off<
     CpuImpl,
     WatchdogImpl,
-    MeasuredBootImpl,
     Storage,
     Devices,
     ReseedWallClock,
     InterruptGuests,
     PowerOff,
 >(
-    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    handle: &HibernateHandle<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     user_pool: &UserMemoryPool,
     params: AtomicSnapshotParams<'_>,
@@ -647,7 +642,6 @@ pub async fn hibernate_to_disk_with_power_off<
 where
     CpuImpl: Cpu + Clone,
     WatchdogImpl: Watchdog + Clone,
-    MeasuredBootImpl: MeasuredBoot,
     Storage: HibernateStorage,
     Devices: HibernateDeviceController,
     ReseedWallClock: FnOnce(u64, u64),
@@ -665,12 +659,12 @@ where
 
     // 1. Verify authentication key and boot metadata exist before doing work.
     let auth_key = auth_key.ok_or(HibernateError::NoAuthenticationKey)?;
-    let boot_memory = kernel
+    let boot_memory = handle
         .boot_memory()
         .ok_or(HibernateError::MissingBootMemoryMetadata)?;
 
     // 2. Pre-freeze disk capacity check: refuse an undersized disk BEFORE
-    //    reserving memory or calling `Kernel::freeze_for_hibernate(...)`.
+    //    reserving memory or calling `freeze_for_hibernate(...)`.
     let sector_size = storage.sector_size();
     let required_bytes = required_disk_bytes(reservation_bytes, sector_size)?;
     let disk_bytes = storage.capacity_bytes();
@@ -681,29 +675,48 @@ where
         });
     }
 
-    // 3. Reserve free user memory BEFORE freezing.
+    // 3. Reserve free user memory BEFORE freezing: the compressed image
+    //    destination buffer plus an isolated scratch arena so `encode_snapshot`
+    //    never mutates the main kernel heap while live RAM is being read.
     let reservation = user_pool
         .reserve_hibernate_frames(reservation_bytes)
         .map_err(|oom| HibernateError::ReservationUnavailable {
             requested_bytes: oom.requested_bytes,
             available_bytes: oom.available_bytes,
         })?;
-    let reservation_ranges = reservation.frame_ranges();
+    let scratch_reservation = user_pool
+        .reserve_hibernate_frames(HIBERNATE_ENCODE_SCRATCH_BYTES)
+        .map_err(|oom| HibernateError::ReservationUnavailable {
+            requested_bytes: oom.requested_bytes,
+            available_bytes: oom.available_bytes,
+        })?;
+    let mut excluded_ranges = reservation.frame_ranges();
+    excluded_ranges.extend(scratch_reservation.frame_ranges());
     let mut writer = ReservationWriter::new(reservation);
 
     // 4. Freeze all processors at a scheduler boundary, stop all online
     //    secondaries into their saved resume contexts, and quiesce all devices.
-    let frozen = kernel
+    let frozen = handle
         .freeze_for_hibernate(arrival_deadline, interrupt_guests)
         .await?;
     if let Err(error) = devices.quiesce_all() {
         drop(writer);
+        drop(scratch_reservation);
         recover_devices_after_abort(devices);
         frozen.thaw();
         return Err(error.into());
     }
 
-    // 5. Double-return BSP snapshot point. Record `pre_hibernate_now` right
+    // 5. Drain frame slabs and enumerate live physical runs BEFORE the
+    //    double-return snapshot point so neither `user_pool` nor the main
+    //    kernel heap changes after `capture_bsp_state`.
+    let frame_runs =
+        collect_snapshot_physical_runs(user_pool, boot_memory, balloon, &excluded_ranges);
+    let max_phys = boot_memory.max_physical_address();
+    let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
+    let direct_offset = boot_memory.physical_memory_offset;
+
+    // 6. Double-return BSP snapshot point. Record `pre_hibernate_now` right
     //    before capture so the resumed continuation can advance the monotonic
     //    timebase strictly above it.
     let pre_hibernate_now = cpu.now();
@@ -712,12 +725,16 @@ where
         Ok(point) => point,
         Err(error) => {
             drop(writer);
+            drop(scratch_reservation);
             recover_devices_after_abort(devices);
             frozen.thaw();
             return Err(error.into());
         }
     };
     if let SnapshotPoint::Resumed(handoff) = point {
+        // `.bss` was snapshotted while scratch mode was active: deactivate it
+        // immediately without allocating before anything touches the main heap.
+        crate::exit_hibernate_scratch_allocator();
         return complete_resume_continuation(
             cpu,
             pre_hibernate_now,
@@ -726,43 +743,49 @@ where
             storage,
             devices,
             writer,
+            scratch_reservation,
             frozen,
         );
     }
 
-    // 6. Compress all reachable live frames into reserved user memory.
-    let frame_runs =
-        collect_snapshot_physical_runs(user_pool, boot_memory, balloon, &reservation_ranges);
-    let max_phys = boot_memory.max_physical_address();
-    let machine_max_frames = max_phys.div_ceil(PhysFrame::SIZE as u64);
-    let direct_offset = boot_memory.physical_memory_offset;
-
-    let header = match encode_snapshot(
-        EncodeParams {
-            auth_key: Some(auth_key),
-            identity,
-            machine_max_frames,
-            bsp_context,
-            config,
-        },
-        &frame_runs,
-        &mut writer,
-        |phys_frame, dst| {
-            let direct_addr = (phys_frame as usize) * PhysFrame::SIZE + direct_offset;
-            // SAFETY: `phys_frame` came from `collect_snapshot_physical_runs`
-            // while the machine is frozen (`FrozenMachine`) and all devices are
-            // quiesced, and every live RAM frame is mapped readable at
-            // `phys + physical_memory_offset`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    core::ptr::with_exposed_provenance::<u8>(direct_addr),
-                    dst.as_mut_ptr(),
-                    PhysFrame::SIZE,
-                );
-            }
-        },
-        || frozen.pet_watchdog(),
-    ) {
+    // 7. Compress all reachable live frames into reserved user memory with
+    //    `ALLOCATOR` routed strictly to the excluded scratch arena.
+    let header = {
+        // SAFETY: the machine is single-core frozen on the BSP with all devices
+        // quiesced, `scratch_reservation` owns exclusively reserved frames
+        // excluded from `frame_runs`, and every allocation made inside
+        // `encode_snapshot` is dropped before `_scratch` leaves scope.
+        let _scratch =
+            unsafe { crate::enter_hibernate_scratch_allocator(scratch_reservation.blocks()) };
+        encode_snapshot(
+            EncodeParams {
+                auth_key: Some(auth_key),
+                identity,
+                machine_max_frames,
+                bsp_context,
+                config,
+            },
+            &frame_runs,
+            &mut writer,
+            |phys_frame, dst| {
+                let direct_addr = (phys_frame as usize) * PhysFrame::SIZE + direct_offset;
+                // SAFETY: `phys_frame` came from `collect_snapshot_physical_runs`
+                // while the machine is frozen (`FrozenMachine`) and all devices are
+                // quiesced, and every live RAM frame is mapped readable at
+                // `phys + physical_memory_offset`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::with_exposed_provenance::<u8>(direct_addr),
+                        dst.as_mut_ptr(),
+                        PhysFrame::SIZE,
+                    );
+                }
+            },
+            || frozen.pet_watchdog(),
+        )
+    };
+    drop(scratch_reservation);
+    let header = match header {
         Ok(header) => header,
         Err(error) => {
             drop(writer);
@@ -806,6 +829,60 @@ where
         written_bytes,
         chunk_count: header.chunk_count,
     })
+}
+
+/// Orchestrates the complete hibernate-to-disk workflow and invokes `power_off`
+/// only after the final header flush succeeds while the machine is still frozen.
+///
+/// Production callers should use [`hibernate_to_disk`] or [`hibernate_machine`],
+/// which pass `|| cpu.shutdown()`. Tests that cannot exit the host process use
+/// this entry point with a recording power-off hook.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
+)]
+pub async fn hibernate_to_disk_with_power_off<
+    CpuImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+    Storage,
+    Devices,
+    ReseedWallClock,
+    InterruptGuests,
+    PowerOff,
+>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+    cpu: &CpuImpl,
+    user_pool: &UserMemoryPool,
+    params: AtomicSnapshotParams<'_>,
+    resume_targets: ResumeTargets<'_, ReseedWallClock>,
+    storage: &mut Storage,
+    devices: &mut Devices,
+    interrupt_guests: InterruptGuests,
+    power_off: PowerOff,
+) -> Result<HibernateOutcome, HibernateError>
+where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
+    Storage: HibernateStorage,
+    Devices: HibernateDeviceController,
+    ReseedWallClock: FnOnce(u64, u64),
+    InterruptGuests: FnOnce(),
+    PowerOff: FnOnce(),
+{
+    hibernate_to_disk_with_handle_and_power_off(
+        &kernel.hibernate_handle(),
+        cpu,
+        user_pool,
+        params,
+        resume_targets,
+        storage,
+        devices,
+        interrupt_guests,
+        power_off,
+    )
+    .await
 }
 
 /// Full production hibernate-to-disk entry point: writes and flushes the
@@ -852,6 +929,91 @@ where
         user_pool,
         params,
         resume_targets,
+        storage,
+        devices,
+        interrupt_guests,
+        || cpu.shutdown(),
+    )
+    .await
+}
+
+/// High-level machine hibernate entry point taking an owned [`HibernateHandle`]
+/// so a BSP-pinned detached task can trigger hibernation without borrowing the
+/// [`Kernel`] owned by the BSP run loop.
+///
+/// # Safety
+///
+/// `handle.boot_memory()`'s immutable `.text` and `.rodata` descriptors must
+/// point to valid mapped kernel sections (always true on bare-metal boots).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit static-dispatch dependencies keep the kernel free of global state and dynamic dispatch"
+)]
+pub async unsafe fn hibernate_machine_with_handle<
+    CpuImpl,
+    WatchdogImpl,
+    ProgramService,
+    NetworkService,
+    StorageImpl,
+    HibStorage,
+    Devices,
+    InterruptGuests,
+>(
+    handle: &HibernateHandle<CpuImpl, WatchdogImpl>,
+    cpu: &CpuImpl,
+    runtime_state: &RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    user_pool: &UserMemoryPool,
+    feature_records: &[DeviceFeatureRecord],
+    reservation_bytes: usize,
+    arrival_deadline: Duration,
+    storage: &mut HibStorage,
+    devices: &mut Devices,
+    interrupt_guests: InterruptGuests,
+) -> Result<HibernateOutcome, HibernateError>
+where
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone,
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: crate::Storage,
+    HibStorage: HibernateStorage,
+    Devices: HibernateDeviceController,
+    InterruptGuests: FnOnce(),
+{
+    let boot_memory = handle
+        .boot_memory()
+        .ok_or(HibernateError::MissingBootMemoryMetadata)?;
+    // SAFETY: forwarded from `hibernate_machine_with_handle`'s contract.
+    let identity = unsafe {
+        build_machine_identity(
+            boot_memory,
+            handle.topology().configured_processors as u32,
+            handle.devices(),
+            handle.dma_model(),
+            feature_records,
+        )
+    }?;
+    let mut image_id = [0_u8; 16];
+    runtime_state.root_entropy().fill(&mut image_id);
+    let balloon = runtime_state.memory_balloon();
+
+    hibernate_to_disk_with_handle_and_power_off(
+        handle,
+        cpu,
+        user_pool,
+        AtomicSnapshotParams {
+            balloon: balloon.as_ref(),
+            auth_key: runtime_state.hibernate_auth_key(),
+            identity,
+            reservation_bytes,
+            arrival_deadline,
+            config: SnapshotConfig::new(image_id),
+        },
+        ResumeTargets {
+            machine_generation: runtime_state.machine_generation(),
+            root_entropy: runtime_state.root_entropy(),
+            reseed_wall_clock: |ticks, nanos| runtime_state.reseed_wall_clock_nanos(ticks, nanos),
+        },
         storage,
         devices,
         interrupt_guests,
@@ -909,43 +1071,21 @@ where
     Devices: HibernateDeviceController,
     InterruptGuests: FnOnce(),
 {
-    let boot_memory = kernel
-        .boot_memory()
-        .ok_or(HibernateError::MissingBootMemoryMetadata)?;
+    let handle = kernel.hibernate_handle();
     // SAFETY: forwarded from `hibernate_machine`'s contract.
-    let identity = unsafe {
-        build_machine_identity(
-            boot_memory,
-            kernel.topology().configured_processors as u32,
-            kernel.devices(),
-            kernel.dma_model(),
+    unsafe {
+        hibernate_machine_with_handle(
+            &handle,
+            cpu,
+            runtime_state,
+            user_pool,
             feature_records,
-        )
-    }?;
-    let mut image_id = [0_u8; 16];
-    runtime_state.root_entropy().fill(&mut image_id);
-    let balloon = runtime_state.memory_balloon();
-
-    hibernate_to_disk(
-        kernel,
-        cpu,
-        user_pool,
-        AtomicSnapshotParams {
-            balloon: balloon.as_ref(),
-            auth_key: runtime_state.hibernate_auth_key(),
-            identity,
             reservation_bytes,
             arrival_deadline,
-            config: SnapshotConfig::new(image_id),
-        },
-        ResumeTargets {
-            machine_generation: runtime_state.machine_generation(),
-            root_entropy: runtime_state.root_entropy(),
-            reseed_wall_clock: |ticks, nanos| runtime_state.reseed_wall_clock_nanos(ticks, nanos),
-        },
-        storage,
-        devices,
-        interrupt_guests,
-    )
-    .await
+            storage,
+            devices,
+            interrupt_guests,
+        )
+        .await
+    }
 }

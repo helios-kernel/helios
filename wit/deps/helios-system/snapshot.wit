@@ -26,9 +26,34 @@ interface snapshot {
     has-generation-id: func() -> bool;
   }
 
+  /// Why `hibernate` did not capture and persist a hibernate image.
+  variant hibernate-error {
+    /// The caller does not hold `machine-right.control`.
+    denied,
+    /// Another hibernate operation is already in progress.
+    busy,
+    /// This platform does not support hibernation.
+    unsupported,
+    /// No virtio-blk disk carrying the `helios-hibernate` serial is attached.
+    no-hibernate-disk,
+    /// The boot ran without a TPM-sealed authentication key.
+    no-authentication-key,
+    /// The hibernate disk is smaller than the required snapshot capacity.
+    disk-too-small(string),
+    /// Any other typed kernel hibernate failure.
+    failed(string),
+  }
+
   /// Waits for the host-share operations in flight to finish, returns the
   /// share to the host, and holds it released until the returned
   /// `snapshot-hold` drops. Operations issued while the hold is active wait
   /// for it to end; none fails.
   prepare: async func() -> result<snapshot-hold, snapshot-error>;
+
+  /// Captures an atomic, compressed, authenticated hibernate image to the
+  /// `helios-hibernate` disk and powers off the machine.
+  ///
+  /// On success the machine powers off before this call returns; it returns
+  /// `ok` only when the machine resumes from that image on a later boot.
+  hibernate: async func() -> result<_, hibernate-error>;
 }

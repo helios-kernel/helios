@@ -893,6 +893,8 @@ where
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
     requested_exit: Option<u8>,
+    /// Number of open debug serial port resources held in `table`.
+    serial_ports_held: u32,
 }
 
 impl<FileSystem: StoreFilesystem> ComponentExecutionContext<FileSystem> {
@@ -978,6 +980,7 @@ where
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),
             requested_exit: None,
+            serial_ports_held: 0,
         }
     }
 
@@ -1007,6 +1010,18 @@ where
 
     pub(crate) fn set_default_linux_image(&self, image: Option<FileSystem::DefaultImage>) {
         *self.execution_context.default_linux_image.lock() = image;
+    }
+
+    pub(crate) fn increment_serial_ports_held(&mut self) {
+        self.serial_ports_held = self.serial_ports_held.saturating_add(1);
+    }
+
+    pub(crate) fn decrement_serial_ports_held(&mut self) {
+        self.serial_ports_held = self.serial_ports_held.saturating_sub(1);
+    }
+
+    pub(crate) const fn holds_serial_port(&self) -> bool {
+        self.serial_ports_held > 0
     }
 
     pub(crate) fn inherited_sockets(&self) -> &crate::InheritedSockets {

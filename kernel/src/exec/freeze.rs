@@ -599,6 +599,12 @@ impl Executor {
             .await
     }
 
+    pub(crate) fn freeze_handle(&self) -> FreezeHandle {
+        FreezeHandle {
+            group: self.group(),
+        }
+    }
+
     /// Freezes every online processor at a scheduler boundary and then transitions
     /// every online secondary into [`Cpu::stop_current`], waiting until each
     /// secondary has saved its architectural state and stopped in hardware.
@@ -625,127 +631,15 @@ impl Executor {
         interrupt_guests: impl FnOnce(),
         stop_secondaries: bool,
     ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
-        // Held for the whole future, and moved into the answer at its
-        // end, so that the future is `!Send` (a value that nothing uses
-        // later is not kept across an await, and would not count): the
-        // freezer is the processor that polls this first, and its task
-        // must stay on that processor's own queue (`spawn_local`), never
-        // in a node queue another processor could pop it from.
-        let processor_local = PhantomData::<*mut ()>;
-        let group = self.group();
-        let barrier = &group.freeze;
-        let online = group.online();
-        let cpu = timer.cpu();
-        let freezer = current_processor();
-
-        barrier
-            .control
-            .phase
-            .compare_exchange(
-                Phase::Running as u8,
-                Phase::Freezing as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| FreezeError::AlreadyFreezing)?;
-        // An offline or online in flight finishes before the barrier
-        // counts anything, and none starts until the thaw is done.
-        let claim = PhaseClaim {
-            phase: &barrier.control.phase,
-        };
-        let transition = group.lifecycle().lock_transitions().await;
-        claim.hand_to_release();
-        let generation = ((barrier.control.hold.load(Ordering::Relaxed) >> 1) + 1) % GENERATIONS;
-        let held = (generation << 1) | HELD;
-        barrier
-            .control
-            .stop_secondaries
-            .store(false, Ordering::Relaxed);
-        barrier
-            .control
-            .freezer
-            .store(freezer.id(), Ordering::Relaxed);
-        // `SeqCst`, before any read of the online set: the freezer's half
-        // of the join handshake (`FreezeBarrier::join_checkpoint`).
-        barrier.control.hold.store(held, Ordering::SeqCst);
-        // From here a drop, whether of the guard or of this future,
-        // releases the machine.
-        let mut release = Release {
-            group,
-            cpu: cpu.clone(),
-            freezer,
-            held,
-            stopped_secondaries: false,
-            _transition: transition,
-        };
-
-        interrupt_guests();
-        barrier.wake_secondaries(cpu, online, freezer);
-
-        let deadline = cpu
-            .now()
-            .saturating_add(cpu.timebase().duration_to_ticks(arrival_deadline));
-        let mut expiry = pin!(timer.sleep_until(deadline));
-        let mut arrival = barrier.arrived.waiter();
-        let arrived = poll_fn(|context| {
-            loop {
-                let Some(missing) = barrier.first_missing(online, freezer, held) else {
-                    return Poll::Ready(Ok(()));
-                };
-                if expiry.as_mut().poll(context).is_ready() {
-                    return Poll::Ready(Err(FreezeError::ProcessorDidNotArrive {
-                        processor: missing,
-                    }));
-                }
-                // The waiter is armed before `first_missing` reads, and
-                // re-armed each time it completes.
-                match barrier.arrived.poll_notified(context, &mut arrival) {
-                    Poll::Ready(()) => {}
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
-        .await;
-        arrived?;
-
-        // No await from here: this processor polls nothing else until the
-        // guard is dropped.
-        let mask = cpu.mask_to_wake_only();
-        if stop_secondaries && online.count() > 1 {
-            // Phase 2: every online secondary is already parked at a scheduler
-            // boundary. Advance `hold` with `stop_secondaries = true` so each
-            // secondary saves its architectural state and enters `stop_current`.
-            let stop_gen = ((held >> 1) + 1) % GENERATIONS;
-            let stop_held = (stop_gen << 1) | HELD;
-            barrier
-                .control
-                .stop_secondaries
-                .store(true, Ordering::Release);
-            barrier.control.hold.store(stop_held, Ordering::SeqCst);
-            release.held = stop_held;
-            release.stopped_secondaries = true;
-            barrier.wake_secondaries(cpu, online, freezer);
-            for index in 0..barrier.arrivals.len() {
-                let processor = processor_at(index);
-                if processor == freezer || !online.contains(processor) {
-                    continue;
-                }
-                while barrier.arrivals[index].load(Ordering::Acquire) != stop_held {
-                    core::hint::spin_loop();
-                }
-                cpu.wait_processor_stopped(processor);
-            }
-        }
-        barrier
-            .control
-            .phase
-            .store(Phase::Frozen as u8, Ordering::Release);
-        Ok(FrozenMachine {
-            _release: release,
-            _mask: mask,
-            _processor_local: processor_local,
+        freeze_group_inner(
+            self.group(),
+            timer,
             watchdog,
-        })
+            arrival_deadline,
+            interrupt_guests,
+            stop_secondaries,
+        )
+        .await
     }
 
     /// A scheduler boundary of this processor's run loop; see
@@ -766,4 +660,162 @@ impl Executor {
     pub(crate) fn freeze_requested_of_this_processor(&self) -> bool {
         self.group().freeze.requested_of(self.owner_processor())
     }
+}
+
+/// Copyable handle to an [`ExecutorGroup`]'s freeze barrier, allowing a
+/// BSP-pinned task spawned with `spawn_local_detached` to freeze the machine
+/// without borrowing the [`Executor`] owned by the run loop.
+#[derive(Clone, Copy)]
+pub(crate) struct FreezeHandle {
+    group: &'static ExecutorGroup,
+}
+
+impl FreezeHandle {
+    pub(crate) async fn freeze_for_hibernate<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog>(
+        &self,
+        timer: &Timer<CpuImpl>,
+        watchdog: WatchdogImpl,
+        arrival_deadline: Duration,
+        interrupt_guests: impl FnOnce(),
+    ) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+        freeze_group_inner(
+            self.group,
+            timer,
+            watchdog,
+            arrival_deadline,
+            interrupt_guests,
+            true,
+        )
+        .await
+    }
+}
+
+async fn freeze_group_inner<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog>(
+    group: &'static ExecutorGroup,
+    timer: &Timer<CpuImpl>,
+    watchdog: WatchdogImpl,
+    arrival_deadline: Duration,
+    interrupt_guests: impl FnOnce(),
+    stop_secondaries: bool,
+) -> Result<FrozenMachine<CpuImpl, WatchdogImpl>, FreezeError> {
+    // Held for the whole future, and moved into the answer at its
+    // end, so that the future is `!Send` (a value that nothing uses
+    // later is not kept across an await, and would not count): the
+    // freezer is the processor that polls this first, and its task
+    // must stay on that processor's own queue (`spawn_local`), never
+    // in a node queue another processor could pop it from.
+    let processor_local = PhantomData::<*mut ()>;
+    let barrier = &group.freeze;
+    let online = group.online();
+    let cpu = timer.cpu();
+    let freezer = current_processor();
+
+    barrier
+        .control
+        .phase
+        .compare_exchange(
+            Phase::Running as u8,
+            Phase::Freezing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| FreezeError::AlreadyFreezing)?;
+    // An offline or online in flight finishes before the barrier
+    // counts anything, and none starts until the thaw is done.
+    let claim = PhaseClaim {
+        phase: &barrier.control.phase,
+    };
+    let transition = group.lifecycle().lock_transitions().await;
+    claim.hand_to_release();
+    let generation = ((barrier.control.hold.load(Ordering::Relaxed) >> 1) + 1) % GENERATIONS;
+    let held = (generation << 1) | HELD;
+    barrier
+        .control
+        .stop_secondaries
+        .store(false, Ordering::Relaxed);
+    barrier
+        .control
+        .freezer
+        .store(freezer.id(), Ordering::Relaxed);
+    // `SeqCst`, before any read of the online set: the freezer's half
+    // of the join handshake (`FreezeBarrier::join_checkpoint`).
+    barrier.control.hold.store(held, Ordering::SeqCst);
+    // From here a drop, whether of the guard or of this future,
+    // releases the machine.
+    let mut release = Release {
+        group,
+        cpu: cpu.clone(),
+        freezer,
+        held,
+        stopped_secondaries: false,
+        _transition: transition,
+    };
+
+    interrupt_guests();
+    barrier.wake_secondaries(cpu, online, freezer);
+
+    let deadline = cpu
+        .now()
+        .saturating_add(cpu.timebase().duration_to_ticks(arrival_deadline));
+    let mut expiry = pin!(timer.sleep_until(deadline));
+    let mut arrival = barrier.arrived.waiter();
+    let arrived = poll_fn(|context| {
+        loop {
+            let Some(missing) = barrier.first_missing(online, freezer, held) else {
+                return Poll::Ready(Ok(()));
+            };
+            if expiry.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Err(FreezeError::ProcessorDidNotArrive {
+                    processor: missing,
+                }));
+            }
+            // The waiter is armed before `first_missing` reads, and
+            // re-armed each time it completes.
+            match barrier.arrived.poll_notified(context, &mut arrival) {
+                Poll::Ready(()) => {}
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    })
+    .await;
+    arrived?;
+
+    // No await from here: this processor polls nothing else until the
+    // guard is dropped.
+    let mask = cpu.mask_to_wake_only();
+    if stop_secondaries && online.count() > 1 {
+        // Phase 2: every online secondary is already parked at a scheduler
+        // boundary. Advance `hold` with `stop_secondaries = true` so each
+        // secondary saves its architectural state and enters `stop_current`.
+        let stop_gen = ((held >> 1) + 1) % GENERATIONS;
+        let stop_held = (stop_gen << 1) | HELD;
+        barrier
+            .control
+            .stop_secondaries
+            .store(true, Ordering::Release);
+        barrier.control.hold.store(stop_held, Ordering::SeqCst);
+        release.held = stop_held;
+        release.stopped_secondaries = true;
+        barrier.wake_secondaries(cpu, online, freezer);
+        for index in 0..barrier.arrivals.len() {
+            let processor = processor_at(index);
+            if processor == freezer || !online.contains(processor) {
+                continue;
+            }
+            while barrier.arrivals[index].load(Ordering::Acquire) != stop_held {
+                core::hint::spin_loop();
+            }
+            cpu.wait_processor_stopped(processor);
+        }
+    }
+    barrier
+        .control
+        .phase
+        .store(Phase::Frozen as u8, Ordering::Release);
+    Ok(FrozenMachine {
+        _release: release,
+        _mask: mask,
+        _processor_local: processor_local,
+        watchdog,
+    })
 }

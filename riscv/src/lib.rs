@@ -1244,6 +1244,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             &mut hibernate_devices,
             &[],
         );
+        let hibernate_receiver = debug_state.install_hibernate_service();
+        kernel.spawn_local_detached(hibernate::serve_hibernate_requests(
+            cpu.clone(),
+            kernel.hibernate_handle(),
+            debug_state.clone(),
+            pool,
+            hibernate_devices,
+            hibernate_receiver,
+            DEBUG_SERIAL_WRITER,
+            has_debug_transport && has_vsock,
+        ));
         helios_kernel::install_generation_reactions(&kernel, debug_state.clone(), rtc);
         let grants = device::publish_grants(&fdt, debug_state.device_grants(), &domains);
         for (line, route) in grants {
@@ -1410,6 +1421,7 @@ fn collect_boot_memory_metadata(
     let stack = riscv_section_range(&raw const __estack, &raw const __sstack);
     let mut metadata = BootMemoryMetadata {
         kernel_sections: KernelImageSections {
+            image: None,
             text: riscv_section_range(&raw const __stext, &raw const __etext),
             rodata: riscv_section_range(&raw const __srodata, &raw const __erodata),
             data: riscv_section_range(&raw const __sdata, &raw const __edata),

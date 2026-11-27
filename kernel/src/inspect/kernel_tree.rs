@@ -18,6 +18,7 @@ pub struct KernelTelemetrySnapshot {
     pub timestamp: u64,
     pub uptime: u64,
     pub wall_clock: u64,
+    pub machine_generation: u64,
     pub configured_processors: u32,
     pub online_processors: u32,
     pub guest_isa_level: &'static str,
@@ -92,6 +93,15 @@ pub fn emit_kernel_entries(
             out,
             String::from("/kernel/clock/wall-clock-nanos"),
             InspectValue::Unsigned64(snapshot.wall_clock),
+        );
+    }
+
+    if prefixes.may_match_subtree("/kernel/machine") {
+        push_if_admitted(
+            prefixes,
+            out,
+            String::from("/kernel/machine/generation"),
+            InspectValue::Unsigned64(snapshot.machine_generation),
         );
     }
 

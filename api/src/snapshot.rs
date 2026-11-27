@@ -7,7 +7,7 @@
 //! advances (on a copy restored from the snapshot).
 
 use crate::bindings::helios::system::snapshot as raw;
-pub use crate::bindings::helios::system::snapshot::{SnapshotError, SnapshotHold};
+pub use crate::bindings::helios::system::snapshot::{HibernateError, SnapshotError, SnapshotHold};
 
 /// Waits for the host-share operations in flight to finish, returns the
 /// share to the host, and holds it released until the returned
@@ -15,4 +15,13 @@ pub use crate::bindings::helios::system::snapshot::{SnapshotError, SnapshotHold}
 /// for it to end; none fails.
 pub async fn prepare() -> Result<SnapshotHold, SnapshotError> {
     raw::prepare().await
+}
+
+/// Captures an atomic, compressed, authenticated hibernate image to the
+/// `helios-hibernate` disk and powers off the machine.
+///
+/// On success the machine powers off before this call returns; it returns
+/// `Ok(())` only when execution resumes from that image on a later boot.
+pub async fn hibernate() -> Result<(), HibernateError> {
+    raw::hibernate().await
 }
