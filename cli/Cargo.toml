@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 askama = "0.15.6"
 clap = { version = "4.5.38", features = ["derive", "env"] }
+console = "0.16.1"
 directories = "6.0.0"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc", "rand_core"] }
 fatfs = "0.3.6"

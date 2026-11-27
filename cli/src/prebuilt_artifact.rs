@@ -300,13 +300,17 @@ pub(crate) enum ArtifactFetchError {
         expected: PrebuiltArtifactKind,
         found: PrebuiltArtifactKind,
     },
-    #[error("artifact {artifact} manifest profile is {found:?}, expected {expected:?}")]
+    #[error("artifact {artifact} manifest profile is `{found}`, expected `{expected}`")]
     ProfileMismatch {
         artifact: u64,
         expected: String,
         found: String,
     },
-    #[error("artifact {artifact} manifest arch is {found:?}, expected {expected:?}")]
+    #[error(
+        "artifact {artifact} manifest arch is {}, expected {}",
+        format_opt_identifier(found.as_deref()),
+        format_opt_identifier(expected.as_deref())
+    )]
     ArchMismatch {
         artifact: u64,
         expected: Option<String>,
@@ -323,6 +327,13 @@ pub(crate) enum ArtifactFetchError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+fn format_opt_identifier(value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!("`{v}`"),
+        None => "none".to_owned(),
+    }
 }
 
 /// The parts of a GitHub workflow run response read to verify it is green.
@@ -758,18 +769,17 @@ pub(crate) fn run_fetch(
             .map_err(|source| ArtifactFetchError::EncodeReport { source })?;
         println!("{encoded}");
     } else {
-        let source_state = if report.cache_hit {
-            "cached"
-        } else {
-            "fetched"
-        };
+        let colors = crate::diagnostics::stdout_colors_enabled();
         println!(
-            "{} {} (run {}, sha {}) -> {}",
-            source_state,
-            report.artifact_name,
-            report.run_id,
-            &report.head_sha[..report.head_sha.len().min(12)],
-            report.dir.display(),
+            "{}",
+            crate::diagnostics::format_fetch_status(
+                report.cache_hit,
+                &report.artifact_name,
+                report.run_id,
+                &report.head_sha[..report.head_sha.len().min(12)],
+                &report.dir,
+                colors,
+            )
         );
     }
     Ok(())
@@ -831,7 +841,7 @@ fn resolve_artifact(
         return Err(ArtifactFetchError::NotFound {
             repo: repo.clone(),
             candidates: format_candidates(candidate_names),
-            target: format!("ref {git_ref:?}"),
+            target: format!("ref `{git_ref}`"),
         });
     }
 
@@ -865,10 +875,10 @@ fn resolve_artifact(
 
     let target = match head_sha {
         Some(sha) => format!(
-            "HEAD ({}) or default branch {branch:?}",
+            "HEAD ({}) or default branch `{branch}`",
             &sha[..sha.len().min(12)]
         ),
-        None => format!("default branch {branch:?}"),
+        None => format!("default branch `{branch}`"),
     };
     Err(ArtifactFetchError::NotFound {
         repo: repo.clone(),
